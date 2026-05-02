@@ -4,13 +4,13 @@
     "install": {
       "commands": [
         "python -m venv /app/.venv",
-        "pip install --upgrade pip",
-        "pip install requests beautifulsoup4 playwright",
-        "python -m playwright install chromium"
+        "/app/.venv/bin/python -m pip install --upgrade pip",
+        "/app/.venv/bin/python -m pip install requests beautifulsoup4 playwright",
+        "/app/.venv/bin/python -m playwright install chromium"
       ]
     }
   },
   "deploy": {
-    "startCommand": "python app.py"
+    "startCommand": "/app/.venv/bin/python app.py"
   }
 }
