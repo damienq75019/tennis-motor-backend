@@ -1,14 +1,20 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Tennis Motor Backend - V6.9H OFFICIAL PAIR GUARD - Railway Ready
+Tennis Motor Backend - V6.9J HIDE FAKE NON ANALYZED - Railway / PC Ready
 
-Base stable :
-- garde le moteur officiel actuel ;
-- garde fetch_day_lines_v6_9_strict_day_filter.py pour les matchs analysables ;
-- ajoute seulement les matchs présents sur ATP daily-schedule mais absents du payload V6.9 ;
-- ces matchs sont affichés comme "Non analysé" si une donnée obligatoire manque ;
-- aucun pronostic n'est inventé.
+Objectif :
+- garder le moteur officiel actuel ;
+- garder fetch_day_lines_v6_9_strict_day_filter.py pour les vrais matchs analysables ;
+- garder l'audit technique des matchs invisibles / manquants ;
+- NE PLUS envoyer à Unity les matchs sans points ATP valides en "NON ANALYSÉ" ;
+- si aucun match ATP simple valide n'est trouvé :
+  -> matches = []
+  -> totalRows = 0
+  -> validRows = 0
+  -> errorRows = 0
+  -> nonAnalyzedRows = 0
+  -> message clair dans meta.
 
 Fichiers nécessaires dans le même dossier backend :
 - motor.py
@@ -43,7 +49,7 @@ OUT_DIR = BACKEND_DIR / "output"
 DAILY_SCRIPT = "fetch_day_lines_v6_9_strict_day_filter.py"
 MISSING_AUDIT_SCRIPT = "fetch_day_lines_v6_9c_daily_schedule_audit.py"
 
-APP_VERSION = "v6_9i_promote_missing_points_railway"
+APP_VERSION = "v6_9j_hide_fake_non_analyzed_railway"
 
 
 class MatchInput(BaseModel):
@@ -119,12 +125,20 @@ def pair_key(player_a: Any, player_b: Any) -> Tuple[str, str]:
     return tuple(sorted([a, b]))  # type: ignore[return-value]
 
 
+def safe_int(value: Any, default: int = 0) -> int:
+    try:
+        if value is None or value == "":
+            return default
+        return int(float(value))
+    except Exception:
+        return default
+
+
 def is_real_missing_singles(row: Dict[str, Any]) -> bool:
     """
-    L'audit daily-schedule peut capter un faux positif de double :
-    Theo Arribage vs Albano Olivetti.
+    L'audit daily-schedule peut capter des faux positifs.
     On garde seulement les manquants qui ont une vraie preuve de match simple :
-    H2H, Defeats, R32/R64/R16, Not Before, Followed By.
+    H2H, Defeats, R32/R64/R16, Not Before, Followed By, etc.
     """
     player_a = str(row.get("playerA", "") or "").strip()
     player_b = str(row.get("playerB", "") or "").strip()
@@ -153,50 +167,6 @@ def is_real_missing_singles(row: Dict[str, Any]) -> bool:
     return any(signal in evidence for signal in strong_signals)
 
 
-def make_non_analyzed_match(row: Dict[str, Any]) -> Dict[str, Any]:
-    player_a = str(row.get("playerA", "") or "").strip()
-    player_b = str(row.get("playerB", "") or "").strip()
-    evidence = str(row.get("evidence", "") or "").strip()
-    source_url = str(row.get("source_url", "") or row.get("sourceUrl", "") or "").strip()
-
-    return {
-        "playerA": player_a,
-        "playerB": player_b,
-        "surface": "Clay",
-        "playerAPoints": 0,
-        "playerBPoints": 0,
-        "player_b_is_qualifier": False,
-        "player_b_tournament_wins": 0,
-        "sweA": 0,
-        "sweB": 0,
-        "pSwe": 0,
-        "pAtp": 0,
-        "pRank": 0,
-        "pForm5": 0,
-        "pForm10": 0,
-        "pSurfaceForm5": 0,
-        "pDominance": 0,
-        "premium": 0,
-        "premiumPct": 0,
-        "veto": "",
-        "decision": "Non analysé",
-        "error": "Non analysé : données ATP incomplètes ou joueur introuvable dans la table des points ATP.",
-        "nonAnalyzed": True,
-        "source": "ATP daily-schedule",
-        "sourceUrl": source_url,
-        "evidence": evidence,
-    }
-
-
-def safe_int(value: Any, default: int = 0) -> int:
-    try:
-        if value is None or value == "":
-            return default
-        return int(float(value))
-    except Exception:
-        return default
-
-
 def make_payload_match_from_missing(row: Dict[str, Any]) -> Dict[str, Any] | None:
     """
     Transforme un match official daily-schedule manquant en entrée moteur
@@ -213,6 +183,7 @@ def make_payload_match_from_missing(row: Dict[str, Any]) -> Dict[str, Any] | Non
 
     if not player_a or not player_b:
         return None
+
     if points_a <= 0 or points_b <= 0:
         return None
 
@@ -235,9 +206,11 @@ def promote_missing_rows_into_payload(
     """
     Avant le calcul moteur :
     - ajoute les matchs manquants qui ont des points ATP réels ;
-    - laisse les autres en Non analysé après calcul.
+    - garde les autres uniquement pour meta/audit technique ;
+    - ne les affiche plus dans Unity.
     """
     existing_keys = set()
+
     for row in payload:
         if not isinstance(row, dict):
             continue
@@ -251,11 +224,13 @@ def promote_missing_rows_into_payload(
             continue
 
         candidate = make_payload_match_from_missing(row)
+
         if candidate is None:
             still_missing.append(row)
             continue
 
         key = pair_key(candidate.get("playerA", ""), candidate.get("playerB", ""))
+
         if key in existing_keys:
             continue
 
@@ -272,6 +247,7 @@ def render_backend_result(result: Dict[str, Any]) -> str:
     summary = result.get("summary")
     matches = result.get("matches")
     engine = result.get("engine")
+    meta = result.get("meta")
 
     if isinstance(summary, dict):
         lines.append("Résumé")
@@ -287,6 +263,17 @@ def render_backend_result(result: Dict[str, Any]) -> str:
     if isinstance(matches, list):
         lines.append("Résultats")
         lines.append("")
+
+        if not matches:
+            message = ""
+            if isinstance(meta, dict):
+                message = str(meta.get("message", "") or "").strip()
+
+            if not message:
+                message = "Aucun match ATP simple analysable aujourd'hui."
+
+            lines.append(message)
+            lines.append("")
 
         for row in matches:
             if not isinstance(row, dict):
@@ -369,6 +356,28 @@ def calculate(request: CalculateRequest) -> Dict[str, Any]:
     return result
 
 
+def empty_summary() -> Dict[str, int]:
+    return {
+        "totalRows": 0,
+        "validRows": 0,
+        "errorRows": 0,
+        "nonAnalyzedRows": 0,
+        "over80": 0,
+        "vetoCount": 0,
+        "jouables": 0,
+    }
+
+
+def empty_engine() -> Dict[str, Any]:
+    return {
+        "name": "Tennis Motor V7",
+        "version": "Bayesian Shrinkage",
+        "historyRowsLoaded": get_history_rows_loaded(),
+        "premiumFormula": "Bayesian shrinkage blend of SWE, ATP, Rank, Form5, Form10, SurfaceForm5, Dominance",
+        "threshold": "> 0.80",
+    }
+
+
 def run_daily_fetch(day: str, target_day: date) -> Dict[str, Any]:
     script_path = BACKEND_DIR / DAILY_SCRIPT
 
@@ -385,15 +394,22 @@ def run_daily_fetch(day: str, target_day: date) -> Dict[str, Any]:
         "http://127.0.0.1:9",
     ]
 
-    completed = subprocess.run(
-        cmd,
-        cwd=str(BACKEND_DIR),
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-        timeout=260,
-    )
+    try:
+        completed = subprocess.run(
+            cmd,
+            cwd=str(BACKEND_DIR),
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=260,
+        )
+    except subprocess.TimeoutExpired:
+        return {
+            "error": "Le script daily a dépassé le délai maximum.",
+            "matches": [],
+            "summary": empty_summary(),
+        }
 
     if completed.returncode != 0:
         return {
@@ -531,9 +547,6 @@ def run_missing_audit(day: str, target_day: date) -> Dict[str, Any]:
             if not isinstance(row, dict):
                 continue
 
-            # Sécurité V6.9H :
-            # on garde seulement les vrais blocs ATP.
-            # Les lignes reconstruites "vs" peuvent parfois mélanger deux matchs.
             if str(row.get("source", "")).strip() != "daily_schedule_block":
                 continue
 
@@ -567,11 +580,10 @@ def filter_payload_against_official_pairs(
     missing_audit: Dict[str, Any],
 ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
     """
-    Sécurité V6.9H :
-    - le scraper peut parfois créer une fausse paire en mélangeant des joueurs
-      de deux blocs voisins ;
-    - l'audit ATP daily-schedule donne les vrais blocs officiels ;
-    - on supprime du payload les paires absentes des vrais blocs ATP.
+    Sécurité :
+    - si l'audit donne les vrais blocs ATP official daily-schedule,
+      on supprime du payload les paires absentes de ces blocs.
+    - si l'audit n'a aucune paire officielle, on ne filtre pas ici.
     """
     official_rows = missing_audit.get("officialDailyPairs", [])
 
@@ -606,52 +618,74 @@ def filter_payload_against_official_pairs(
     return kept, dropped
 
 
-def append_non_analyzed_matches(result: Dict[str, Any], missing_rows: List[Dict[str, Any]]) -> int:
-    if not missing_rows:
-        return 0
-
+def sanitize_result_for_unity(result: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Dernière barrière de sécurité avant retour Unity :
+    - supprime tous les matches marqués nonAnalyzed ;
+    - supprime tous les matches avec error ;
+    - supprime tous les matches avec playerAPoints <= 0 ou playerBPoints <= 0 ;
+    - recalcule les compteurs.
+    """
     matches = result.get("matches")
-    if not isinstance(matches, list):
-        matches = []
-        result["matches"] = matches
 
-    existing_keys = set()
+    if not isinstance(matches, list):
+        result["matches"] = []
+        result["summary"] = empty_summary()
+        return result
+
+    clean_matches: List[Dict[str, Any]] = []
 
     for row in matches:
         if not isinstance(row, dict):
             continue
-        existing_keys.add(pair_key(row.get("playerA", ""), row.get("playerB", "")))
 
-    appended = 0
-
-    for row in missing_rows:
-        new_match = make_non_analyzed_match(row)
-        key = pair_key(new_match.get("playerA", ""), new_match.get("playerB", ""))
-
-        if key in existing_keys:
+        if row.get("nonAnalyzed"):
             continue
 
-        matches.append(new_match)
-        existing_keys.add(key)
-        appended += 1
+        if row.get("error"):
+            continue
 
-    summary = result.get("summary")
-    if not isinstance(summary, dict):
-        summary = {}
-        result["summary"] = summary
+        points_a = safe_int(row.get("playerAPoints", 0))
+        points_b = safe_int(row.get("playerBPoints", 0))
 
-    old_total = int(summary.get("totalRows", len(matches) - appended) or 0)
-    old_error = int(summary.get("errorRows", 0) or 0)
-    old_non_analyzed = int(summary.get("nonAnalyzedRows", 0) or 0)
+        if points_a <= 0 or points_b <= 0:
+            continue
 
-    summary["totalRows"] = old_total + appended
-    summary["errorRows"] = old_error + appended
-    summary["nonAnalyzedRows"] = old_non_analyzed + appended
+        clean_matches.append(row)
 
-    if "validRows" not in summary:
-        summary["validRows"] = max(0, len(matches) - appended)
+    result["matches"] = clean_matches
 
-    return appended
+    over80 = 0
+    veto_count = 0
+    jouables = 0
+
+    for row in clean_matches:
+        premium_pct = float(row.get("premiumPct", 0) or 0)
+        veto_value = str(row.get("veto", "") or "").strip().lower()
+        decision = str(row.get("decision", "") or "").lower()
+
+        has_veto = veto_value not in ("", "non", "false", "0", "none", "null")
+
+        if premium_pct > 80:
+            over80 += 1
+
+        if has_veto:
+            veto_count += 1
+
+        if "jouable" in decision and not has_veto:
+            jouables += 1
+
+    result["summary"] = {
+        "totalRows": len(clean_matches),
+        "validRows": len(clean_matches),
+        "errorRows": 0,
+        "nonAnalyzedRows": 0,
+        "over80": over80,
+        "vetoCount": veto_count,
+        "jouables": jouables,
+    }
+
+    return result
 
 
 @app.get("/daily")
@@ -664,19 +698,41 @@ def daily(day: str = Query("today", description="today | tomorrow | YYYY-MM-DD")
     fetched = run_daily_fetch(day, target_day)
 
     if "error" in fetched:
-        return fetched
+        result: Dict[str, Any] = {
+            "matches": [],
+            "summary": empty_summary(),
+            "engine": empty_engine(),
+            "meta": {
+                "targetDay": target_day.isoformat(),
+                "targetLabel": day,
+                "mode": APP_VERSION,
+                "message": "Aucun match ATP simple analysable aujourd'hui ou source ATP indisponible.",
+                "dailyFetchError": fetched,
+            },
+        }
+
+        OUT_DIR.mkdir(exist_ok=True)
+        result_json_path = OUT_DIR / f"result_{target_day.isoformat()}.json"
+        result_txt_path = OUT_DIR / f"result_{target_day.isoformat()}.txt"
+        result_latest_path = OUT_DIR / "result_latest.txt"
+
+        result_json_path.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
+        result_text = render_backend_result(result)
+        result_txt_path.write_text(result_text, encoding="utf-8")
+        result_latest_path.write_text(result_text, encoding="utf-8")
+
+        return result
 
     payload = fetched.get("payload", [])
 
     if not isinstance(payload, list):
         payload = []
 
-    # IMPORTANT V6.9H :
-    # on lance l'audit AVANT le moteur pour obtenir les vrais blocs ATP officiels.
     missing_audit = run_missing_audit(day, target_day)
 
     payload_before_guard_count = len(payload)
     payload, dropped_wrong_pairs = filter_payload_against_official_pairs(payload, missing_audit)
+    payload_after_guard_count = len(payload)
 
     if dropped_wrong_pairs:
         try:
@@ -707,24 +763,10 @@ def daily(day: str = Query("today", description="today | tomorrow | YYYY-MM-DD")
     payload_after_promote_count = len(payload)
 
     if not payload:
-        result: Dict[str, Any] = {
+        result = {
             "matches": [],
-            "summary": {
-                "totalRows": 0,
-                "validRows": 0,
-                "errorRows": 0,
-                "nonAnalyzedRows": 0,
-                "over80": 0,
-                "vetoCount": 0,
-                "jouables": 0,
-            },
-            "engine": {
-                "name": "Tennis Motor V7",
-                "version": "Bayesian Shrinkage",
-                "historyRowsLoaded": get_history_rows_loaded(),
-                "premiumFormula": "Bayesian shrinkage blend of SWE, ATP, Rank, Form5, Form10, SurfaceForm5, Dominance",
-                "threshold": "> 0.80",
-            },
+            "summary": empty_summary(),
+            "engine": empty_engine(),
         }
     else:
         if not hasattr(motor, "calculate_predictions"):
@@ -735,19 +777,30 @@ def daily(day: str = Query("today", description="today | tomorrow | YYYY-MM-DD")
         if not isinstance(result, dict):
             return {"error": "Le moteur n'a pas renvoyé un objet dict valide."}
 
+    # Important V6.9J :
+    # Ne jamais faire append_non_analyzed_matches ici.
+    # Les lignes sans points ATP valides ne sont pas envoyées à Unity.
+    hidden_non_analyzed_count = len(remaining_missing_rows)
+
     result["meta"] = {
         "targetDay": target_day.isoformat(),
         "targetLabel": day,
         "mode": APP_VERSION,
+        "message": (
+            "Aucun match ATP simple analysable aujourd'hui."
+            if not result.get("matches")
+            else "Recherche terminée."
+        ),
         "payloadPath": fetched.get("payloadPath", ""),
         "auditPath": fetched.get("auditPath", ""),
         "officialPairGuard": {
             "enabled": True,
             "payloadBeforeGuard": payload_before_guard_count,
-            "payloadAfterGuard": payload_after_promote_count,
+            "payloadAfterGuard": payload_after_guard_count,
             "payloadAfterPromote": payload_after_promote_count,
             "promotedMissingRows": len(promoted_missing_rows),
             "droppedWrongPairs": len(dropped_wrong_pairs),
+            "hiddenNonAnalyzedRows": hidden_non_analyzed_count,
             "officialDailyPairsCount": missing_audit.get("officialDailyPairsCount", 0),
             "droppedPairs": [
                 {
@@ -759,25 +812,28 @@ def daily(day: str = Query("today", description="today | tomorrow | YYYY-MM-DD")
                 if isinstance(row, dict)
             ],
         },
-    }
-
-    appended = 0
-
-    if remaining_missing_rows:
-        appended = append_non_analyzed_matches(result, remaining_missing_rows)
-
-    if isinstance(result.get("meta"), dict):
-        result["meta"]["missingAudit"] = {
+        "missingAudit": {
             "enabled": missing_audit.get("enabled", False),
             "error": missing_audit.get("error", ""),
             "auditPath": missing_audit.get("auditPath", ""),
             "rawMissingCount": missing_audit.get("rawMissingCount", 0),
             "keptMissingCount": missing_audit.get("keptMissingCount", 0),
             "ignoredMissingCount": missing_audit.get("ignoredMissingCount", 0),
-            "appendedNonAnalyzed": appended,
+            "appendedNonAnalyzed": 0,
+            "hiddenNonAnalyzed": hidden_non_analyzed_count,
             "promotedMissingAnalyzed": len(promoted_missing_rows),
             "officialDailyPairsCount": missing_audit.get("officialDailyPairsCount", 0),
-        }
+        },
+    }
+
+    result = sanitize_result_for_unity(result)
+
+    if isinstance(result.get("meta"), dict):
+        result["meta"]["message"] = (
+            "Aucun match ATP simple analysable aujourd'hui."
+            if len(result.get("matches", [])) == 0
+            else "Recherche terminée."
+        )
 
     OUT_DIR.mkdir(exist_ok=True)
 
