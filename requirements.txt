@@ -1,7 +1,0 @@
-fastapi
-uvicorn[standard]
-requests
-beautifulsoup4
-lxml
-pandas
-numpy
