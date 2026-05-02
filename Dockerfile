@@ -1,0 +1,12 @@
+FROM mcr.microsoft.com/playwright/python:v1.59.0-noble
+
+WORKDIR /app
+
+COPY requirements.txt .
+
+RUN pip install --upgrade pip
+RUN pip install -r requirements.txt
+
+COPY . .
+
+CMD uvicorn app:app --host 0.0.0.0 --port ${PORT}
