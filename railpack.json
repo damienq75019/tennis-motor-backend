@@ -1,0 +1,16 @@
+{
+  "$schema": "https://schema.railpack.com",
+  "steps": {
+    "install": {
+      "commands": [
+        "python -m venv /app/.venv",
+        "pip install --upgrade pip",
+        "pip install -r requirements.txt",
+        "python -m playwright install --with-deps chromium"
+      ]
+    }
+  },
+  "deploy": {
+    "startCommand": "python app.py"
+  }
+}
