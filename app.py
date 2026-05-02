@@ -5,9 +5,10 @@ import json
 import os
 import subprocess
 import sys
+import traceback
 from datetime import date, timedelta
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Tuple
 
 from fastapi import FastAPI, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -32,8 +33,8 @@ app.add_middleware(
 
 def _paris_today() -> date:
     try:
-        from zoneinfo import ZoneInfo
         from datetime import datetime
+        from zoneinfo import ZoneInfo
 
         return datetime.now(ZoneInfo("Europe/Paris")).date()
     except Exception:
@@ -50,7 +51,6 @@ def normalize_day(day: str) -> str:
     if value == "tomorrow":
         return (today + timedelta(days=1)).isoformat()
 
-    # Validation YYYY-MM-DD
     return date.fromisoformat(value).isoformat()
 
 
@@ -72,36 +72,93 @@ async def _read_request_matches(request: Request) -> List[Dict[str, Any]]:
         payload = await request.json()
     except Exception:
         payload = []
+
     return _extract_matches_from_payload(payload)
+
+
+def _empty_response(
+    status: str,
+    message: str = "",
+    target_day: str = "",
+    stdout_tail: str = "",
+    stderr_tail: str = "",
+    command: str = "",
+) -> Dict[str, Any]:
+    try:
+        state = get_state()
+        history_rows_loaded = int(state.get("history_rows_loaded", 0))
+    except Exception:
+        history_rows_loaded = 0
+
+    return {
+        "matches": [],
+        "summary": {
+            "totalRows": 0,
+            "validRows": 0,
+            "errorRows": 0,
+            "over80": 0,
+            "vetoCount": 0,
+            "jouables": 0,
+        },
+        "engine": {
+            "name": "Tennis Motor V7",
+            "version": "Bayesian Shrinkage",
+            "historyYears": [2022, 2023, 2024, 2025],
+            "historyRowsLoaded": history_rows_loaded,
+            "premiumFormula": "Bayesian shrinkage blend of SWE, ATP, Rank, Form5, Form10, SurfaceForm5, Dominance",
+            "threshold": "> 0.80",
+            "status": status,
+        },
+        "daily": {
+            "targetDay": target_day,
+            "payloadCount": 0,
+            "stdoutTail": stdout_tail[-4000:] if stdout_tail else "",
+            "stderrTail": stderr_tail[-4000:] if stderr_tail else "",
+            "command": command,
+        },
+        "error": message,
+    }
 
 
 def calculate_from_matches(matches: List[Dict[str, Any]]) -> Dict[str, Any]:
     if not matches:
-        return {
-            "matches": [],
-            "summary": {
-                "totalRows": 0,
-                "validRows": 0,
-                "errorRows": 0,
-                "over80": 0,
-                "vetoCount": 0,
-                "jouables": 0,
-            },
-            "engine": {
-                "name": "Tennis Motor V7",
-                "status": "empty_payload",
-            },
-        }
+        return _empty_response(
+            status="empty_payload",
+            message="Aucun match exploitable dans le payload daily.",
+        )
 
     return calculate_predictions(matches)
 
 
+def _read_payload_for_day(target_day: str) -> Tuple[List[Dict[str, Any]], str]:
+    payload_path = OUTPUT_DIR / f"payload_{target_day}.json"
+
+    if not payload_path.exists():
+        payload_path = PAYLOAD_LATEST_PATH
+
+    if not payload_path.exists():
+        return [], ""
+
+    payload = json.loads(payload_path.read_text(encoding="utf-8"))
+    return _extract_matches_from_payload(payload), payload_path.name
+
+
 def run_daily_fetch_sync(target_day: str) -> Dict[str, Any]:
+    """Lance l'extraction daily.
+
+    Important : cette fonction ne doit jamais faire tomber FastAPI en 500.
+    Si l'extraction ATP plante, on renvoie un JSON propre avec l'erreur.
+    """
+
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
     script = BASE_DIR / "fetch_day_lines_v6_9_strict_day_filter.py"
     if not script.exists():
-        raise RuntimeError("fetch_day_lines_v6_9_strict_day_filter.py introuvable sur Railway.")
+        return _empty_response(
+            status="script_missing",
+            message="fetch_day_lines_v6_9_strict_day_filter.py introuvable sur Railway.",
+            target_day=target_day,
+        )
 
     cmd = [
         sys.executable,
@@ -110,40 +167,61 @@ def run_daily_fetch_sync(target_day: str) -> Dict[str, Any]:
         "--no-send-backend",
     ]
 
-    timeout_seconds = int(os.environ.get("FETCH_TIMEOUT_SECONDS", "180"))
+    command_text = " ".join(cmd)
+    timeout_seconds = int(os.environ.get("FETCH_TIMEOUT_SECONDS", "240"))
 
-    completed = subprocess.run(
-        cmd,
-        cwd=str(BASE_DIR),
-        capture_output=True,
-        text=True,
-        timeout=timeout_seconds,
-    )
+    try:
+        completed = subprocess.run(
+            cmd,
+            cwd=str(BASE_DIR),
+            capture_output=True,
+            text=True,
+            timeout=timeout_seconds,
+        )
+    except subprocess.TimeoutExpired as exc:
+        return _empty_response(
+            status="daily_fetch_timeout",
+            message=f"Extraction daily trop longue : timeout après {timeout_seconds} secondes.",
+            target_day=target_day,
+            stdout_tail=exc.stdout or "",
+            stderr_tail=exc.stderr or "",
+            command=command_text,
+        )
+    except Exception as exc:
+        return _empty_response(
+            status="daily_fetch_exception",
+            message=f"Erreur lancement extraction daily : {exc}",
+            target_day=target_day,
+            stdout_tail="",
+            stderr_tail=traceback.format_exc(),
+            command=command_text,
+        )
 
     stdout = completed.stdout or ""
     stderr = completed.stderr or ""
 
     if completed.returncode != 0:
-        raise RuntimeError(
-            "Extraction daily échouée.\n"
-            f"Commande: {' '.join(cmd)}\n"
-            f"STDOUT:\n{stdout[-4000:]}\n"
-            f"STDERR:\n{stderr[-4000:]}"
+        return _empty_response(
+            status="daily_fetch_failed",
+            message=f"Extraction daily échouée. Code retour : {completed.returncode}",
+            target_day=target_day,
+            stdout_tail=stdout,
+            stderr_tail=stderr,
+            command=command_text,
         )
 
-    payload_path = OUTPUT_DIR / f"payload_{target_day}.json"
-    if not payload_path.exists():
-        payload_path = PAYLOAD_LATEST_PATH
-
-    if not payload_path.exists():
-        raise RuntimeError("Payload daily introuvable après extraction.")
-
     try:
-        payload = json.loads(payload_path.read_text(encoding="utf-8"))
+        matches, payload_name = _read_payload_for_day(target_day)
     except Exception as exc:
-        raise RuntimeError(f"Payload daily illisible: {payload_path} | {exc}") from exc
+        return _empty_response(
+            status="payload_read_failed",
+            message=f"Payload daily illisible : {exc}",
+            target_day=target_day,
+            stdout_tail=stdout,
+            stderr_tail=stderr + "\n" + traceback.format_exc(),
+            command=command_text,
+        )
 
-    matches = _extract_matches_from_payload(payload)
     result = calculate_from_matches(matches)
 
     result.setdefault("daily", {})
@@ -151,9 +229,10 @@ def run_daily_fetch_sync(target_day: str) -> Dict[str, Any]:
         {
             "targetDay": target_day,
             "payloadCount": len(matches),
-            "payloadPath": str(payload_path.name),
+            "payloadPath": payload_name,
             "stdoutTail": stdout[-1200:],
             "stderrTail": stderr[-1200:],
+            "command": command_text,
         }
     )
 
@@ -165,7 +244,13 @@ def root() -> Dict[str, Any]:
     return {
         "status": "ok",
         "service": "Tennis Motor Railway Backend",
-        "endpoints": ["/health", "/calculate", "/daily?day=today", "/predictions?day=today"],
+        "endpoints": [
+            "/health",
+            "/calculate",
+            "/daily?day=today",
+            "/daily?day=tomorrow",
+            "/predictions?day=today",
+        ],
     }
 
 
@@ -189,35 +274,70 @@ def health() -> Dict[str, Any]:
 
 @app.post("/calculate")
 async def calculate(request: Request) -> Dict[str, Any]:
-    matches = await _read_request_matches(request)
-    return calculate_from_matches(matches)
+    try:
+        matches = await _read_request_matches(request)
+        return calculate_from_matches(matches)
+    except Exception as exc:
+        return _empty_response(
+            status="calculate_failed",
+            message=str(exc),
+            stderr_tail=traceback.format_exc(),
+        )
 
 
 @app.post("/predictions")
 async def predictions_post(request: Request) -> Dict[str, Any]:
-    matches = await _read_request_matches(request)
-    return calculate_from_matches(matches)
+    try:
+        matches = await _read_request_matches(request)
+        return calculate_from_matches(matches)
+    except Exception as exc:
+        return _empty_response(
+            status="predictions_post_failed",
+            message=str(exc),
+            stderr_tail=traceback.format_exc(),
+        )
 
 
 @app.get("/daily")
 async def daily(day: str = Query("today")) -> Dict[str, Any]:
-    target_day = normalize_day(day)
+    try:
+        target_day = normalize_day(day)
+    except Exception as exc:
+        return _empty_response(
+            status="bad_day_parameter",
+            message=f"Paramètre day invalide : {day} | {exc}",
+            target_day=str(day),
+        )
+
     return await asyncio.to_thread(run_daily_fetch_sync, target_day)
 
 
 @app.get("/predictions")
 async def predictions_get(day: str = Query("today")) -> Dict[str, Any]:
-    target_day = normalize_day(day)
+    try:
+        target_day = normalize_day(day)
+    except Exception as exc:
+        return _empty_response(
+            status="bad_day_parameter",
+            message=f"Paramètre day invalide : {day} | {exc}",
+            target_day=str(day),
+        )
+
     return await asyncio.to_thread(run_daily_fetch_sync, target_day)
 
 
 @app.get("/state")
 def state() -> Dict[str, Any]:
-    s = get_state()
-    return {
-        "historyRowsLoaded": s.get("history_rows_loaded", 0),
-        "rankReferenceSize": len(s.get("rank_reference_points", [])),
-    }
+    try:
+        s = get_state()
+        return {
+            "historyRowsLoaded": s.get("history_rows_loaded", 0),
+            "rankReferenceSize": len(s.get("rank_reference_points", [])),
+        }
+    except Exception as exc:
+        return {
+            "error": str(exc),
+        }
 
 
 if __name__ == "__main__":
