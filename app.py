@@ -168,7 +168,7 @@ def run_daily_fetch_sync(target_day: str) -> Dict[str, Any]:
     ]
 
     command_text = " ".join(cmd)
-    timeout_seconds = int(os.environ.get("FETCH_TIMEOUT_SECONDS", "240"))
+    timeout_seconds = int(os.environ.get("FETCH_TIMEOUT_SECONDS", "540"))
 
     try:
         completed = subprocess.run(
