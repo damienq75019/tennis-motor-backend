@@ -173,7 +173,7 @@ async def run_daily_fetch_async(target_day: str) -> Dict[str, Any]:
     ]
 
     command_text = " ".join(cmd)
-    timeout_seconds = int(os.environ.get("FETCH_TIMEOUT_SECONDS", "240"))
+    timeout_seconds = int(os.environ.get("FETCH_TIMEOUT_SECONDS", "500"))
 
     try:
         process = await asyncio.create_subprocess_exec(
