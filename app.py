@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import subprocess
 import sys
 import traceback
 from datetime import date, timedelta
@@ -28,9 +29,6 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
-# Verrou global : empêche Railway de lancer 2 extractions daily en même temps
-_DAILY_LOCK = asyncio.Lock()
 
 
 def _paris_today() -> date:
@@ -145,14 +143,12 @@ def _read_payload_for_day(target_day: str) -> Tuple[List[Dict[str, Any]], str]:
     return _extract_matches_from_payload(payload), payload_path.name
 
 
-async def run_daily_fetch_async(target_day: str) -> Dict[str, Any]:
+def run_daily_fetch_sync(target_day: str) -> Dict[str, Any]:
     """
-    Lance l'extraction daily sans asyncio.to_thread.
+    Lance l'extraction daily.
 
-    Objectif Railway :
-    - éviter de créer un thread supplémentaire
-    - éviter plusieurs extractions simultanées
-    - ne jamais faire tomber FastAPI en 500
+    Cette fonction ne doit jamais faire tomber FastAPI en 500.
+    Si l'extraction ATP plante, on renvoie un JSON propre avec l'erreur.
     """
 
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
@@ -173,58 +169,26 @@ async def run_daily_fetch_async(target_day: str) -> Dict[str, Any]:
     ]
 
     command_text = " ".join(cmd)
-    timeout_seconds = int(os.environ.get("FETCH_TIMEOUT_SECONDS", "500"))
+    timeout_seconds = int(os.environ.get("FETCH_TIMEOUT_SECONDS", "540"))
 
     try:
-        process = await asyncio.create_subprocess_exec(
-            *cmd,
+        completed = subprocess.run(
+            cmd,
             cwd=str(BASE_DIR),
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
+            capture_output=True,
+            text=True,
+            timeout=timeout_seconds,
         )
-
-        try:
-            stdout_bytes, stderr_bytes = await asyncio.wait_for(
-                process.communicate(),
-                timeout=timeout_seconds,
-            )
-        except asyncio.TimeoutError:
-            try:
-                process.kill()
-            except Exception:
-                pass
-
-            return _empty_response(
-                status="daily_fetch_timeout",
-                message=f"Extraction daily trop longue : timeout après {timeout_seconds} secondes.",
-                target_day=target_day,
-                stdout_tail="",
-                stderr_tail="",
-                command=command_text,
-            )
-
+    except subprocess.TimeoutExpired as exc:
+        return _empty_response(
+            status="daily_fetch_timeout",
+            message=f"Extraction daily trop longue : timeout après {timeout_seconds} secondes.",
+            target_day=target_day,
+            stdout_tail=exc.stdout or "",
+            stderr_tail=exc.stderr or "",
+            command=command_text,
+        )
     except Exception as exc:
-        # Si Railway bloque la création du sous-process, on essaie quand même de relire un payload existant.
-        try:
-            matches, payload_name = _read_payload_for_day(target_day)
-            if matches:
-                result = calculate_from_matches(matches)
-                result.setdefault("daily", {})
-                result["daily"].update(
-                    {
-                        "targetDay": target_day,
-                        "payloadCount": len(matches),
-                        "payloadPath": payload_name,
-                        "stdoutTail": "",
-                        "stderrTail": traceback.format_exc()[-1200:],
-                        "command": command_text,
-                        "fallback": "used_existing_payload_after_subprocess_error",
-                    }
-                )
-                return result
-        except Exception:
-            pass
-
         return _empty_response(
             status="daily_fetch_exception",
             message=f"Erreur lancement extraction daily : {exc}",
@@ -234,14 +198,13 @@ async def run_daily_fetch_async(target_day: str) -> Dict[str, Any]:
             command=command_text,
         )
 
-    stdout = (stdout_bytes or b"").decode("utf-8", errors="replace")
-    stderr = (stderr_bytes or b"").decode("utf-8", errors="replace")
-    return_code = process.returncode
+    stdout = completed.stdout or ""
+    stderr = completed.stderr or ""
 
-    if return_code != 0:
+    if completed.returncode != 0:
         return _empty_response(
             status="daily_fetch_failed",
-            message=f"Extraction daily échouée. Code retour : {return_code}",
+            message=f"Extraction daily échouée. Code retour : {completed.returncode}",
             target_day=target_day,
             stdout_tail=stdout,
             stderr_tail=stderr,
@@ -277,18 +240,6 @@ async def run_daily_fetch_async(target_day: str) -> Dict[str, Any]:
     return result
 
 
-async def run_daily_locked(target_day: str) -> Dict[str, Any]:
-    if _DAILY_LOCK.locked():
-        return _empty_response(
-            status="daily_fetch_busy",
-            message="Extraction daily déjà en cours. Réessaie dans quelques secondes.",
-            target_day=target_day,
-        )
-
-    async with _DAILY_LOCK:
-        return await run_daily_fetch_async(target_day)
-
-
 @app.get("/")
 async def root() -> Dict[str, Any]:
     return {
@@ -306,19 +257,10 @@ async def root() -> Dict[str, Any]:
 
 @app.get("/health")
 async def health() -> Dict[str, Any]:
-    try:
-        state = get_state()
-        history_rows = int(state.get("history_rows_loaded", 0))
-    except Exception as exc:
-        return {
-            "status": "error",
-            "message": str(exc),
-        }
-
     return {
         "status": "ok",
-        "engine": "loaded",
-        "historyRowsLoaded": history_rows,
+        "service": "Tennis Motor Railway Backend",
+        "message": "Backend alive",
     }
 
 
@@ -359,7 +301,7 @@ async def daily(day: str = Query("today")) -> Dict[str, Any]:
             target_day=str(day),
         )
 
-    return await run_daily_locked(target_day)
+    return await asyncio.to_thread(run_daily_fetch_sync, target_day)
 
 
 @app.get("/predictions")
@@ -373,7 +315,7 @@ async def predictions_get(day: str = Query("today")) -> Dict[str, Any]:
             target_day=str(day),
         )
 
-    return await run_daily_locked(target_day)
+    return await asyncio.to_thread(run_daily_fetch_sync, target_day)
 
 
 @app.get("/state")
@@ -381,11 +323,13 @@ async def state() -> Dict[str, Any]:
     try:
         s = get_state()
         return {
+            "status": "ok",
             "historyRowsLoaded": s.get("history_rows_loaded", 0),
             "rankReferenceSize": len(s.get("rank_reference_points", [])),
         }
     except Exception as exc:
         return {
+            "status": "error",
             "error": str(exc),
         }
 
