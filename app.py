@@ -257,11 +257,23 @@ async def root() -> Dict[str, Any]:
 
 @app.get("/health")
 async def health() -> Dict[str, Any]:
-    return {
-        "status": "ok",
-        "service": "Tennis Motor Railway Backend",
-        "message": "Backend alive",
-    }
+    try:
+        state = get_state()
+        history_rows = int(state.get("history_rows_loaded", 0))
+
+        return {
+            "status": "ok",
+            "service": "Tennis Motor Railway Backend",
+            "engine": "loaded",
+            "historyRowsLoaded": history_rows,
+        }
+    except Exception as exc:
+        return {
+            "status": "error",
+            "service": "Tennis Motor Railway Backend",
+            "engine": "not_loaded",
+            "error": str(exc),
+        }
 
 
 @app.post("/calculate")
