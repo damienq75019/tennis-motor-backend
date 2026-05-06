@@ -10,10 +10,9 @@ But :
   correspondant réellement à target_day ;
 - si aucune section datée fiable n'est trouvée, ne pas inventer de matchs.
 
-Correction importante :
-- suppression du fallback dangereux qui faisait des paires avec des noms consécutifs.
-- le script accepte seulement les vrais matchs détectés avec "vs" / "v.".
-- si les noms sont en lignes séparées autour de "Vs", le script reconstruit la paire proprement.
+Ce fichier est volontairement un wrapper complet : il réutilise le script V6.7
+existant pour toutes les fonctions lourdes déjà validées, puis remplace seulement
+la sélection des matchs du jour.
 """
 
 from __future__ import annotations
@@ -26,7 +25,7 @@ import sys
 from dataclasses import asdict
 from datetime import date
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 from urllib.parse import urlparse
 
 from bs4 import BeautifulSoup
@@ -122,6 +121,7 @@ def line_mentions_target_date(line: str, target_day: date) -> bool:
     day2 = f"{data['day']:02d}"
     year = str(data["year"])
 
+    # Signatures fortes : ISO ou mois + jour, ou weekday + mois/jour.
     if data["iso"] in ln:
         return True
 
@@ -135,6 +135,8 @@ def line_mentions_target_date(line: str, target_day: date) -> bool:
     if has_weekday and (has_month or has_day or has_year):
         return True
 
+    # Certains articles ATP titrent "Saturday Schedule" sans date numérique.
+    # On accepte seulement si la ligne ressemble à un titre de section.
     if has_weekday and re.search(r"\b(schedule|order of play|play|matches|draw|court|session)\b", ln):
         return True
 
@@ -153,9 +155,11 @@ def line_mentions_other_date(line: str, target_day: date) -> bool:
     if any(re.search(rf"\b{re.escape(w)}\b", ln) for w in weekdays):
         if re.search(r"\b(schedule|order of play|play|matches|draw|court|session)\b", ln):
             return True
+        # Ligne avec weekday + mois/jour = très probablement nouvelle section.
         if any(m in ln for m in _month_names()):
             return True
 
+    # Mois + jour différent, ex : "Sunday, April 27".
     for month in _month_names():
         if month not in ln:
             continue
@@ -199,7 +203,7 @@ def build_name_alias_index(display_map: Dict[str, str], valid_player_keys: Set[s
         }
 
         if len(parts) >= 2:
-            aliases.add(parts[-1])
+            aliases.add(parts[-1])  # nom de famille
             aliases.add(f"{parts[0]} {parts[-1]}")
             aliases.add(f"{parts[0][0]} {parts[-1]}")
 
@@ -209,6 +213,7 @@ def build_name_alias_index(display_map: Dict[str, str], valid_player_keys: Set[s
 
     out: Dict[str, List[str]] = {}
     for alias, names in tmp.items():
+        # garder seulement les alias non ambigus
         if len(names) == 1:
             out[alias] = list(names)
 
@@ -229,6 +234,7 @@ def find_player_in_fragment(
     if not norm:
         return None
 
+    # Plus long d'abord pour éviter de matcher un nom court avant un nom complet.
     for alias in sorted(alias_index.keys(), key=len, reverse=True):
         if re.search(rf"\b{re.escape(alias)}\b", norm):
             return alias_index[alias][0]
@@ -241,13 +247,9 @@ def extract_pair_from_vs_line(
     alias_index: Dict[str, List[str]],
     valid_player_keys: Set[str],
 ) -> Optional[Tuple[str, str]]:
+    # Supprimer les morceaux de contexte qui parasitent souvent une ligne ATP.
     cleaned = base.normalize_space(line)
-    cleaned = re.sub(
-        r"\b(Court|Stadium|Manolo Santana|Arantxa Sanchez|Not Before|NB|Starts at).*$",
-        "",
-        cleaned,
-        flags=re.I,
-    )
+    cleaned = re.sub(r"\b(Court|Stadium|Manolo Santana|Arantxa Sanchez|Not Before|NB|Starts at).*$", "", cleaned, flags=re.I)
 
     if not re.search(r"\b(vs|v)\.?\b", cleaned, flags=re.I):
         return None
@@ -258,6 +260,7 @@ def extract_pair_from_vs_line(
 
     left, right = parts[0], parts[1]
 
+    # Doubles : on ignore volontairement si / est présent autour du vs.
     if "/" in left or "/" in right:
         return None
 
@@ -277,15 +280,6 @@ def extract_pairs_from_lines(
     display_map: Dict[str, str],
     valid_player_keys: Set[str],
 ) -> List[Tuple[str, str]]:
-    """
-    Version RESTAURÉE : récupère les matchs ATP comme avant.
-
-    Important :
-    - On garde la détection directe "Joueur A vs Joueur B" si elle existe.
-    - Si aucune paire directe n'est trouvée, on remet le fallback ATP précédent :
-      extraction des noms valides dans la section datée, puis pairing consécutif.
-    - Ça restaure la récupération des matchs pour today/tomorrow/AAAA-MM-JJ.
-    """
     alias_index = build_name_alias_index(display_map, valid_player_keys)
     pairs: List[Tuple[str, str]] = []
 
@@ -297,9 +291,8 @@ def extract_pairs_from_lines(
     if pairs:
         return base.pair_consecutive_names([x for pair in pairs for x in pair])
 
-    # Fallback ATP restauré : section datée uniquement.
-    section_html = "
-".join(lines)
+    # Fallback dans la section datée uniquement : ordre des noms ATP.
+    section_html = "\n".join(lines)
     ordered_names = base.extract_ordered_valid_names(section_html, display_map, valid_player_keys)
     return base.pair_consecutive_names(ordered_names)
 
@@ -319,6 +312,7 @@ def split_target_sections(lines: Sequence[str], target_day: date) -> Tuple[List[
                 break
 
         section = list(lines[start:end])
+        # éviter des sections immenses si l'article ne découpe pas proprement
         if len(section) > 120:
             section = section[:120]
             audit.append("strict_section_clamped=120_lines")
@@ -353,6 +347,7 @@ def parse_article_pairs_strict_day(
         audit.append(f"undated_fallback_pairs={len(pairs)}")
         all_pairs.extend(pairs)
 
+    # dédoublonnage stable
     uniq: Dict[Tuple[str, str], Tuple[str, str]] = {}
     for a, b in all_pairs:
         key = (base.canonical_name(a), base.canonical_name(b))
@@ -371,6 +366,10 @@ def parse_tournament_context_strict(
     target_day: date,
     allow_undated_article_fallback: bool = False,
 ) -> Tuple[Any, List[str]]:
+    """
+    On laisse la V6.7 construire le contexte complet, puis on remplace seulement
+    ctx.article_pairs par des paires filtrées par target_day.
+    """
     ctx = base.parse_tournament_context(
         session=session,
         draw_url=draw_url,
@@ -407,6 +406,7 @@ def parse_tournament_context_strict(
         except Exception as exc:
             audit.append(f"[STRICT ARTICLE FAIL] {ctx.tournament_name} | {article_url} | {exc}")
 
+    # Remplacement essentiel : on ne garde pas les article_pairs globaux de la V6.7.
     ctx.article_pairs = strict_pairs
     return ctx, audit
 
