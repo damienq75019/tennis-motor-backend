@@ -278,65 +278,30 @@ def extract_pairs_from_lines(
     valid_player_keys: Set[str],
 ) -> List[Tuple[str, str]]:
     """
-    Extraction sécurisée des paires de matchs.
+    Version RESTAURÉE : récupère les matchs ATP comme avant.
 
-    Correction V6.9 :
-    - On ne fait plus de pairing automatique avec des noms consécutifs.
-    - On accepte seulement :
-      1) une ligne complète "Joueur A vs Joueur B" ;
-      2) le format ATP officiel en plusieurs lignes :
-         Joueur A
-         Vs
-         Joueur B
+    Important :
+    - On garde la détection directe "Joueur A vs Joueur B" si elle existe.
+    - Si aucune paire directe n'est trouvée, on remet le fallback ATP précédent :
+      extraction des noms valides dans la section datée, puis pairing consécutif.
+    - Ça restaure la récupération des matchs pour today/tomorrow/AAAA-MM-JJ.
     """
     alias_index = build_name_alias_index(display_map, valid_player_keys)
     pairs: List[Tuple[str, str]] = []
 
-    # 1) Cas simple : "Joueur A vs Joueur B" sur une même ligne.
     for ln in lines:
         pair = extract_pair_from_vs_line(ln, alias_index, valid_player_keys)
         if pair:
             pairs.append(pair)
 
-    # 2) Cas ATP officiel : noms sur plusieurs lignes autour de "Vs".
-    for i, ln in enumerate(lines):
-        clean = base.normalize_space(ln)
+    if pairs:
+        return base.pair_consecutive_names([x for pair in pairs for x in pair])
 
-        if not re.fullmatch(r"(?i)(vs|v\.?)", clean):
-            continue
-
-        player_a: Optional[str] = None
-        player_b: Optional[str] = None
-
-        # Chercher le joueur A dans les lignes précédentes.
-        for j in range(i - 1, max(-1, i - 10), -1):
-            candidate = find_player_in_fragment(lines[j], alias_index, valid_player_keys)
-            if candidate:
-                player_a = candidate
-                break
-
-        # Chercher le joueur B dans les lignes suivantes.
-        for j in range(i + 1, min(len(lines), i + 10)):
-            candidate = find_player_in_fragment(lines[j], alias_index, valid_player_keys)
-            if candidate:
-                player_b = candidate
-                break
-
-        if not player_a or not player_b:
-            continue
-
-        if base.canonical_name(player_a) == base.canonical_name(player_b):
-            continue
-
-        pairs.append((player_a, player_b))
-
-    # 3) Déduplication stable.
-    uniq: Dict[Tuple[str, str], Tuple[str, str]] = {}
-    for a, b in pairs:
-        key = (base.canonical_name(a), base.canonical_name(b))
-        uniq[key] = (a, b)
-
-    return list(uniq.values())
+    # Fallback ATP restauré : section datée uniquement.
+    section_html = "
+".join(lines)
+    ordered_names = base.extract_ordered_valid_names(section_html, display_map, valid_player_keys)
+    return base.pair_consecutive_names(ordered_names)
 
 
 def split_target_sections(lines: Sequence[str], target_day: date) -> Tuple[List[List[str]], List[str]]:
