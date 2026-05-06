@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Tennis Motor - Fetch daily lines V6.9 STRICT DAY FILTER
+Tennis Motor - Fetch daily lines V6.11 ATP DAILY SCHEDULE SCROLL FIX
 
 But :
 - garder le moteur / veto existant de la V6.7 ;
@@ -39,7 +39,7 @@ BASE_MODULE_CANDIDATES = [
     "fetch_day_lines_v6_5_results_context_safe",
 ]
 
-MODE = "V6_9_STRICT_DAY_FILTER"
+MODE = "V6_11_ATP_DAILY_SCHEDULE_SCROLL_FIX"
 PAYLOAD_LATEST_PATH = Path("output") / "payload_latest.json"
 
 
@@ -363,12 +363,44 @@ def atp_daily_schedule_url_from_draw_url(draw_url: str) -> Optional[str]:
 def fetch_atp_daily_schedule_html(session, schedule_url: str) -> Tuple[str, List[str]]:
     """
     Récupère le HTML ATP Daily Schedule.
-    Priorité : Playwright avec scroll si disponible.
-    Secours : fetch_html/session simple si Playwright indisponible.
+
+    Ordre volontaire :
+    1) HTTP direct avec gros User-Agent : la page ATP daily-schedule expose souvent
+       le programme dans le HTML déjà rendu. C'est plus stable sur Railway.
+    2) Playwright + scroll si disponible.
+    3) base.fetch_html en dernier secours.
     """
     audit: List[str] = []
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/124.0 Safari/537.36"
+        ),
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9,fr;q=0.8",
+        "Cache-Control": "no-cache",
+        "Pragma": "no-cache",
+        "Referer": "https://www.atptour.com/en/scores/current",
+    }
 
-    # 1) Playwright + scroll, utile si ATP charge une partie du programme après rendu JS.
+    urls_to_try = [schedule_url]
+    if "?" not in schedule_url:
+        urls_to_try.append(schedule_url + "?matchType=Singles")
+
+    # 1) HTTP direct avec la session existante.
+    for url in urls_to_try:
+        try:
+            resp = session.get(url, headers=headers, timeout=45)
+            text = resp.text or ""
+            audit.append(f"daily_schedule_fetch=http_status:{getattr(resp, 'status_code', 'unknown')} len={len(text)} url={url}")
+            if resp.status_code == 200 and len(text) > 5000 and ("Vs" in text or "Defeats" in text or "daily-schedule" in text):
+                audit.append("daily_schedule_fetch=http_direct_ok")
+                return text, audit
+        except Exception as exc:
+            audit.append(f"daily_schedule_fetch=http_direct_failed:{type(exc).__name__}:{exc}")
+
+    # 2) Playwright + scroll, utile si ATP charge une partie du programme après rendu JS.
     try:
         from playwright.sync_api import sync_playwright  # type: ignore
 
@@ -377,34 +409,28 @@ def fetch_atp_daily_schedule_html(session, schedule_url: str) -> Tuple[str, List
                 headless=True,
                 args=["--no-sandbox", "--disable-dev-shm-usage"],
             )
-            page = browser.new_page(
-                user_agent=(
-                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                    "AppleWebKit/537.36 (KHTML, like Gecko) "
-                    "Chrome/124.0 Safari/537.36"
-                ),
-                viewport={"width": 1400, "height": 2200},
-            )
-            page.goto(schedule_url, wait_until="networkidle", timeout=60000)
+            page = browser.new_page(user_agent=headers["User-Agent"], viewport={"width": 1400, "height": 2400})
+            page.goto(schedule_url, wait_until="domcontentloaded", timeout=60000)
+            page.wait_for_timeout(2500)
 
-            # Fermer cookies si un bouton existe.
             for selector in [
+                "#onetrust-accept-btn-handler",
                 "button:has-text('Accept')",
                 "button:has-text('I Accept')",
                 "button:has-text('Agree')",
                 "button:has-text('OK')",
-                "#onetrust-accept-btn-handler",
             ]:
                 try:
                     page.locator(selector).first.click(timeout=1500)
+                    page.wait_for_timeout(500)
                     break
                 except Exception:
                     pass
 
-            last_height = 0
-            for _ in range(12):
-                page.mouse.wheel(0, 1800)
-                page.wait_for_timeout(700)
+            last_height = -1
+            for _ in range(18):
+                page.mouse.wheel(0, 2200)
+                page.wait_for_timeout(850)
                 height = page.evaluate("document.body.scrollHeight")
                 if height == last_height:
                     break
@@ -412,15 +438,15 @@ def fetch_atp_daily_schedule_html(session, schedule_url: str) -> Tuple[str, List
 
             html = page.content()
             browser.close()
-            audit.append("daily_schedule_fetch=playwright_scroll_ok")
+            audit.append(f"daily_schedule_fetch=playwright_scroll_ok len={len(html)}")
             return html, audit
     except Exception as exc:
         audit.append(f"daily_schedule_fetch=playwright_failed:{type(exc).__name__}:{exc}")
 
-    # 2) Secours léger : requests/session via fonctions existantes.
+    # 3) Secours léger : fonction existante.
     try:
         html = base.fetch_html(session, schedule_url)
-        audit.append("daily_schedule_fetch=base_fetch_html_ok")
+        audit.append(f"daily_schedule_fetch=base_fetch_html_ok len={len(html)}")
         return html, audit
     except Exception as exc:
         audit.append(f"daily_schedule_fetch=base_fetch_html_failed:{type(exc).__name__}:{exc}")
@@ -458,6 +484,46 @@ def extract_schedule_pair_from_line(
     return (a, b)
 
 
+def _is_noise_schedule_line(line: str) -> bool:
+    x = base.normalize_space(line or "")
+    n = _norm_ascii(x)
+    if not x:
+        return True
+    if n in {"image player photo", "player photo", "h2h", "wta", "atp", "followed by"}:
+        return True
+    if re.fullmatch(r"r\d+", n):
+        return True
+    if re.fullmatch(r"(q|wc|pr|ll|se)", n):
+        return True
+    if re.fullmatch(r"\(?\s*(q|wc|pr|ll|se)\s*\)?", n):
+        return True
+    if re.search(r"\b(starts at|not before|court|campo|arena|pietrangeli|centrale|refresh|print|use local time zone)\b", n):
+        return True
+    # Scores : 63, 76^{8}, 06 64 76 etc.
+    if re.fullmatch(r"[0-9\s\^{}()]+", n):
+        return True
+    return False
+
+
+def _find_near_schedule_player(
+    lines: Sequence[str],
+    start: int,
+    stop: int,
+    step: int,
+    alias_index: Dict[str, List[str]],
+    valid_player_keys: Set[str],
+) -> Optional[str]:
+    j = start
+    while (j > stop if step < 0 else j < stop):
+        ln = lines[j]
+        if not _is_noise_schedule_line(ln) and "/" not in ln:
+            candidate = find_player_in_fragment(ln, alias_index, valid_player_keys)
+            if candidate:
+                return candidate
+        j += step
+    return None
+
+
 def extract_pairs_from_atp_daily_schedule_lines(
     lines: Sequence[str],
     display_map: Dict[str, str],
@@ -465,12 +531,16 @@ def extract_pairs_from_atp_daily_schedule_lines(
 ) -> List[Tuple[str, str]]:
     """
     Extraction officielle depuis ATP Daily Schedule.
-    Ne fait jamais de paires par noms consécutifs.
-    Les paires doivent être autour d'un vrai marqueur ATP : Vs / Defeats / etc.
+
+    Sécurité :
+    - aucune paire par noms consécutifs globaux ;
+    - paire acceptée seulement autour d'un marqueur officiel ATP : Vs / Defeats ;
+    - WTA ignoré automatiquement car les joueuses ne sont pas dans le points_map ATP ;
+    - support des formats ATP en lignes séparées : Initiale. Nom / Vs / Initiale. Nom.
     """
     alias_index = build_name_alias_index(display_map, valid_player_keys)
     pairs: List[Tuple[str, str]] = []
-    markers = re.compile(r"(?i)^(vs|v\.?|defeats|def\.?|walkover|retired|retires)$")
+    marker_line = re.compile(r"(?i)^(vs|v\.?|defeats|def\.?|walkover|retired|retires)$")
 
     # Cas 1 : tout sur la même ligne.
     for ln in lines:
@@ -478,30 +548,28 @@ def extract_pairs_from_atp_daily_schedule_lines(
         if pair:
             pairs.append(pair)
 
-    # Cas 2 : ATP en lignes séparées : joueur A / Vs / joueur B.
+    # Cas 2 : ATP en lignes séparées : joueur A / Vs|Defeats / joueur B.
     for i, ln in enumerate(lines):
         clean = base.normalize_space(ln)
-        if not markers.fullmatch(clean):
+        if not marker_line.fullmatch(clean):
             continue
 
-        player_a: Optional[str] = None
-        player_b: Optional[str] = None
-
-        for j in range(i - 1, max(-1, i - 12), -1):
-            if "/" in lines[j]:
-                continue
-            candidate = find_player_in_fragment(lines[j], alias_index, valid_player_keys)
-            if candidate:
-                player_a = candidate
-                break
-
-        for j in range(i + 1, min(len(lines), i + 12)):
-            if "/" in lines[j]:
-                continue
-            candidate = find_player_in_fragment(lines[j], alias_index, valid_player_keys)
-            if candidate:
-                player_b = candidate
-                break
+        player_a = _find_near_schedule_player(
+            lines,
+            start=i - 1,
+            stop=max(-1, i - 14),
+            step=-1,
+            alias_index=alias_index,
+            valid_player_keys=valid_player_keys,
+        )
+        player_b = _find_near_schedule_player(
+            lines,
+            start=i + 1,
+            stop=min(len(lines), i + 14),
+            step=1,
+            alias_index=alias_index,
+            valid_player_keys=valid_player_keys,
+        )
 
         if player_a and player_b and base.canonical_name(player_a) != base.canonical_name(player_b):
             pairs.append((player_a, player_b))
