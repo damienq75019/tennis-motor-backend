@@ -19,7 +19,7 @@ from motor import calculate_predictions, get_state
 BASE_DIR = Path(__file__).resolve().parent
 OUTPUT_DIR = BASE_DIR / "output"
 PAYLOAD_LATEST_PATH = OUTPUT_DIR / "payload_latest.json"
-DAILY_SCRIPT_NAME = "fetch_day_lines_v6_10_daily_schedule_only.py"
+fetch_day_lines_v6_10d_daily_schedule_full_payload.py
 
 app = FastAPI(title="Tennis Motor Railway Backend")
 
