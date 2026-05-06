@@ -23,6 +23,7 @@ import importlib
 import json
 import re
 import sys
+import time
 from dataclasses import asdict
 from datetime import date
 from pathlib import Path
@@ -278,29 +279,279 @@ def extract_pairs_from_lines(
     valid_player_keys: Set[str],
 ) -> List[Tuple[str, str]]:
     """
-    Version restaurée + sécurisée.
+    Extraction sécurisée des paires de matchs.
 
-    1) Si la source contient de vraies lignes "Joueur A vs Joueur B", on les utilise.
-    2) Sinon, on garde le fallback ATP précédent pour continuer à récupérer les matchs.
-
-    Important : ce fallback peut encore être corrigé ensuite par SportyTrader dans
-    parse_tournament_context_strict(), sans casser la récupération ATP.
+    Correction V6.9 :
+    - On ne fait plus de pairing automatique avec des noms consécutifs.
+    - On accepte seulement :
+      1) une ligne complète "Joueur A vs Joueur B" ;
+      2) le format ATP officiel en plusieurs lignes :
+         Joueur A
+         Vs
+         Joueur B
     """
     alias_index = build_name_alias_index(display_map, valid_player_keys)
     pairs: List[Tuple[str, str]] = []
 
+    # 1) Cas simple : "Joueur A vs Joueur B" sur une même ligne.
     for ln in lines:
         pair = extract_pair_from_vs_line(ln, alias_index, valid_player_keys)
         if pair:
             pairs.append(pair)
 
-    if pairs:
-        return base.pair_consecutive_names([x for pair in pairs for x in pair])
+    # 2) Cas ATP officiel : noms sur plusieurs lignes autour de "Vs".
+    for i, ln in enumerate(lines):
+        clean = base.normalize_space(ln)
 
-    # Fallback ATP restauré : section datée uniquement.
-    section_html = "\\n".join(lines)
-    ordered_names = base.extract_ordered_valid_names(section_html, display_map, valid_player_keys)
-    return base.pair_consecutive_names(ordered_names)
+        if not re.fullmatch(r"(?i)(vs|v\.?)", clean):
+            continue
+
+        player_a: Optional[str] = None
+        player_b: Optional[str] = None
+
+        # Chercher le joueur A dans les lignes précédentes.
+        for j in range(i - 1, max(-1, i - 10), -1):
+            candidate = find_player_in_fragment(lines[j], alias_index, valid_player_keys)
+            if candidate:
+                player_a = candidate
+                break
+
+        # Chercher le joueur B dans les lignes suivantes.
+        for j in range(i + 1, min(len(lines), i + 10)):
+            candidate = find_player_in_fragment(lines[j], alias_index, valid_player_keys)
+            if candidate:
+                player_b = candidate
+                break
+
+        if not player_a or not player_b:
+            continue
+
+        if base.canonical_name(player_a) == base.canonical_name(player_b):
+            continue
+
+        pairs.append((player_a, player_b))
+
+    # 3) Déduplication stable.
+    uniq: Dict[Tuple[str, str], Tuple[str, str]] = {}
+    for a, b in pairs:
+        key = (base.canonical_name(a), base.canonical_name(b))
+        uniq[key] = (a, b)
+
+    return list(uniq.values())
+
+
+
+def atp_daily_schedule_url_from_draw_url(draw_url: str) -> Optional[str]:
+    """
+    Transforme une URL ATP draw en URL ATP daily schedule.
+    Exemple :
+    /en/scores/current/rome/416/draws -> /en/scores/current/rome/416/daily-schedule
+    """
+    try:
+        parsed = urlparse(draw_url)
+        path = parsed.path or draw_url
+        m = re.search(r"/scores/current/([^/]+)/([^/]+)", path)
+        if not m:
+            return None
+        slug = m.group(1)
+        event_id = m.group(2)
+        return f"https://www.atptour.com/en/scores/current/{slug}/{event_id}/daily-schedule"
+    except Exception:
+        return None
+
+
+def fetch_atp_daily_schedule_html(session, schedule_url: str) -> Tuple[str, List[str]]:
+    """
+    Récupère le HTML ATP Daily Schedule.
+    Priorité : Playwright avec scroll si disponible.
+    Secours : fetch_html/session simple si Playwright indisponible.
+    """
+    audit: List[str] = []
+
+    # 1) Playwright + scroll, utile si ATP charge une partie du programme après rendu JS.
+    try:
+        from playwright.sync_api import sync_playwright  # type: ignore
+
+        with sync_playwright() as p:
+            browser = p.chromium.launch(
+                headless=True,
+                args=["--no-sandbox", "--disable-dev-shm-usage"],
+            )
+            page = browser.new_page(
+                user_agent=(
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/124.0 Safari/537.36"
+                ),
+                viewport={"width": 1400, "height": 2200},
+            )
+            page.goto(schedule_url, wait_until="networkidle", timeout=60000)
+
+            # Fermer cookies si un bouton existe.
+            for selector in [
+                "button:has-text('Accept')",
+                "button:has-text('I Accept')",
+                "button:has-text('Agree')",
+                "button:has-text('OK')",
+                "#onetrust-accept-btn-handler",
+            ]:
+                try:
+                    page.locator(selector).first.click(timeout=1500)
+                    break
+                except Exception:
+                    pass
+
+            last_height = 0
+            for _ in range(12):
+                page.mouse.wheel(0, 1800)
+                page.wait_for_timeout(700)
+                height = page.evaluate("document.body.scrollHeight")
+                if height == last_height:
+                    break
+                last_height = height
+
+            html = page.content()
+            browser.close()
+            audit.append("daily_schedule_fetch=playwright_scroll_ok")
+            return html, audit
+    except Exception as exc:
+        audit.append(f"daily_schedule_fetch=playwright_failed:{type(exc).__name__}:{exc}")
+
+    # 2) Secours léger : requests/session via fonctions existantes.
+    try:
+        html = base.fetch_html(session, schedule_url)
+        audit.append("daily_schedule_fetch=base_fetch_html_ok")
+        return html, audit
+    except Exception as exc:
+        audit.append(f"daily_schedule_fetch=base_fetch_html_failed:{type(exc).__name__}:{exc}")
+        return "", audit
+
+
+def extract_schedule_pair_from_line(
+    line: str,
+    alias_index: Dict[str, List[str]],
+    valid_player_keys: Set[str],
+) -> Optional[Tuple[str, str]]:
+    """
+    Détecte une paire dans une ligne ATP si la ligne contient déjà :
+    Joueur A vs Joueur B / Joueur A defeats Joueur B.
+    """
+    cleaned = base.normalize_space(line)
+    marker = r"(?:vs|v\.?|defeats|def\.?|walkover|retired|retires)"
+    if not re.search(rf"\b{marker}\b", cleaned, flags=re.I):
+        return None
+
+    parts = re.split(rf"\b{marker}\b", cleaned, maxsplit=1, flags=re.I)
+    if len(parts) != 2:
+        return None
+
+    left, right = parts[0], parts[1]
+    if "/" in left or "/" in right:
+        return None
+
+    a = find_player_in_fragment(left, alias_index, valid_player_keys)
+    b = find_player_in_fragment(right, alias_index, valid_player_keys)
+    if not a or not b:
+        return None
+    if base.canonical_name(a) == base.canonical_name(b):
+        return None
+    return (a, b)
+
+
+def extract_pairs_from_atp_daily_schedule_lines(
+    lines: Sequence[str],
+    display_map: Dict[str, str],
+    valid_player_keys: Set[str],
+) -> List[Tuple[str, str]]:
+    """
+    Extraction officielle depuis ATP Daily Schedule.
+    Ne fait jamais de paires par noms consécutifs.
+    Les paires doivent être autour d'un vrai marqueur ATP : Vs / Defeats / etc.
+    """
+    alias_index = build_name_alias_index(display_map, valid_player_keys)
+    pairs: List[Tuple[str, str]] = []
+    markers = re.compile(r"(?i)^(vs|v\.?|defeats|def\.?|walkover|retired|retires)$")
+
+    # Cas 1 : tout sur la même ligne.
+    for ln in lines:
+        pair = extract_schedule_pair_from_line(ln, alias_index, valid_player_keys)
+        if pair:
+            pairs.append(pair)
+
+    # Cas 2 : ATP en lignes séparées : joueur A / Vs / joueur B.
+    for i, ln in enumerate(lines):
+        clean = base.normalize_space(ln)
+        if not markers.fullmatch(clean):
+            continue
+
+        player_a: Optional[str] = None
+        player_b: Optional[str] = None
+
+        for j in range(i - 1, max(-1, i - 12), -1):
+            if "/" in lines[j]:
+                continue
+            candidate = find_player_in_fragment(lines[j], alias_index, valid_player_keys)
+            if candidate:
+                player_a = candidate
+                break
+
+        for j in range(i + 1, min(len(lines), i + 12)):
+            if "/" in lines[j]:
+                continue
+            candidate = find_player_in_fragment(lines[j], alias_index, valid_player_keys)
+            if candidate:
+                player_b = candidate
+                break
+
+        if player_a and player_b and base.canonical_name(player_a) != base.canonical_name(player_b):
+            pairs.append((player_a, player_b))
+
+    uniq: Dict[Tuple[str, str], Tuple[str, str]] = {}
+    for a, b in pairs:
+        key = (base.canonical_name(a), base.canonical_name(b))
+        uniq[key] = (a, b)
+    return list(uniq.values())
+
+
+def parse_atp_daily_schedule_pairs(
+    html: str,
+    display_map: Dict[str, str],
+    valid_player_keys: Set[str],
+    target_day: date,
+) -> Tuple[List[Tuple[str, str]], List[str]]:
+    lines = extract_article_lines(html)
+    audit: List[str] = [f"daily_schedule_lines={len(lines)}"]
+
+    if not lines:
+        audit.append("daily_schedule_pairs=0")
+        return [], audit
+
+    sections, section_audit = split_target_sections(lines, target_day)
+    audit.extend(section_audit)
+
+    candidate_sections: List[List[str]] = []
+    if sections:
+        candidate_sections = sections
+        audit.append(f"daily_schedule_date_sections_used={len(sections)}")
+    else:
+        # Beaucoup de pages ATP daily-schedule sont déjà filtrées sur le jour affiché.
+        candidate_sections = [list(lines)]
+        audit.append("daily_schedule_no_date_section_using_full_page=true")
+
+    all_pairs: List[Tuple[str, str]] = []
+    for section in candidate_sections:
+        pairs = extract_pairs_from_atp_daily_schedule_lines(section, display_map, valid_player_keys)
+        audit.append(f"daily_schedule_section_pairs={len(pairs)}")
+        all_pairs.extend(pairs)
+
+    uniq: Dict[Tuple[str, str], Tuple[str, str]] = {}
+    for a, b in all_pairs:
+        key = (base.canonical_name(a), base.canonical_name(b))
+        uniq[key] = (a, b)
+
+    final_pairs = list(uniq.values())
+    audit.append(f"daily_schedule_pairs={len(final_pairs)}")
+    return final_pairs, audit
 
 
 def split_target_sections(lines: Sequence[str], target_day: date) -> Tuple[List[List[str]], List[str]]:
@@ -362,177 +613,6 @@ def parse_article_pairs_strict_day(
     return final_pairs, audit
 
 
-
-# ---------------------------------------------------------------------------
-# Validation / correction des paires via SportyTrader
-# ---------------------------------------------------------------------------
-
-SPORTYTRADER_ATP_URLS = [
-    "https://www.sportytrader.com/en/odds/tennis/atp-s/",
-    "https://www.sportytrader.com/cotes/tennis/atp-s/",
-]
-
-_FR_MONTHS = {
-    1: ["janvier", "janv", "jan"],
-    2: ["fevrier", "fevr", "fev", "february", "feb"],
-    3: ["mars", "march", "mar"],
-    4: ["avril", "april", "apr"],
-    5: ["mai", "may"],
-    6: ["juin", "june", "jun"],
-    7: ["juillet", "july", "jul"],
-    8: ["aout", "august", "aug"],
-    9: ["septembre", "september", "sep"],
-    10: ["octobre", "october", "oct"],
-    11: ["novembre", "november", "nov"],
-    12: ["decembre", "december", "dec"],
-}
-
-
-def line_mentions_target_date_flexible(line: str, target_day: date) -> bool:
-    ln = _norm_ascii(line)
-    day = target_day.day
-    day1 = str(day)
-    day2 = f"{day:02d}"
-    month_num = target_day.month
-
-    if target_day.isoformat() in ln:
-        return True
-
-    # Formats numériques : 06/05, 6/5, 05/06 selon site.
-    numeric_patterns = [
-        rf"\b{day1}/{month_num}\b",
-        rf"\b{day2}/{month_num:02d}\b",
-        rf"\b{month_num}/{day1}\b",
-        rf"\b{month_num:02d}/{day2}\b",
-    ]
-    if any(re.search(p, ln) for p in numeric_patterns):
-        return True
-
-    month_words = _FR_MONTHS.get(month_num, []) + [target_day.strftime("%B").lower()]
-    has_day = re.search(rf"\b({day1}|{day2})(st|nd|rd|th)?\b", ln) is not None
-    has_month = any(re.search(rf"\b{re.escape(_norm_ascii(m))}\b", ln) for m in month_words)
-
-    return bool(has_day and has_month)
-
-
-def extract_sportytrader_pairs_from_html(
-    html: str,
-    display_map: Dict[str, str],
-    valid_player_keys: Set[str],
-    target_day: date,
-) -> Tuple[List[Tuple[str, str]], List[str]]:
-    """
-    Lit la page SportyTrader ATP et récupère uniquement des paires explicites
-    du type "Joueur A - Joueur B".
-
-    On ne fait aucun calcul avec les cotes ici. SportyTrader sert seulement à
-    corriger l'association joueur A / joueur B quand l'article ATP mélange les noms.
-    """
-    lines = extract_article_lines(html)
-    audit: List[str] = [f"sporty_lines={len(lines)}"]
-    alias_index = build_name_alias_index(display_map, valid_player_keys)
-
-    target_date_exists = any(line_mentions_target_date_flexible(ln, target_day) for ln in lines)
-    audit.append(f"sporty_target_date_seen={str(target_date_exists).lower()}")
-
-    pairs: List[Tuple[str, str]] = []
-
-    for i, ln in enumerate(lines):
-        clean = base.normalize_space(ln)
-
-        # SportyTrader affiche les matchs ainsi : "Player A - Player B".
-        if " - " not in clean:
-            continue
-
-        # Si une date cible est visible sur la page, on exige qu'elle soit proche
-        # de la ligne du match pour éviter de prendre un autre jour.
-        if target_date_exists:
-            window = lines[max(0, i - 6): min(len(lines), i + 3)]
-            if not any(line_mentions_target_date_flexible(x, target_day) for x in window):
-                continue
-
-        left, right = clean.split(" - ", 1)
-
-        if "/" in left or "/" in right:
-            continue
-
-        a = find_player_in_fragment(left, alias_index, valid_player_keys)
-        b = find_player_in_fragment(right, alias_index, valid_player_keys)
-
-        if not a or not b:
-            continue
-        if base.canonical_name(a) == base.canonical_name(b):
-            continue
-
-        pairs.append((a, b))
-
-    uniq: Dict[Tuple[str, str], Tuple[str, str]] = {}
-    for a, b in pairs:
-        key = (base.canonical_name(a), base.canonical_name(b))
-        uniq[key] = (a, b)
-
-    final_pairs = list(uniq.values())
-    audit.append(f"sporty_pairs={len(final_pairs)}")
-    return final_pairs, audit
-
-
-def get_sportytrader_pairs_for_context(
-    session,
-    ctx,
-    display_map: Dict[str, str],
-    valid_player_keys: Set[str],
-    target_day: date,
-) -> Tuple[List[Tuple[str, str]], List[str]]:
-    """
-    Essaie de récupérer les vraies paires du jour via SportyTrader,
-    puis garde seulement les joueurs appartenant au tournoi/contexte ATP courant.
-
-    Si SportyTrader échoue ou ne donne rien, le script retombe sur l'ancienne
-    extraction ATP. Donc la récupération ne tombe pas à zéro.
-    """
-    audit: List[str] = []
-
-    ctx_player_keys = set(getattr(ctx, "player_keys", set()) or set())
-    if not ctx_player_keys:
-        audit.append("[SPORTY] ctx_player_keys=0 -> skipped")
-        return [], audit
-
-    for url in SPORTYTRADER_ATP_URLS:
-        try:
-            html = base.fetch_html(session, url)
-            pairs, paudit = extract_sportytrader_pairs_from_html(
-                html=html,
-                display_map=display_map,
-                valid_player_keys=valid_player_keys,
-                target_day=target_day,
-            )
-            audit.append(f"[SPORTY URL] pairs_raw={len(pairs)} | url={url}")
-            audit.extend(f"  {x}" for x in paudit)
-
-            filtered: List[Tuple[str, str]] = []
-            for a, b in pairs:
-                ka = base.canonical_name(a)
-                kb = base.canonical_name(b)
-                if ka in ctx_player_keys and kb in ctx_player_keys:
-                    filtered.append((a, b))
-
-            # Dédoublonnage stable.
-            uniq: Dict[Tuple[str, str], Tuple[str, str]] = {}
-            for a, b in filtered:
-                uniq[(base.canonical_name(a), base.canonical_name(b))] = (a, b)
-            filtered = list(uniq.values())
-
-            audit.append(f"[SPORTY FILTERED] {ctx.tournament_name} | count={len(filtered)}")
-
-            if filtered:
-                return filtered, audit
-
-        except Exception as exc:
-            audit.append(f"[SPORTY FAIL] {url} | {exc}")
-
-    return [], audit
-
-
 def parse_tournament_context_strict(
     session,
     draw_url: str,
@@ -541,15 +621,6 @@ def parse_tournament_context_strict(
     target_day: date,
     allow_undated_article_fallback: bool = False,
 ) -> Tuple[Any, List[str]]:
-    """
-    On laisse la V6.7 construire le contexte complet.
-
-    Ordre de sélection des paires :
-    1) SportyTrader, uniquement pour corriger l'association Joueur A / Joueur B.
-    2) Si SportyTrader ne donne rien : ancienne extraction ATP stricte par article.
-
-    Le moteur/veto reste inchangé.
-    """
     ctx = base.parse_tournament_context(
         session=session,
         draw_url=draw_url,
@@ -561,24 +632,28 @@ def parse_tournament_context_strict(
     audit: List[str] = []
     strict_pairs: List[Tuple[str, str]] = []
 
-    # 1) Correction paires via SportyTrader.
-    sporty_pairs, sporty_audit = get_sportytrader_pairs_for_context(
-        session=session,
-        ctx=ctx,
-        display_map=display_map,
-        valid_player_keys=valid_player_keys,
-        target_day=target_day,
-    )
-    audit.extend(sporty_audit)
+    # Source prioritaire : ATP Daily Schedule officiel, avec scroll Playwright si disponible.
+    schedule_url = atp_daily_schedule_url_from_draw_url(draw_url)
+    if schedule_url:
+        audit.append(f"[ATP DAILY SCHEDULE] {ctx.tournament_name} | url={schedule_url}")
+        schedule_html, fetch_audit = fetch_atp_daily_schedule_html(session, schedule_url)
+        audit.extend(f"  {x}" for x in fetch_audit)
+        schedule_pairs, schedule_parse_audit = parse_atp_daily_schedule_pairs(
+            schedule_html,
+            display_map,
+            valid_player_keys,
+            target_day,
+        )
+        audit.extend(f"  {x}" for x in schedule_parse_audit)
+        if schedule_pairs:
+            ctx.article_pairs = schedule_pairs
+            audit.append(f"[ATP DAILY SCHEDULE OK] {ctx.tournament_name} | pairs={len(schedule_pairs)}")
+            return ctx, audit
 
-    if sporty_pairs:
-        ctx.article_pairs = sporty_pairs
-        audit.append(f"[DAY PAIRS SOURCE] {ctx.tournament_name} | source=sportytrader | count={len(sporty_pairs)}")
-        return ctx, audit
-
-    # 2) Fallback ATP comme avant.
+    # Fallback : articles ATP strictement datés. Ne sert que si daily schedule ne donne rien.
     article_urls = base.discover_schedule_article_urls(session, ctx.slug, target_day.year)
-    audit.append(f"[STRICT ARTICLE] {ctx.tournament_name} | urls={len(article_urls)}")
+
+    audit.append(f"[STRICT ARTICLE FALLBACK] {ctx.tournament_name} | urls={len(article_urls)}")
 
     for article_url in article_urls:
         try:
@@ -603,7 +678,6 @@ def parse_tournament_context_strict(
             audit.append(f"[STRICT ARTICLE FAIL] {ctx.tournament_name} | {article_url} | {exc}")
 
     ctx.article_pairs = strict_pairs
-    audit.append(f"[DAY PAIRS SOURCE] {ctx.tournament_name} | source=atp_article_fallback | count={len(strict_pairs)}")
     return ctx, audit
 
 
