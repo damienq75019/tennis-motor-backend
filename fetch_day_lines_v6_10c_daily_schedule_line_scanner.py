@@ -45,7 +45,7 @@ BASE_MODULE_CANDIDATES = [
     "fetch_day_lines_v6_5_results_context_safe",
 ]
 
-MODE = "V6_10C_DAILY_SCHEDULE_LINE_SCANNER"
+MODE = "V6_10C_DAILY_SCHEDULE_LINE_SCANNER_FIXED"
 PAYLOAD_LATEST_PATH = Path("output") / "payload_latest.json"
 
 
@@ -302,47 +302,123 @@ def append_pair_if_valid(
             "playerB": b,
             "source": source,
             "sourceUrl": source_url,
-            "evidence": normalize_space(evidence)[:260],
+            "evidence": normalize_space(evidence)[:320],
         }
     )
     return True
 
 
-def _is_inside_player_link(node: Any) -> bool:
-    parent = getattr(node, "parent", None)
-    while parent is not None:
-        if isinstance(parent, Tag):
-            href = parent.get("href", "") if parent.name == "a" else ""
-            if href and "/players/" in href:
-                return True
-        parent = getattr(parent, "parent", None)
-    return False
+def _marker_name(name: str) -> str:
+    name = clean_name(name)
+    name = name.replace("[[ATP_PLAYER:", "").replace("]]", "")
+    return name
 
 
-def _text_to_small_lines(text: str) -> List[str]:
-    raw = (text or "").replace("\xa0", " ")
-    lines: List[str] = []
+def _replace_player_links_with_markers(soup: BeautifulSoup) -> None:
+    """
+    Remplace seulement les liens ATP /players/ par un marqueur texte.
+    Important : les joueuses WTA de la page daily-schedule ne sont pas des liens ATP /players/,
+    donc elles ne deviennent jamais des tokens PLAYER.
+    """
+    for a in soup.find_all("a", href=True):
+        href = a.get("href", "") or ""
 
-    for chunk in re.split(r"[\n\r\t]+", raw):
-        chunk = normalize_space(chunk)
-        if not chunk:
+        if "/players/" not in href:
             continue
 
-        # Les pages ATP mettent parfois plusieurs petits labels sur la même ligne.
-        # On garde le texte original, puis on découpe seulement les séparateurs très nets.
-        pieces = [normalize_space(x) for x in re.split(r"\s{2,}", chunk) if normalize_space(x)]
+        name = full_name_from_href(href, a.get_text(" ", strip=True))
+        name = clean_name(name)
 
-        if pieces:
-            lines.extend(pieces)
-        else:
-            lines.append(chunk)
+        if not name or not is_name_like(name):
+            continue
 
-    return lines
+        a.clear()
+        a.append(f"[[ATP_PLAYER:{name}]]")
+
+
+def _line_to_tokens(line: str) -> List[Dict[str, str]]:
+    """
+    Convertit une ligne visible en tokens.
+    Une ligne peut contenir un marqueur joueur + du texte autour.
+    """
+    tokens: List[Dict[str, str]] = []
+    raw = normalize_space(line)
+
+    if not raw:
+        return tokens
+
+    pattern = re.compile(r"\[\[ATP_PLAYER:(.*?)\]\]")
+
+    pos = 0
+    for m in pattern.finditer(raw):
+        before = normalize_space(raw[pos:m.start()])
+        if before:
+            tokens.append({"type": "TEXT", "text": before})
+
+        name = _marker_name(m.group(1))
+        if name and is_name_like(name):
+            tokens.append({"type": "PLAYER", "name": name})
+
+        pos = m.end()
+
+    after = normalize_space(raw[pos:])
+    if after:
+        tokens.append({"type": "TEXT", "text": after})
+
+    if not tokens:
+        tokens.append({"type": "TEXT", "text": raw})
+
+    return tokens
+
+
+def _visible_tokens_from_marked_soup(soup: BeautifulSoup) -> List[Dict[str, str]]:
+    """
+    Méthode V6.10C corrigée :
+    - on marque les liens ATP avant extraction texte ;
+    - on lit la page ligne par ligne comme elle apparaît ;
+    - on s'arrête à Latest news pour ne pas capter les widgets H2H / stats.
+    """
+    _replace_player_links_with_markers(soup)
+
+    text = soup.get_text("\n", strip=True)
+
+    tokens: List[Dict[str, str]] = []
+    previous_player_key = ""
+
+    for raw_line in text.splitlines():
+        line = normalize_space(raw_line)
+
+        if not line:
+            continue
+
+        low = line.lower()
+
+        if "latest news" in low:
+            break
+
+        if "{{" in line or "}}" in line:
+            continue
+
+        for token in _line_to_tokens(line):
+            if token.get("type") == "PLAYER":
+                key = canonical_name(token.get("name", ""))
+
+                # Supprime doublon immédiat seulement.
+                if key and key == previous_player_key:
+                    continue
+
+                previous_player_key = key
+                tokens.append(token)
+            else:
+                previous_player_key = ""
+                tokens.append(token)
+
+    return tokens
 
 
 def _status_from_text(text: str) -> str:
     t = normalize_space(text).lower()
-    t = re.sub(r"[^a-z0-9 ]+", " ", t)
+    t = re.sub(r"[^a-z0-9 /.-]+", " ", t)
     t = normalize_space(t)
 
     if re.fullmatch(r"(vs|v)", t):
@@ -354,28 +430,51 @@ def _status_from_text(text: str) -> str:
     if re.search(r"\bdefeats?\b", t):
         return "Defeats"
 
-    if re.search(r"\bwalkover\b|\bw\/o\b|\bretired\b|\bret\b", t):
+    if re.search(r"\bwalkover\b|\bw/o\b|\bretired\b|\bret\b", t):
         return "Defeats"
 
     return ""
 
 
-def _looks_like_score_or_noise(text: str) -> bool:
+def _is_ignorable_between_player_and_status(text: str) -> bool:
     t = normalize_space(text).lower()
 
     if not t:
         return True
 
     if block_has_bad_noise(t):
+        return False
+
+    # Labels fréquents ATP entre joueur et statut.
+    if re.fullmatch(r"\(?\s*(wc|q|ll|pr|se)\s*\)?", t, flags=re.I):
         return True
 
-    # scores : 6-4, 7 6, 67 76 62, etc.
-    scoreish = re.sub(r"[^0-9 ]+", " ", t)
-    nums = re.findall(r"\b\d{1,2}\b", scoreish)
-    if len(nums) >= 2 and not re.search(r"[a-z]", t):
+    if re.fullmatch(r"r\d{1,3}", t, flags=re.I):
         return True
 
-    return False
+    if re.fullmatch(r"(not before|followed by|starts at)\s*.*", t, flags=re.I):
+        return True
+
+    if re.fullmatch(r"(court|campo|stadium|arena|pietrangeli|centrale|supertennis).*", t, flags=re.I):
+        return True
+
+    # Score / H2H après le second joueur : ignoré par le scan.
+    if re.search(r"\bh2h\b", t):
+        return True
+
+    if re.fullmatch(r"[0-9\s{}^.,-]+", t):
+        return True
+
+    return True
+
+
+def _is_doubles_marker(text: str) -> bool:
+    t = normalize_space(text).lower()
+
+    if re.search(r"[a-zà-ÿ]\s*/\s*[a-zà-ÿ]", t, flags=re.I):
+        return True
+
+    return bool(re.search(r"\bdoubles?\b", t))
 
 
 def _is_wta_marker(text: str) -> bool:
@@ -383,120 +482,64 @@ def _is_wta_marker(text: str) -> bool:
     return bool(re.search(r"\bwta\b|women|women's|femmes", t))
 
 
-def _is_doubles_marker(text: str) -> bool:
-    # Doubles : équipe avec slash, ou label doubles.
-    t = normalize_space(text).lower()
-    if re.search(r"[a-zà-ÿ]\s*/\s*[a-zà-ÿ]", t, flags=re.I):
-        return True
-    return bool(re.search(r"\bdoubles?\b", t))
-
-
-def _collect_visible_tokens(soup: BeautifulSoup) -> List[Dict[str, str]]:
-    """
-    Transforme la page ATP daily-schedule en flux visible :
-    PLAYER, TEXT, PLAYER, TEXT...
-    On ne garde les joueurs que depuis les liens ATP /players/.
-    """
-    tokens: List[Dict[str, str]] = []
-
-    root = soup.body or soup
-
-    for node in root.descendants:
-        if isinstance(node, Tag):
-            if node.name != "a":
-                continue
-
-            href = node.get("href", "") or ""
-            if "/players/" not in href:
-                continue
-
-            name = full_name_from_href(href, node.get_text(" ", strip=True))
-            name = clean_name(name)
-
-            if not name or not is_name_like(name):
-                continue
-
-            # Evite les répétitions immédiates du même joueur.
-            if tokens and tokens[-1].get("type") == "PLAYER" and canonical_name(tokens[-1].get("name", "")) == canonical_name(name):
-                continue
-
-            tokens.append(
-                {
-                    "type": "PLAYER",
-                    "name": name,
-                    "href": href,
-                    "text": normalize_space(node.get_text(" ", strip=True)),
-                }
-            )
-            continue
-
-        if isinstance(node, NavigableString):
-            if _is_inside_player_link(node):
-                continue
-
-            text = str(node or "")
-            for line in _text_to_small_lines(text):
-                if not line:
-                    continue
-
-                # Evite textes purement invisibles / caractères seuls.
-                if len(line) == 1 and not re.search(r"[A-Za-z0-9]", line):
-                    continue
-
-                if tokens and tokens[-1].get("type") == "TEXT" and tokens[-1].get("text") == line:
-                    continue
-
-                tokens.append({"type": "TEXT", "text": line})
-
-    return tokens
+def _token_text(token: Dict[str, str]) -> str:
+    if token.get("type") == "PLAYER":
+        return token.get("name", "")
+    return token.get("text", "")
 
 
 def _window_text(tokens: List[Dict[str, str]], start: int, end: int) -> str:
-    parts: List[str] = []
-
-    for token in tokens[max(0, start):min(len(tokens), end)]:
-        if token.get("type") == "PLAYER":
-            parts.append(token.get("name", ""))
-        else:
-            parts.append(token.get("text", ""))
-
-    return normalize_space(" | ".join(x for x in parts if x))
+    return normalize_space(" | ".join(_token_text(t) for t in tokens[max(0, start):min(len(tokens), end)] if _token_text(t)))
 
 
-def _find_next_status(tokens: List[Dict[str, str]], start: int, limit: int = 18) -> Tuple[int, str]:
-    max_i = min(len(tokens), start + limit)
+def _find_status_after_player(tokens: List[Dict[str, str]], start: int, max_scan: int = 10) -> Tuple[int, str]:
+    """
+    Cherche Vs/Defeats après joueur A.
+    Contrairement à l'ancienne version, on tolère (WC), (Q), R128, courts, etc.
+    """
+    end = min(len(tokens), start + max_scan)
 
-    for i in range(start, max_i):
+    for i in range(start, end):
         token = tokens[i]
 
         if token.get("type") == "PLAYER":
-            # Si on tombe sur un autre joueur avant Vs/Defeats, ce n'était pas le bon départ.
             return -1, ""
 
         text = token.get("text", "")
 
-        if _is_doubles_marker(text):
+        if _is_wta_marker(text) or _is_doubles_marker(text):
             return -1, ""
 
         status = _status_from_text(text)
         if status:
             return i, status
 
+        if not _is_ignorable_between_player_and_status(text):
+            return -1, ""
+
     return -1, ""
 
 
-def _find_next_player(tokens: List[Dict[str, str]], start: int, limit: int = 22) -> int:
-    max_i = min(len(tokens), start + limit)
+def _find_player_after_status(tokens: List[Dict[str, str]], start: int, max_scan: int = 14) -> int:
+    """
+    Cherche joueur B après Vs/Defeats.
+    On tolère les marqueurs (Q), (PR), images, R128 et scores.
+    """
+    end = min(len(tokens), start + max_scan)
 
-    for i in range(start, max_i):
+    for i in range(start, end):
         token = tokens[i]
 
         if token.get("type") == "PLAYER":
             return i
 
         text = token.get("text", "")
+
         if _is_wta_marker(text) or _is_doubles_marker(text):
             return -1
+
+        # sinon on continue, même si c'est (Q)/(PR)/score/H2H
+        continue
 
     return -1
 
@@ -507,7 +550,7 @@ def extract_pairs_line_scanner(html: str, source_url: str) -> Tuple[List[Dict[st
     for tag in soup(["script", "style", "noscript"]):
         tag.decompose()
 
-    tokens = _collect_visible_tokens(soup)
+    tokens = _visible_tokens_from_marked_soup(soup)
 
     audit: List[str] = []
     pairs: List[Dict[str, str]] = []
@@ -517,27 +560,34 @@ def extract_pairs_line_scanner(html: str, source_url: str) -> Tuple[List[Dict[st
     audit.append(f"visible_player_tokens={sum(1 for t in tokens if t.get('type') == 'PLAYER')}")
 
     added = 0
+    i = 0
 
-    for i, token in enumerate(tokens):
+    while i < len(tokens):
+        token = tokens[i]
+
         if token.get("type") != "PLAYER":
+            i += 1
             continue
 
         player_a = token.get("name", "")
-        status_index, status = _find_next_status(tokens, i + 1)
+        status_index, status = _find_status_after_player(tokens, i + 1)
 
         if status_index < 0:
+            i += 1
             continue
 
-        player_b_index = _find_next_player(tokens, status_index + 1)
+        player_b_index = _find_player_after_status(tokens, status_index + 1)
 
         if player_b_index < 0:
+            i += 1
             continue
 
         player_b = tokens[player_b_index].get("name", "")
+        evidence = _window_text(tokens, i, player_b_index + 5)
 
-        evidence = _window_text(tokens, i, player_b_index + 6)
-
-        if _is_wta_marker(evidence) or _is_doubles_marker(evidence):
+        # Sécurité doubles. Ne pas rejeter juste parce que la prochaine ligne WTA arrive après le match ATP.
+        if _is_doubles_marker(evidence):
+            i += 1
             continue
 
         if append_pair_if_valid(
@@ -545,38 +595,41 @@ def extract_pairs_line_scanner(html: str, source_url: str) -> Tuple[List[Dict[st
             seen_unordered,
             player_a,
             player_b,
-            f"ATP Daily Schedule Line Scanner {status}",
+            f"ATP Daily Schedule Line Scanner Fixed {status}",
             source_url,
             evidence,
         ):
             added += 1
+            i = player_b_index + 1
+            continue
 
-    audit.append(f"line_scanner_added={added}")
-    audit.append(f"line_scanner_pairs={len(pairs)}")
+        i += 1
+
+    audit.append(f"line_scanner_fixed_added={added}")
+    audit.append(f"line_scanner_fixed_pairs={len(pairs)}")
 
     return pairs, audit
 
 
 def extract_pairs_from_daily_schedule_html(html: str, source_url: str) -> Tuple[List[Dict[str, str]], List[str]]:
     """
-    V6.10C :
+    V6.10C FIXED :
     Source unique = ATP daily-schedule.
-    Extraction correcte : flux visible ligne par ligne.
+    Extraction par texte visible marqué avec les liens ATP /players/.
 
     Motif accepté :
-    ATP player link
+    ATP_PLAYER A
     puis Vs / Defeats / Walkover / Retired
-    puis ATP player link
+    puis ATP_PLAYER B
 
-    Exclusions :
-    - WTA
-    - doubles
-    - blocs parasites
+    Cette version ne rejette plus un match ATP parce qu'une ligne WTA arrive après.
+    Elle tolère (WC), (Q), (PR), R128, H2H et les scores.
     """
     pairs, audit = extract_pairs_line_scanner(html, source_url)
 
-    # Fallback de sécurité minimal : si aucun motif ligne n'est trouvé, on tente les petits blocs exacts.
+    # Fallback exact block seulement si le scanner ne trouve rien.
     if pairs:
+        audit.append(f"daily_schedule_singles_pairs={len(pairs)}")
         return pairs, audit
 
     soup = BeautifulSoup(html or "", "html.parser")
@@ -597,7 +650,7 @@ def extract_pairs_from_daily_schedule_html(html: str, source_url: str) -> Tuple[
         if len(links) != 2:
             continue
 
-        if _is_wta_marker(text) or _is_doubles_marker(text) or block_has_bad_noise(text):
+        if _is_doubles_marker(text) or block_has_bad_noise(text):
             continue
 
         if not re.search(r"\b(vs|v|defeats?|walkover|retired|ret)\b", text, flags=re.I):
@@ -608,7 +661,7 @@ def extract_pairs_from_daily_schedule_html(html: str, source_url: str) -> Tuple[
             seen_unordered,
             links[0][0],
             links[1][0],
-            "ATP Daily Schedule Exact Block Fallback",
+            "ATP Daily Schedule Exact Block Fallback Fixed",
             source_url,
             text,
         ):
@@ -863,7 +916,7 @@ def main() -> int:
     audit.append(f"target_label={args.target_day}")
     audit.append(f"backend_url={args.backend_url}")
     audit.append(f"mode={MODE}")
-    audit.append("source_policy=ATP_DAILY_SCHEDULE_LINE_SCANNER_ONLY")
+    audit.append("source_policy=ATP_DAILY_SCHEDULE_LINE_SCANNER_FIXED_ONLY")
     audit.append("no_draw_pending_for_day_matches=true")
     audit.append("no_article_schedule_for_day_matches=true")
     audit.append(f"strict_unknown_veto={str(strict_unknown_veto).lower()}")
