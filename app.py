@@ -18,10 +18,8 @@ from motor import calculate_predictions, get_state
 
 BASE_DIR = Path(__file__).resolve().parent
 OUTPUT_DIR = BASE_DIR / "output"
-
-# Source officielle unique des matchs du jour :
-# ATP daily-schedule scanné ligne par ligne.
-DAILY_SCRIPT_NAME = "fetch_day_lines_v6_10d_daily_schedule_full_payload.py"
+PAYLOAD_LATEST_PATH = OUTPUT_DIR / "payload_latest.json"
+DAILY_SCRIPT_NAME = "fetch_day_lines_v6_10_daily_schedule_only.py"
 
 app = FastAPI(title="Tennis Motor Railway Backend")
 
@@ -79,14 +77,6 @@ async def _read_request_matches(request: Request) -> List[Dict[str, Any]]:
     return _extract_matches_from_payload(payload)
 
 
-def _history_rows_loaded() -> int:
-    try:
-        state = get_state()
-        return int(state.get("history_rows_loaded", 0))
-    except Exception:
-        return 0
-
-
 def _empty_response(
     status: str,
     message: str = "",
@@ -95,13 +85,18 @@ def _empty_response(
     stderr_tail: str = "",
     command: str = "",
 ) -> Dict[str, Any]:
+    try:
+        state = get_state()
+        history_rows_loaded = int(state.get("history_rows_loaded", 0))
+    except Exception:
+        history_rows_loaded = 0
+
     return {
         "matches": [],
         "summary": {
             "totalRows": 0,
             "validRows": 0,
             "errorRows": 0,
-            "nonAnalyzedRows": 0,
             "over80": 0,
             "vetoCount": 0,
             "jouables": 0,
@@ -110,7 +105,7 @@ def _empty_response(
             "name": "Tennis Motor V7",
             "version": "Bayesian Shrinkage",
             "historyYears": [2022, 2023, 2024, 2025],
-            "historyRowsLoaded": _history_rows_loaded(),
+            "historyRowsLoaded": history_rows_loaded,
             "premiumFormula": "Bayesian shrinkage blend of SWE, ATP, Rank, Form5, Form10, SurfaceForm5, Dominance",
             "threshold": "> 0.80",
             "status": status,
@@ -121,7 +116,6 @@ def _empty_response(
             "stdoutTail": stdout_tail[-4000:] if stdout_tail else "",
             "stderrTail": stderr_tail[-4000:] if stderr_tail else "",
             "command": command,
-            "dailyScript": DAILY_SCRIPT_NAME,
         },
         "error": message,
     }
@@ -134,22 +128,15 @@ def calculate_from_matches(matches: List[Dict[str, Any]]) -> Dict[str, Any]:
             message="Aucun match exploitable dans le payload daily.",
         )
 
-    result = calculate_predictions(matches)
-
-    if not isinstance(result, dict):
-        return _empty_response(
-            status="calculate_invalid_result",
-            message="Le moteur n'a pas renvoyé un objet JSON valide.",
-        )
-
-    return result
+    return calculate_predictions(matches)
 
 
 def _read_payload_for_day(target_day: str) -> Tuple[List[Dict[str, Any]], str]:
     """
     Sécurité anti-cache :
     on lit uniquement le payload daté du jour demandé.
-    On ne retombe JAMAIS sur payload_latest.json.
+    On ne retombe jamais sur payload_latest.json, car il peut contenir
+    les matchs d'une ancienne journée.
     """
     payload_path = OUTPUT_DIR / f"payload_{target_day}.json"
 
@@ -160,11 +147,32 @@ def _read_payload_for_day(target_day: str) -> Tuple[List[Dict[str, Any]], str]:
     return _extract_matches_from_payload(payload), payload_path.name
 
 
+def _read_audit_for_day(target_day: str) -> str:
+    audit_path = OUTPUT_DIR / f"audit_{target_day}.txt"
+
+    if not audit_path.exists():
+        audit_path = OUTPUT_DIR / "audit_latest.txt"
+
+    if not audit_path.exists():
+        return ""
+
+    try:
+        return audit_path.read_text(encoding="utf-8", errors="replace")
+    except Exception:
+        return ""
+
+
 def run_daily_fetch_sync(target_day: str) -> Dict[str, Any]:
+    """
+    Lance l'extraction daily.
+
+    Cette fonction ne doit jamais faire tomber FastAPI en 500.
+    Si l'extraction ATP plante, on renvoie un JSON propre avec l'erreur.
+    """
+
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
     script = BASE_DIR / DAILY_SCRIPT_NAME
-
     if not script.exists():
         return _empty_response(
             status="script_missing",
@@ -188,8 +196,6 @@ def run_daily_fetch_sync(target_day: str) -> Dict[str, Any]:
             cwd=str(BASE_DIR),
             capture_output=True,
             text=True,
-            encoding="utf-8",
-            errors="replace",
             timeout=timeout_seconds,
         )
     except subprocess.TimeoutExpired as exc:
@@ -206,6 +212,7 @@ def run_daily_fetch_sync(target_day: str) -> Dict[str, Any]:
             status="daily_fetch_exception",
             message=f"Erreur lancement extraction daily : {exc}",
             target_day=target_day,
+            stdout_tail="",
             stderr_tail=traceback.format_exc(),
             command=command_text,
         )
@@ -246,8 +253,6 @@ def run_daily_fetch_sync(target_day: str) -> Dict[str, Any]:
             "stdoutTail": stdout[-1200:],
             "stderrTail": stderr[-1200:],
             "command": command_text,
-            "dailyScript": DAILY_SCRIPT_NAME,
-            "cacheProtection": "payload_latest_disabled",
         }
     )
 
@@ -265,7 +270,6 @@ async def root() -> Dict[str, Any]:
             "/daily?day=today",
             "/daily?day=tomorrow",
             "/predictions?day=today",
-            "/state",
         ],
     }
 
@@ -273,15 +277,14 @@ async def root() -> Dict[str, Any]:
 @app.get("/health")
 async def health() -> Dict[str, Any]:
     try:
+        state = get_state()
+        history_rows = int(state.get("history_rows_loaded", 0))
+
         return {
             "status": "ok",
             "service": "Tennis Motor Railway Backend",
             "engine": "loaded",
-            "historyRowsLoaded": _history_rows_loaded(),
-            "dailyScript": DAILY_SCRIPT_NAME,
-            "dailyScriptFound": (BASE_DIR / DAILY_SCRIPT_NAME).exists(),
-            "cacheProtection": "payload_latest_disabled",
-            "hostMode": "railway_0.0.0.0_port_env",
+            "historyRowsLoaded": history_rows,
         }
     except Exception as exc:
         return {
@@ -289,8 +292,6 @@ async def health() -> Dict[str, Any]:
             "service": "Tennis Motor Railway Backend",
             "engine": "not_loaded",
             "error": str(exc),
-            "dailyScript": DAILY_SCRIPT_NAME,
-            "dailyScriptFound": (BASE_DIR / DAILY_SCRIPT_NAME).exists(),
         }
 
 
@@ -356,14 +357,33 @@ async def state() -> Dict[str, Any]:
             "status": "ok",
             "historyRowsLoaded": s.get("history_rows_loaded", 0),
             "rankReferenceSize": len(s.get("rank_reference_points", [])),
-            "dailyScript": DAILY_SCRIPT_NAME,
-            "dailyScriptFound": (BASE_DIR / DAILY_SCRIPT_NAME).exists(),
         }
     except Exception as exc:
         return {
             "status": "error",
             "error": str(exc),
         }
+
+
+
+@app.get("/audit")
+async def audit(day: str = Query("today")) -> Dict[str, Any]:
+    try:
+        target_day = normalize_day(day)
+    except Exception as exc:
+        return {
+            "status": "error",
+            "error": f"Paramètre day invalide : {day} | {exc}",
+        }
+
+    text = _read_audit_for_day(target_day)
+
+    return {
+        "status": "ok" if text else "empty",
+        "targetDay": target_day,
+        "dailyScript": DAILY_SCRIPT_NAME,
+        "audit": text,
+    }
 
 
 if __name__ == "__main__":
