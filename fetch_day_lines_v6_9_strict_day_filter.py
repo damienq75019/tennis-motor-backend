@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Tennis Motor - Fetch daily lines V6.13 ATP DAILY SCHEDULE OFFICIAL PARSER FIX
+Tennis Motor - Fetch daily lines V6.14 ATP ARTICLE ORDER OF PLAY PARSER FIX
 
 But :
 - garder le moteur / veto existant de la V6.7 ;
@@ -39,7 +39,7 @@ BASE_MODULE_CANDIDATES = [
     "fetch_day_lines_v6_5_results_context_safe",
 ]
 
-MODE = "V6_13_ATP_DAILY_SCHEDULE_OFFICIAL_PARSER_FIX"
+MODE = "V6_14_ATP_ARTICLE_ORDER_OF_PLAY_PARSER_FIX"
 PAYLOAD_LATEST_PATH = Path("output") / "payload_latest.json"
 
 
@@ -340,6 +340,73 @@ def extract_pair_from_vs_line(
     return (a, b)
 
 
+
+def _clean_atp_order_player_fragment(fragment: str) -> str:
+    """
+    Nettoie une moitié de ligne ATP officielle :
+    ATP - [WC] Matteo Arnaldi (ITA) -> Matteo Arnaldi
+    [Q] Francisco Comesana (ARG) WTA Match -> Francisco Comesana
+    """
+    s = base.normalize_space(fragment or "")
+    s = re.sub(r"(?i)^\s*ATP\s*-\s*", "", s)
+    s = re.sub(r"(?i)\bWTA\s+Match\b.*$", "", s)
+    s = re.sub(r"\[[^\]]+\]", " ", s)          # [Q], [WC], [LL]
+    s = re.sub(r"\([^)]{2,4}\)", " ", s)        # (POL), (GER), etc.
+    s = re.sub(r"(?i)\b(Q|WC|PR|LL|SE)\b", " ", s)
+    s = re.sub(r"\b\d{1,2}\b", " ", s)          # seed éventuel
+    s = re.sub(r"[•|]+", " ", s)
+    s = base.normalize_space(s)
+    return base.clean_candidate_name(s)
+
+
+def extract_pair_from_atp_order_line(
+    line: str,
+    alias_index: Dict[str, List[str]],
+    valid_player_keys: Set[str],
+) -> Optional[Tuple[str, str]]:
+    """
+    Parse une vraie ligne d'ordre de jeu ATP issue de l'article officiel.
+
+    Exemples acceptés :
+    ATP - Hubert Hurkacz (POL) vs Yannick Hanfmann (GER)
+    ATP - [WC] Matteo Arnaldi (ITA) vs Jaume Munar (ESP)
+    ATP - Jan-Lennard Struff (GER) vs [Q] Francisco Comesana (ARG)
+
+    Sécurité : aucune paire n'est créée si la ligne ne contient pas explicitement ATP + vs.
+    """
+    raw = base.normalize_space(line or "")
+    if not raw:
+        return None
+
+    # On accepte seulement les lignes clairement ATP. Ça évite WTA et widgets parasites.
+    if not re.search(r"(?i)\bATP\s*-", raw):
+        return None
+    if not re.search(r"(?i)\bvs\b|\bv\.\b", raw):
+        return None
+    if "/" in raw:
+        return None  # doubles volontairement ignorés
+
+    # Retirer les bouts de ligne après le match si la page colle du texte derrière.
+    raw = re.sub(r"(?i)\s+WTA\s+Match\b.*$", "", raw)
+    raw = re.sub(r"(?i)\s+Not\s+Before\b.*$", "", raw)
+
+    parts = re.split(r"(?i)\b(?:vs|v\.)\b", raw, maxsplit=1)
+    if len(parts) != 2:
+        return None
+
+    left = _clean_atp_order_player_fragment(parts[0])
+    right = _clean_atp_order_player_fragment(parts[1])
+
+    a = _resolve_to_known_atp_player(left, alias_index, valid_player_keys)
+    b = _resolve_to_known_atp_player(right, alias_index, valid_player_keys)
+
+    if not a or not b:
+        return None
+    if base.canonical_name(a) == base.canonical_name(b):
+        return None
+    return (a, b)
+
+
 def extract_pairs_from_lines(
     lines: Sequence[str],
     display_map: Dict[str, str],
@@ -348,17 +415,19 @@ def extract_pairs_from_lines(
     """
     Extraction sécurisée des paires de matchs.
 
-    Correction V6.9 :
-    - On ne fait plus de pairing automatique avec des noms consécutifs.
-    - On accepte seulement :
-      1) une ligne complète "Joueur A vs Joueur B" ;
-      2) le format ATP officiel en plusieurs lignes :
-         Joueur A
-         Vs
-         Joueur B
+    V6.14 :
+    - priorité aux vraies lignes officielles ATP "ATP - Joueur A vs Joueur B" ;
+    - accepte aussi le format ATP Daily Schedule avec noms autour de "Vs" ;
+    - ne fait JAMAIS de pairing global par noms consécutifs.
     """
     alias_index = build_name_alias_index(display_map, valid_player_keys)
     pairs: List[Tuple[str, str]] = []
+
+    # 0) Cas le plus fiable pour l'article ATP officiel "ORDER OF PLAY".
+    for ln in lines:
+        pair = extract_pair_from_atp_order_line(ln, alias_index, valid_player_keys)
+        if pair:
+            pairs.append(pair)
 
     # 1) Cas simple : "Joueur A vs Joueur B" sur une même ligne.
     for ln in lines:
@@ -376,14 +445,12 @@ def extract_pairs_from_lines(
         player_a: Optional[str] = None
         player_b: Optional[str] = None
 
-        # Chercher le joueur A dans les lignes précédentes.
         for j in range(i - 1, max(-1, i - 10), -1):
             candidate = find_player_in_fragment(lines[j], alias_index, valid_player_keys)
             if candidate:
                 player_a = candidate
                 break
 
-        # Chercher le joueur B dans les lignes suivantes.
         for j in range(i + 1, min(len(lines), i + 10)):
             candidate = find_player_in_fragment(lines[j], alias_index, valid_player_keys)
             if candidate:
@@ -392,20 +459,16 @@ def extract_pairs_from_lines(
 
         if not player_a or not player_b:
             continue
-
         if base.canonical_name(player_a) == base.canonical_name(player_b):
             continue
-
         pairs.append((player_a, player_b))
 
-    # 3) Déduplication stable.
     uniq: Dict[Tuple[str, str], Tuple[str, str]] = {}
     for a, b in pairs:
         key = (base.canonical_name(a), base.canonical_name(b))
         uniq[key] = (a, b)
 
     return list(uniq.values())
-
 
 
 def atp_daily_schedule_url_from_draw_url(draw_url: str) -> Optional[str]:
