@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Tennis Motor - Fetch daily lines V6.11 ATP DAILY SCHEDULE SCROLL FIX
+Tennis Motor - Fetch daily lines V6.12 ATP DAILY SCHEDULE ANCHOR FIX
 
 But :
 - garder le moteur / veto existant de la V6.7 ;
@@ -39,7 +39,7 @@ BASE_MODULE_CANDIDATES = [
     "fetch_day_lines_v6_5_results_context_safe",
 ]
 
-MODE = "V6_11_ATP_DAILY_SCHEDULE_SCROLL_FIX"
+MODE = "V6_12_ATP_DAILY_SCHEDULE_ANCHOR_FIX"
 PAYLOAD_LATEST_PATH = Path("output") / "payload_latest.json"
 
 
@@ -201,8 +201,13 @@ def build_name_alias_index(display_map: Dict[str, str], valid_player_keys: Set[s
 
         if len(parts) >= 2:
             aliases.add(parts[-1])
+            aliases.add(" ".join(parts[1:]))
             aliases.add(f"{parts[0]} {parts[-1]}")
             aliases.add(f"{parts[0][0]} {parts[-1]}")
+            aliases.add(f"{parts[0][0]} {' '.join(parts[1:])}")
+            if len(parts) >= 3:
+                aliases.add(" ".join(parts[-2:]))
+                aliases.add(f"{parts[0][0]} {' '.join(parts[-2:])}")
 
         for alias in aliases:
             if len(alias) >= 3:
@@ -581,14 +586,131 @@ def extract_pairs_from_atp_daily_schedule_lines(
     return list(uniq.values())
 
 
+
+def _is_atp_player_href(href: str) -> bool:
+    h = href or ""
+    # Les joueuses WTA de la page combinée Rome n'ont pas ces liens ATP /en/players/.
+    return "/en/players/" in h and "/overview" in h
+
+
+def extract_pairs_from_atp_daily_schedule_anchors(
+    html: str,
+    display_map: Dict[str, str],
+    valid_player_keys: Set[str],
+) -> Tuple[List[Tuple[str, str]], List[str]]:
+    """
+    Extraction la plus fiable sur ATP Daily Schedule.
+
+    Principe :
+    - les joueurs ATP sont des liens /en/players/.../overview ;
+    - les joueuses WTA sur la page mixte sont généralement du texte simple ;
+    - on accepte une paire seulement si elle entoure un marqueur officiel Vs / Defeats.
+
+    Donc : pas de pairing global par noms consécutifs.
+    """
+    audit: List[str] = []
+    soup = BeautifulSoup(html or "", "html.parser")
+    for tag in soup(["script", "style", "noscript"]):
+        tag.decompose()
+
+    alias_index = build_name_alias_index(display_map, valid_player_keys)
+    tokens: List[Tuple[str, str]] = []  # (kind, value) kind = player|marker|text
+
+    def add_text_token(txt: str) -> None:
+        clean = base.normalize_space(txt or "")
+        if not clean:
+            return
+        if re.fullmatch(r"(?i)(vs|v\.?|defeats|def\.?|walkover|retired|retires)", clean):
+            tokens.append(("marker", clean))
+        else:
+            tokens.append(("text", clean))
+
+    def walk(node) -> None:
+        from bs4 import NavigableString, Tag
+        if isinstance(node, NavigableString):
+            add_text_token(str(node))
+            return
+        if not isinstance(node, Tag):
+            return
+        if node.name == "a" and _is_atp_player_href(node.get("href", "")):
+            label = base.normalize_space(node.get_text(" ", strip=True))
+            player = find_player_in_fragment(label, alias_index, valid_player_keys)
+            if player:
+                tokens.append(("player", player))
+            else:
+                audit.append(f"anchor_player_unmatched={label}")
+            return
+        for child in node.children:
+            walk(child)
+
+    root = soup.body or soup
+    walk(root)
+
+    audit.append(f"daily_schedule_anchor_tokens={len(tokens)}")
+    audit.append(f"daily_schedule_anchor_players={sum(1 for k, _ in tokens if k == 'player')}")
+    audit.append(f"daily_schedule_anchor_markers={sum(1 for k, _ in tokens if k == 'marker')}")
+
+    pairs: List[Tuple[str, str]] = []
+    for i, (kind, value) in enumerate(tokens):
+        if kind != "marker":
+            continue
+
+        player_a: Optional[str] = None
+        player_b: Optional[str] = None
+
+        # joueur A = joueur ATP le plus proche avant le marqueur
+        for j in range(i - 1, max(-1, i - 30), -1):
+            if tokens[j][0] == "player":
+                player_a = tokens[j][1]
+                break
+
+        # joueur B = joueur ATP le plus proche après le marqueur
+        for j in range(i + 1, min(len(tokens), i + 30)):
+            if tokens[j][0] == "player":
+                player_b = tokens[j][1]
+                break
+
+        if not player_a or not player_b:
+            continue
+        if base.canonical_name(player_a) == base.canonical_name(player_b):
+            continue
+
+        pairs.append((player_a, player_b))
+
+    uniq: Dict[Tuple[str, str], Tuple[str, str]] = {}
+    for a, b in pairs:
+        key = (base.canonical_name(a), base.canonical_name(b))
+        uniq[key] = (a, b)
+
+    final_pairs = list(uniq.values())
+    audit.append(f"daily_schedule_anchor_pairs={len(final_pairs)}")
+    return final_pairs, audit
+
+
 def parse_atp_daily_schedule_pairs(
     html: str,
     display_map: Dict[str, str],
     valid_player_keys: Set[str],
     target_day: date,
 ) -> Tuple[List[Tuple[str, str]], List[str]]:
+    audit: List[str] = []
+
+    # Priorité absolue : extraction par liens ATP /en/players/ autour des marqueurs Vs/Defeats.
+    # C'est plus fiable que le texte brut et ça évite les joueuses WTA.
+    anchor_pairs, anchor_audit = extract_pairs_from_atp_daily_schedule_anchors(
+        html,
+        display_map,
+        valid_player_keys,
+    )
+    audit.extend(anchor_audit)
+    if anchor_pairs:
+        audit.append(f"daily_schedule_pairs={len(anchor_pairs)}")
+        audit.append("daily_schedule_source=anchor_players")
+        return anchor_pairs, audit
+
+    # Secours : texte brut, toujours sans pairing global dangereux.
     lines = extract_article_lines(html)
-    audit: List[str] = [f"daily_schedule_lines={len(lines)}"]
+    audit.append(f"daily_schedule_lines={len(lines)}")
 
     if not lines:
         audit.append("daily_schedule_pairs=0")
@@ -619,7 +741,9 @@ def parse_atp_daily_schedule_pairs(
 
     final_pairs = list(uniq.values())
     audit.append(f"daily_schedule_pairs={len(final_pairs)}")
+    audit.append("daily_schedule_source=text_lines")
     return final_pairs, audit
+
 
 
 def split_target_sections(lines: Sequence[str], target_day: date) -> Tuple[List[List[str]], List[str]]:
@@ -801,7 +925,7 @@ def build_day_matches_from_contexts_strict(
             for a, b in ctx.article_pairs:
                 matches.append(
                     base.DayMatch(
-                        source="ATP News Schedule StrictDate",
+                        source="ATP Daily Schedule Official",
                         tournament_name=ctx.tournament_name,
                         player_a=a,
                         player_b=b,
