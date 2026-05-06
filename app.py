@@ -21,7 +21,7 @@ OUTPUT_DIR = BASE_DIR / "output"
 
 # Source officielle unique des matchs du jour :
 # ATP daily-schedule scanné ligne par ligne.
-DAILY_SCRIPT_NAME = "fetch_day_lines_v6_10c_daily_schedule_line_scanner.py"
+DAILY_SCRIPT_NAME = "fetch_day_lines_v6_10d_daily_schedule_full_payload.py"
 
 app = FastAPI(title="Tennis Motor Railway Backend")
 
