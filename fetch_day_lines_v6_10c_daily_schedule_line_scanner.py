@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Tennis Motor - Fetch daily lines V6.10C DAILY SCHEDULE LINE SCANNER
+Tennis Motor - Fetch daily lines V6.10D DAILY SCHEDULE FULL PAYLOAD
 
-Objectif V6.10C :
+Objectif V6.10D :
 - Source officielle UNIQUE des matchs du jour = pages ATP daily-schedule.
 - Ne plus fabriquer la liste du jour depuis les draws pending ou les articles ATP.
 - Exclure doubles / blocs parasites / anciennes paires.
@@ -12,9 +12,9 @@ Objectif V6.10C :
 - Garder le contexte draw/results seulement pour surface + veto Q/wins, jamais pour créer les matchs.
 
 Utilisation :
-    py fetch_day_lines_v6_10c_daily_schedule_line_scanner.py today --backend-url http://127.0.0.1:8000
-    py fetch_day_lines_v6_10c_daily_schedule_line_scanner.py tomorrow --backend-url http://127.0.0.1:8000
-    py fetch_day_lines_v6_10c_daily_schedule_line_scanner.py today --backend-url http://127.0.0.1:9
+    py fetch_day_lines_v6_10d_daily_schedule_full_payload.py today --backend-url http://127.0.0.1:8000
+    py fetch_day_lines_v6_10d_daily_schedule_full_payload.py tomorrow --backend-url http://127.0.0.1:8000
+    py fetch_day_lines_v6_10d_daily_schedule_full_payload.py today --backend-url http://127.0.0.1:9
 
 Sorties :
     output/lines_YYYY-MM-DD.txt
@@ -45,7 +45,7 @@ BASE_MODULE_CANDIDATES = [
     "fetch_day_lines_v6_5_results_context_safe",
 ]
 
-MODE = "V6_10C_DAILY_SCHEDULE_LINE_SCANNER_FIXED"
+MODE = "V6_10D_DAILY_SCHEDULE_FULL_PAYLOAD"
 PAYLOAD_LATEST_PATH = Path("output") / "payload_latest.json"
 
 
@@ -831,6 +831,145 @@ def build_contexts_for_daily_urls(
     return contexts, audit
 
 
+
+# ---------------------------------------------------------------------------
+# V6.10D - Construction payload directe depuis daily-schedule
+# ---------------------------------------------------------------------------
+
+
+def _points_for_name(name: str, points_map: Dict[str, int]) -> int:
+    key = canonical_name(name)
+    value = points_map.get(key, 0)
+
+    try:
+        return int(value or 0)
+    except Exception:
+        return 0
+
+
+def _player_b_is_q_from_evidence(player_b: str, evidence: str) -> bool:
+    """
+    Détection simple et prudente du Q uniquement dans la fenêtre du match.
+    """
+    if not evidence:
+        return False
+
+    ev = normalize_space(evidence)
+    b = re.escape(clean_name(player_b))
+
+    # Cas : (Q) juste avant le joueur B.
+    if re.search(rf"\(Q\).{{0,80}}{b}", ev, flags=re.I):
+        return True
+
+    # Cas : joueur B puis (Q).
+    if re.search(rf"{b}.{{0,80}}\(Q\)", ev, flags=re.I):
+        return True
+
+    return False
+
+
+def _surface_for_row(row: Dict[str, str], surfaces_by_tournament: Dict[str, Optional[str]]) -> str:
+    tournament = row.get("tournament", "ATP") or "ATP"
+    key = canonical_name(tournament)
+
+    surface = row.get("surface") or surfaces_by_tournament.get(key) or ""
+
+    if surface:
+        sf = surface_from_text(surface) or surface
+        if sf in {"Clay", "Hard", "Grass"}:
+            return sf
+
+    # Rome / Madrid / Monte-Carlo / Barcelona : terre battue.
+    t = tournament.lower()
+    if any(x in t for x in ["rome", "madrid", "monte", "barcelona", "munich", "geneva", "hamburg"]):
+        return "Clay"
+
+    return "Clay"
+
+
+def build_payload_items_direct_from_schedule_rows(
+    schedule_rows: List[Dict[str, str]],
+    points_map: Dict[str, int],
+    surfaces_by_tournament: Dict[str, Optional[str]],
+    strict_unknown_veto: bool,
+) -> Tuple[List[Any], List[str]]:
+    """
+    V6.10D :
+    La liste du jour vient de ATP daily-schedule uniquement.
+    On ne laisse plus base.build_payload_items supprimer des matchs parce qu'un contexte draw/results est incomplet.
+
+    Filtre dur :
+    - garde seulement les matchs où les deux joueurs ont des points ATP > 0 ;
+    - si points manquants, audit clair mais pas de faux match inventé.
+    """
+    audit: List[str] = []
+    payload_items: List[Any] = []
+
+    missing_points: List[str] = []
+    seen: Set[Tuple[str, str, str]] = set()
+
+    for row in schedule_rows:
+        player_a = clean_name(row.get("playerA", ""))
+        player_b = clean_name(row.get("playerB", ""))
+        tournament = row.get("tournament", "ATP") or "ATP"
+        evidence = row.get("evidence", "") or ""
+
+        if not player_a or not player_b:
+            continue
+
+        key_pair = unordered_pair_key(player_a, player_b)
+        key = (key_pair[0], key_pair[1], canonical_name(tournament))
+
+        if key in seen:
+            continue
+
+        seen.add(key)
+
+        points_a = _points_for_name(player_a, points_map)
+        points_b = _points_for_name(player_b, points_map)
+
+        if points_a <= 0 or points_b <= 0:
+            missing_points.append(
+                f"{player_a} vs {player_b} | A_points={points_a} | B_points={points_b} | tournament={tournament}"
+            )
+            continue
+
+        surface = _surface_for_row(row, surfaces_by_tournament)
+
+        player_b_is_qualifier = _player_b_is_q_from_evidence(player_b, evidence)
+
+        # Sécurité officielle maison :
+        # si surface Clay et contexte wins inconnu, on force wins B à 2 uniquement en mode strict.
+        # Cela évite une validation verte artificielle contre un profil potentiellement qualifié/dynamique.
+        if strict_unknown_veto and surface == "Clay":
+            player_b_tournament_wins = 2
+        else:
+            player_b_tournament_wins = 0
+
+        item = base.UnityPayloadItem(
+            playerA=player_a,
+            playerB=player_b,
+            surface=surface,
+            playerAPoints=points_a,
+            playerBPoints=points_b,
+            player_b_is_qualifier=bool(player_b_is_qualifier),
+            player_b_tournament_wins=int(player_b_tournament_wins),
+            tournament=tournament,
+            source=row.get("source", "ATP Daily Schedule Full Payload"),
+        )
+
+        payload_items.append(item)
+
+    audit.append(f"daily_schedule_rows_detected={len(schedule_rows)}")
+    audit.append(f"payload_items_direct={len(payload_items)}")
+    audit.append(f"missing_points_rows={len(missing_points)}")
+
+    for line in missing_points[:80]:
+        audit.append(f"[MISSING POINTS] {line}")
+
+    return payload_items, audit
+
+
 # ---------------------------------------------------------------------------
 # Sorties / backend
 # ---------------------------------------------------------------------------
@@ -916,7 +1055,7 @@ def main() -> int:
     audit.append(f"target_label={args.target_day}")
     audit.append(f"backend_url={args.backend_url}")
     audit.append(f"mode={MODE}")
-    audit.append("source_policy=ATP_DAILY_SCHEDULE_LINE_SCANNER_FIXED_ONLY")
+    audit.append("source_policy=ATP_DAILY_SCHEDULE_FULL_PAYLOAD_ONLY")
     audit.append("no_draw_pending_for_day_matches=true")
     audit.append("no_article_schedule_for_day_matches=true")
     audit.append(f"strict_unknown_veto={str(strict_unknown_veto).lower()}")
@@ -934,33 +1073,27 @@ def main() -> int:
     )
     audit.extend(daily_audit)
 
-    contexts, ctx_audit = build_contexts_for_daily_urls(
-        session=session,
+    # V6.10D :
+    # On ne construit plus le payload via base.build_payload_items,
+    # car ce chemin peut supprimer des matchs lorsque le contexte draw/results est incomplet.
+    # La liste vient uniquement de schedule_rows extrait de ATP daily-schedule.
+    payload_items, build_audit = build_payload_items_direct_from_schedule_rows(
         schedule_rows=schedule_rows,
-        display_map=display_map,
-        valid_player_keys=valid_player_keys,
+        points_map=points_map,
         surfaces_by_tournament=surfaces_by_tournament,
-        strict_context=not args.minimal_context_only,
+        strict_unknown_veto=strict_unknown_veto,
     )
-    audit.extend(ctx_audit)
-    audit.append(f"contexts_for_veto_only={len(contexts)}")
-
-    # Construction payload officielle : la liste vient UNIQUEMENT de day_matches daily-schedule.
-    try:
-        lines, build_audit, payload_items = base.build_payload_items(
-            day_matches=day_matches,
-            contexts=contexts,
-            points_map=points_map,
-            strict_unknown_veto=strict_unknown_veto,
-        )
-    except TypeError:
-        lines, build_audit, payload_items = base.build_payload_items(
-            day_matches=day_matches,
-            contexts=contexts,
-            points_map=points_map,
-        )
-
     audit.extend(build_audit)
+
+    lines: List[str] = []
+    for item in payload_items:
+        lines.append(
+            f"{item.playerA};{item.playerB};{item.surface};"
+            f"{item.playerAPoints};{item.playerBPoints};"
+            f"{str(item.player_b_is_qualifier).lower()};{item.player_b_tournament_wins}"
+        )
+
+    audit.append(f"daily_matches_detected={len(day_matches)}")
     audit.append(f"payload_items={len(payload_items)}")
 
     lines_path, audit_path, payload_path, result_json_path, result_txt_path = write_outputs(
