@@ -1,27 +1,62 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Tennis Motor Backend - V6.9H OFFICIAL PAIR GUARD
+
+Base stable :
+- garde le moteur officiel actuel ;
+- garde fetch_day_lines_v6_9_strict_day_filter.py pour les matchs analysables ;
+- ajoute seulement les matchs présents sur ATP daily-schedule mais absents du payload V6.9 ;
+- ces matchs sont affichés comme "Non analysé" si une donnée obligatoire manque ;
+- aucun pronostic n'est inventé.
+
+Fichiers nécessaires dans le même dossier backend :
+- motor.py
+- fetch_day_lines_v6_9_strict_day_filter.py
+- fetch_day_lines_v6_9c_daily_schedule_audit.py
+"""
+
 from __future__ import annotations
 
-import asyncio
 import json
-import os
 import subprocess
 import sys
-import traceback
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
 
-from fastapi import FastAPI, Query, Request
+from fastapi import FastAPI, Query
 from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, Field
+import uvicorn
 
-from motor import calculate_predictions, get_state
+import motor
 
 
-BASE_DIR = Path(__file__).resolve().parent
-OUTPUT_DIR = BASE_DIR / "output"
-PAYLOAD_LATEST_PATH = OUTPUT_DIR / "payload_latest.json"
-DAILY_SCRIPT_NAME = "fetch_day_lines_v6_10c_daily_schedule_line_scanner.py"
+BACKEND_DIR = Path(__file__).resolve().parent
+OUT_DIR = BACKEND_DIR / "output"
 
-app = FastAPI(title="Tennis Motor Railway Backend")
+DAILY_SCRIPT = "fetch_day_lines_v6_9_strict_day_filter.py"
+MISSING_AUDIT_SCRIPT = "fetch_day_lines_v6_9c_daily_schedule_audit.py"
+
+APP_VERSION = "v6_9h_official_pair_guard"
+
+
+class MatchInput(BaseModel):
+    playerA: str
+    playerB: str
+    surface: str
+    playerAPoints: int
+    playerBPoints: int
+    player_b_is_qualifier: bool = False
+    player_b_tournament_wins: int = 0
+
+
+class CalculateRequest(BaseModel):
+    matches: List[MatchInput] = Field(default_factory=list)
+
+
+app = FastAPI(title="Tennis Motor Backend", version=APP_VERSION)
 
 app.add_middleware(
     CORSMiddleware,
@@ -32,329 +67,635 @@ app.add_middleware(
 )
 
 
-def _paris_today() -> date:
+def parse_target_day(raw: str) -> date:
+    raw = (raw or "today").strip().lower()
+    today = date.today()
+
+    if raw == "today":
+        return today
+
+    if raw == "tomorrow":
+        return today + timedelta(days=1)
+
+    return datetime.strptime(raw, "%Y-%m-%d").date()
+
+
+def get_history_rows_loaded() -> int:
     try:
-        from datetime import datetime
-        from zoneinfo import ZoneInfo
-
-        return datetime.now(ZoneInfo("Europe/Paris")).date()
+        if hasattr(motor, "get_state"):
+            state = motor.get_state()
+            if isinstance(state, dict):
+                return int(state.get("history_rows_loaded", 0))
     except Exception:
-        return date.today()
+        pass
+
+    return 0
 
 
-def normalize_day(day: str) -> str:
-    value = (day or "today").strip().lower()
-    today = _paris_today()
+def normalize_text(value: Any) -> str:
+    text = str(value or "").lower()
+    cleaned = []
+    previous_space = False
 
-    if value == "today":
-        return today.isoformat()
+    for ch in text:
+        if ch.isalnum():
+            cleaned.append(ch)
+            previous_space = False
+        else:
+            if not previous_space:
+                cleaned.append(" ")
+                previous_space = True
 
-    if value == "tomorrow":
-        return (today + timedelta(days=1)).isoformat()
-
-    return date.fromisoformat(value).isoformat()
-
-
-def _extract_matches_from_payload(payload: Any) -> List[Dict[str, Any]]:
-    if isinstance(payload, list):
-        return [x for x in payload if isinstance(x, dict)]
-
-    if isinstance(payload, dict):
-        for key in ("matches", "payload", "items", "data"):
-            value = payload.get(key)
-            if isinstance(value, list):
-                return [x for x in value if isinstance(x, dict)]
-
-    return []
+    return " ".join("".join(cleaned).split())
 
 
-async def _read_request_matches(request: Request) -> List[Dict[str, Any]]:
-    try:
-        payload = await request.json()
-    except Exception:
-        payload = []
-
-    return _extract_matches_from_payload(payload)
+def pair_key(player_a: Any, player_b: Any) -> Tuple[str, str]:
+    a = normalize_text(player_a)
+    b = normalize_text(player_b)
+    return tuple(sorted([a, b]))  # type: ignore[return-value]
 
 
-def _empty_response(
-    status: str,
-    message: str = "",
-    target_day: str = "",
-    stdout_tail: str = "",
-    stderr_tail: str = "",
-    command: str = "",
-) -> Dict[str, Any]:
-    try:
-        state = get_state()
-        history_rows_loaded = int(state.get("history_rows_loaded", 0))
-    except Exception:
-        history_rows_loaded = 0
+def is_real_missing_singles(row: Dict[str, Any]) -> bool:
+    """
+    L'audit daily-schedule peut capter un faux positif de double :
+    Theo Arribage vs Albano Olivetti.
+    On garde seulement les manquants qui ont une vraie preuve de match simple :
+    H2H, Defeats, R32/R64/R16, Not Before, Followed By.
+    """
+    player_a = str(row.get("playerA", "") or "").strip()
+    player_b = str(row.get("playerB", "") or "").strip()
+
+    if not player_a or not player_b:
+        return False
+
+    if pair_key(player_a, player_b)[0] == pair_key(player_a, player_b)[1]:
+        return False
+
+    evidence = str(row.get("evidence", "") or "").lower()
+
+    strong_signals = [
+        "h2h",
+        "defeats",
+        "not before",
+        "followed by",
+        "r64",
+        "r32",
+        "r16",
+        "quarter",
+        "semi",
+        "final",
+    ]
+
+    return any(signal in evidence for signal in strong_signals)
+
+
+def make_non_analyzed_match(row: Dict[str, Any]) -> Dict[str, Any]:
+    player_a = str(row.get("playerA", "") or "").strip()
+    player_b = str(row.get("playerB", "") or "").strip()
+    evidence = str(row.get("evidence", "") or "").strip()
+    source_url = str(row.get("source_url", "") or row.get("sourceUrl", "") or "").strip()
 
     return {
-        "matches": [],
-        "summary": {
-            "totalRows": 0,
-            "validRows": 0,
-            "errorRows": 0,
-            "over80": 0,
-            "vetoCount": 0,
-            "jouables": 0,
-        },
-        "engine": {
-            "name": "Tennis Motor V7",
-            "version": "Bayesian Shrinkage",
-            "historyYears": [2022, 2023, 2024, 2025],
-            "historyRowsLoaded": history_rows_loaded,
-            "premiumFormula": "Bayesian shrinkage blend of SWE, ATP, Rank, Form5, Form10, SurfaceForm5, Dominance",
-            "threshold": "> 0.80",
-            "status": status,
-        },
-        "daily": {
-            "targetDay": target_day,
-            "payloadCount": 0,
-            "stdoutTail": stdout_tail[-4000:] if stdout_tail else "",
-            "stderrTail": stderr_tail[-4000:] if stderr_tail else "",
-            "command": command,
-        },
-        "error": message,
+        "playerA": player_a,
+        "playerB": player_b,
+        "surface": "Clay",
+        "playerAPoints": 0,
+        "playerBPoints": 0,
+        "player_b_is_qualifier": False,
+        "player_b_tournament_wins": 0,
+
+        "sweA": 0,
+        "sweB": 0,
+        "pSwe": 0,
+        "pAtp": 0,
+        "pRank": 0,
+        "pForm5": 0,
+        "pForm10": 0,
+        "pSurfaceForm5": 0,
+        "pDominance": 0,
+        "premium": 0,
+        "premiumPct": 0,
+
+        "veto": "",
+        "decision": "Non analysé",
+        "error": "Non analysé : données ATP incomplètes ou joueur introuvable dans la table des points ATP.",
+        "nonAnalyzed": True,
+        "source": "ATP daily-schedule",
+        "sourceUrl": source_url,
+        "evidence": evidence,
     }
 
 
-def calculate_from_matches(matches: List[Dict[str, Any]]) -> Dict[str, Any]:
-    if not matches:
-        return _empty_response(
-            status="empty_payload",
-            message="Aucun match exploitable dans le payload daily.",
-        )
+def render_backend_result(result: Dict[str, Any]) -> str:
+    lines: List[str] = []
 
-    return calculate_predictions(matches)
+    summary = result.get("summary")
+    matches = result.get("matches")
+    engine = result.get("engine")
+
+    if isinstance(summary, dict):
+        lines.append("Résumé")
+        lines.append(f"- Lignes totales : {summary.get('totalRows', 0)}")
+        lines.append(f"- Lignes valides : {summary.get('validRows', 0)}")
+        lines.append(f"- Lignes en erreur : {summary.get('errorRows', 0)}")
+        lines.append(f"- Non analysés : {summary.get('nonAnalyzedRows', 0)}")
+        lines.append(f"- Premium > 80% : {summary.get('over80', 0)}")
+        lines.append(f"- Veto : {summary.get('vetoCount', 0)}")
+        lines.append(f"- Jouables : {summary.get('jouables', 0)}")
+        lines.append("")
+
+    if isinstance(matches, list):
+        lines.append("Résultats")
+        lines.append("")
+
+        for row in matches:
+            if not isinstance(row, dict):
+                continue
+
+            player_a = row.get("playerA", "")
+            player_b = row.get("playerB", "")
+            surface = row.get("surface", "")
+
+            if row.get("nonAnalyzed") or row.get("error"):
+                lines.append(f"{player_a} vs {player_b} ({surface})")
+                lines.append("Décision : Non analysé")
+                lines.append(f"Raison : {row.get('error', 'Données ATP incomplètes.')}")
+                if row.get("evidence"):
+                    lines.append(f"Preuve ATP : {row.get('evidence')}")
+                lines.append("")
+                continue
+
+            lines.append(f"{player_a} vs {player_b} ({surface})")
+            lines.append(f"Points ATP : {row.get('playerAPoints', '')} vs {row.get('playerBPoints', '')}")
+            lines.append(
+                f"Qualifier B : {row.get('player_b_is_qualifier', '')} | "
+                f"Wins tournoi B : {row.get('player_b_tournament_wins', '')}"
+            )
+            lines.append(f"SWE : {row.get('sweA', '')} vs {row.get('sweB', '')}")
+            lines.append(f"pSwe : {row.get('pSwe', '')} | pAtp : {row.get('pAtp', '')}")
+            lines.append(f"pRank : {row.get('pRank', '')} | pForm5 : {row.get('pForm5', '')} | pForm10 : {row.get('pForm10', '')}")
+            lines.append(f"pSurfaceForm5 : {row.get('pSurfaceForm5', '')} | pDominance : {row.get('pDominance', '')}")
+            lines.append(f"Premium : {row.get('premiumPct', '')}%")
+            lines.append(f"Veto : {row.get('veto', '')}")
+
+            decision = str(row.get("decision", "")).replace("✅ ", "").replace("❌ ", "")
+            lines.append(f"Décision : {decision}")
+            lines.append("")
+
+    if isinstance(engine, dict):
+        lines.append("Moteur")
+        lines.append(f"- Nom : {engine.get('name', '')}")
+        lines.append(f"- Version : {engine.get('version', '')}")
+        lines.append(f"- Lignes historiques chargées : {engine.get('historyRowsLoaded', 0)}")
+        lines.append(f"- Formule Premium : {engine.get('premiumFormula', '')}")
+        lines.append(f"- Seuil : {engine.get('threshold', '')}")
+
+    return "\n".join(lines)
 
 
-def _read_payload_for_day(target_day: str) -> Tuple[List[Dict[str, Any]], str]:
-    """
-    Sécurité anti-cache :
-    on lit uniquement le payload daté du jour demandé.
-    On ne retombe jamais sur payload_latest.json, car il peut contenir
-    les matchs d'une ancienne journée.
-    """
-    payload_path = OUTPUT_DIR / f"payload_{target_day}.json"
-
-    if not payload_path.exists():
-        return [], ""
-
-    payload = json.loads(payload_path.read_text(encoding="utf-8"))
-    return _extract_matches_from_payload(payload), payload_path.name
+@app.get("/")
+def root() -> Dict[str, Any]:
+    return health()
 
 
-def run_daily_fetch_sync(target_day: str) -> Dict[str, Any]:
-    """
-    Lance l'extraction daily.
+@app.get("/health")
+def health() -> Dict[str, Any]:
+    return {
+        "status": "ok",
+        "message": "backend prêt",
+        "version": APP_VERSION,
+        "historyRowsLoaded": get_history_rows_loaded(),
+        "dailyScript": DAILY_SCRIPT,
+        "dailyScriptFound": (BACKEND_DIR / DAILY_SCRIPT).exists(),
+        "missingAuditScript": MISSING_AUDIT_SCRIPT,
+        "missingAuditScriptFound": (BACKEND_DIR / MISSING_AUDIT_SCRIPT).exists(),
+    }
 
-    Cette fonction ne doit jamais faire tomber FastAPI en 500.
-    Si l'extraction ATP plante, on renvoie un JSON propre avec l'erreur.
-    """
 
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+@app.post("/calculate")
+def calculate(request: CalculateRequest) -> Dict[str, Any]:
+    matches = [match.model_dump() for match in request.matches]
 
-    script = BASE_DIR / DAILY_SCRIPT_NAME
-    if not script.exists():
-        return _empty_response(
-            status="script_missing",
-            message=f"{DAILY_SCRIPT_NAME} introuvable sur Railway.",
-            target_day=target_day,
-        )
+    if not hasattr(motor, "calculate_predictions"):
+        return {"error": "Le fichier motor.py ne contient pas calculate_predictions(matches)."}
 
-    cmd = [
-        sys.executable,
-        str(script),
-        target_day,
-        "--no-send-backend",
-    ]
+    result = motor.calculate_predictions(matches)
 
-    command_text = " ".join(cmd)
-    timeout_seconds = int(os.environ.get("FETCH_TIMEOUT_SECONDS", "540"))
-
-    try:
-        completed = subprocess.run(
-            cmd,
-            cwd=str(BASE_DIR),
-            capture_output=True,
-            text=True,
-            timeout=timeout_seconds,
-        )
-    except subprocess.TimeoutExpired as exc:
-        return _empty_response(
-            status="daily_fetch_timeout",
-            message=f"Extraction daily trop longue : timeout après {timeout_seconds} secondes.",
-            target_day=target_day,
-            stdout_tail=exc.stdout or "",
-            stderr_tail=exc.stderr or "",
-            command=command_text,
-        )
-    except Exception as exc:
-        return _empty_response(
-            status="daily_fetch_exception",
-            message=f"Erreur lancement extraction daily : {exc}",
-            target_day=target_day,
-            stdout_tail="",
-            stderr_tail=traceback.format_exc(),
-            command=command_text,
-        )
-
-    stdout = completed.stdout or ""
-    stderr = completed.stderr or ""
-
-    if completed.returncode != 0:
-        return _empty_response(
-            status="daily_fetch_failed",
-            message=f"Extraction daily échouée. Code retour : {completed.returncode}",
-            target_day=target_day,
-            stdout_tail=stdout,
-            stderr_tail=stderr,
-            command=command_text,
-        )
-
-    try:
-        matches, payload_name = _read_payload_for_day(target_day)
-    except Exception as exc:
-        return _empty_response(
-            status="payload_read_failed",
-            message=f"Payload daily illisible : {exc}",
-            target_day=target_day,
-            stdout_tail=stdout,
-            stderr_tail=stderr + "\n" + traceback.format_exc(),
-            command=command_text,
-        )
-
-    result = calculate_from_matches(matches)
-
-    result.setdefault("daily", {})
-    result["daily"].update(
-        {
-            "targetDay": target_day,
-            "payloadCount": len(matches),
-            "payloadPath": payload_name,
-            "stdoutTail": stdout[-1200:],
-            "stderrTail": stderr[-1200:],
-            "command": command_text,
-        }
-    )
+    if not isinstance(result, dict):
+        return {"error": "Le moteur n'a pas renvoyé un objet dict valide."}
 
     return result
 
 
-@app.get("/")
-async def root() -> Dict[str, Any]:
+def run_daily_fetch(day: str, target_day: date) -> Dict[str, Any]:
+    script_path = BACKEND_DIR / DAILY_SCRIPT
+
+    if not script_path.exists():
+        return {"error": f"Script daily introuvable : {script_path}"}
+
+    OUT_DIR.mkdir(exist_ok=True)
+
+    cmd = [
+        sys.executable,
+        str(script_path),
+        day,
+        "--backend-url",
+        "http://127.0.0.1:9",
+    ]
+
+    completed = subprocess.run(
+        cmd,
+        cwd=str(BACKEND_DIR),
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=260,
+    )
+
+    if completed.returncode != 0:
+        return {
+            "error": "Le script daily a échoué.",
+            "returncode": completed.returncode,
+            "stdout": completed.stdout[-5000:],
+            "stderr": completed.stderr[-5000:],
+        }
+
+    payload_path = OUT_DIR / f"payload_{target_day.isoformat()}.json"
+    audit_path = OUT_DIR / f"audit_{target_day.isoformat()}.txt"
+
+    if not payload_path.exists():
+        return {
+            "error": f"Payload introuvable après fetch : {payload_path}",
+            "stdout": completed.stdout[-5000:],
+            "stderr": completed.stderr[-5000:],
+        }
+
+    try:
+        payload = json.loads(payload_path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        return {"error": f"Payload JSON illisible : {exc}"}
+
+    if not isinstance(payload, list):
+        return {"error": "Payload JSON invalide : liste attendue."}
+
+    try:
+        (OUT_DIR / "payload_latest.json").write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+    except Exception:
+        pass
+
     return {
-        "status": "ok",
-        "service": "Tennis Motor Railway Backend",
-        "endpoints": [
-            "/health",
-            "/calculate",
-            "/daily?day=today",
-            "/daily?day=tomorrow",
-            "/predictions?day=today",
-        ],
+        "payload": payload,
+        "payloadPath": str(payload_path),
+        "auditPath": str(audit_path),
+        "stdout": completed.stdout[-3000:],
     }
 
 
-@app.get("/health")
-async def health() -> Dict[str, Any]:
-    try:
-        state = get_state()
-        history_rows = int(state.get("history_rows_loaded", 0))
+def run_missing_audit(day: str, target_day: date) -> Dict[str, Any]:
+    script_path = BACKEND_DIR / MISSING_AUDIT_SCRIPT
 
+    if not script_path.exists():
         return {
-            "status": "ok",
-            "service": "Tennis Motor Railway Backend",
-            "engine": "loaded",
-            "historyRowsLoaded": history_rows,
-            "dailyScript": DAILY_SCRIPT_NAME,
-            "dailyScriptFound": (BASE_DIR / DAILY_SCRIPT_NAME).exists(),
-            "cacheProtection": "payload_latest_disabled",
-        }
-    except Exception as exc:
-        return {
-            "status": "error",
-            "service": "Tennis Motor Railway Backend",
-            "engine": "not_loaded",
-            "error": str(exc),
+            "enabled": False,
+            "error": f"Script audit manquant : {script_path}",
+            "missing": [],
+            "ignored": [],
         }
 
+    cmd = [
+        sys.executable,
+        str(script_path),
+        day,
+    ]
 
-@app.post("/calculate")
-async def calculate(request: Request) -> Dict[str, Any]:
     try:
-        matches = await _read_request_matches(request)
-        return calculate_from_matches(matches)
-    except Exception as exc:
-        return _empty_response(
-            status="calculate_failed",
-            message=str(exc),
-            stderr_tail=traceback.format_exc(),
+        completed = subprocess.run(
+            cmd,
+            cwd=str(BACKEND_DIR),
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=180,
         )
+    except subprocess.TimeoutExpired:
+        return {
+            "enabled": True,
+            "error": "Audit matchs invisibles timeout.",
+            "missing": [],
+            "ignored": [],
+        }
 
+    if completed.returncode != 0:
+        return {
+            "enabled": True,
+            "error": "Audit matchs invisibles échoué.",
+            "stdout": completed.stdout[-3000:],
+            "stderr": completed.stderr[-3000:],
+            "missing": [],
+            "ignored": [],
+        }
 
-@app.post("/predictions")
-async def predictions_post(request: Request) -> Dict[str, Any]:
+    json_path = OUT_DIR / f"audit_daily_schedule_missing_{target_day.isoformat()}.json"
+    latest_json_path = OUT_DIR / "audit_daily_schedule_missing_latest.json"
+
+    if json_path.exists():
+        read_path = json_path
+    elif latest_json_path.exists():
+        read_path = latest_json_path
+    else:
+        return {
+            "enabled": True,
+            "error": "Audit JSON introuvable.",
+            "missing": [],
+            "ignored": [],
+        }
+
     try:
-        matches = await _read_request_matches(request)
-        return calculate_from_matches(matches)
+        data = json.loads(read_path.read_text(encoding="utf-8"))
     except Exception as exc:
-        return _empty_response(
-            status="predictions_post_failed",
-            message=str(exc),
-            stderr_tail=traceback.format_exc(),
-        )
+        return {
+            "enabled": True,
+            "error": f"Audit JSON illisible : {exc}",
+            "missing": [],
+            "ignored": [],
+        }
+
+    raw_missing = data.get("missingFromPayload", [])
+    if not isinstance(raw_missing, list):
+        raw_missing = []
+
+    kept: List[Dict[str, Any]] = []
+    ignored: List[Dict[str, Any]] = []
+
+    for row in raw_missing:
+        if not isinstance(row, dict):
+            continue
+
+        if is_real_missing_singles(row):
+            kept.append(row)
+        else:
+            ignored.append(row)
+
+    raw_official_pairs = data.get("dailySchedulePairs", [])
+    official_pairs: List[Dict[str, Any]] = []
+
+    if isinstance(raw_official_pairs, list):
+        for row in raw_official_pairs:
+            if not isinstance(row, dict):
+                continue
+
+            # Sécurité V6.9H :
+            # on garde seulement les vrais blocs ATP.
+            # Les lignes reconstruites "vs" peuvent parfois mélanger deux matchs.
+            if str(row.get("source", "")).strip() != "daily_schedule_block":
+                continue
+
+            pa = str(row.get("playerA", "") or "").strip()
+            pb = str(row.get("playerB", "") or "").strip()
+
+            if not pa or not pb:
+                continue
+
+            if pair_key(pa, pb)[0] == pair_key(pa, pb)[1]:
+                continue
+
+            official_pairs.append(row)
+
+    return {
+        "enabled": True,
+        "error": "",
+        "auditPath": str(read_path),
+        "missing": kept,
+        "ignored": ignored,
+        "rawMissingCount": len(raw_missing),
+        "keptMissingCount": len(kept),
+        "ignoredMissingCount": len(ignored),
+        "officialDailyPairs": official_pairs,
+        "officialDailyPairsCount": len(official_pairs),
+    }
+
+
+
+def filter_payload_against_official_pairs(
+    payload: List[Dict[str, Any]],
+    missing_audit: Dict[str, Any],
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """
+    Sécurité V6.9H :
+    - le scraper peut parfois créer une fausse paire en mélangeant des joueurs
+      de deux blocs voisins ;
+    - l'audit ATP daily-schedule donne les vrais blocs officiels ;
+    - on supprime du payload les paires absentes des vrais blocs ATP.
+    """
+    official_rows = missing_audit.get("officialDailyPairs", [])
+
+    if not isinstance(official_rows, list) or len(official_rows) == 0:
+        return payload, []
+
+    official_keys = set()
+
+    for row in official_rows:
+        if not isinstance(row, dict):
+            continue
+
+        official_keys.add(pair_key(row.get("playerA", ""), row.get("playerB", "")))
+
+    if not official_keys:
+        return payload, []
+
+    kept: List[Dict[str, Any]] = []
+    dropped: List[Dict[str, Any]] = []
+
+    for row in payload:
+        if not isinstance(row, dict):
+            continue
+
+        key = pair_key(row.get("playerA", ""), row.get("playerB", ""))
+
+        if key in official_keys:
+            kept.append(row)
+        else:
+            dropped.append(row)
+
+    return kept, dropped
+
+
+def append_non_analyzed_matches(result: Dict[str, Any], missing_rows: List[Dict[str, Any]]) -> int:
+    if not missing_rows:
+        return 0
+
+    matches = result.get("matches")
+    if not isinstance(matches, list):
+        matches = []
+        result["matches"] = matches
+
+    existing_keys = set()
+
+    for row in matches:
+        if not isinstance(row, dict):
+            continue
+        existing_keys.add(pair_key(row.get("playerA", ""), row.get("playerB", "")))
+
+    appended = 0
+
+    for row in missing_rows:
+        new_match = make_non_analyzed_match(row)
+        key = pair_key(new_match.get("playerA", ""), new_match.get("playerB", ""))
+
+        if key in existing_keys:
+            continue
+
+        matches.append(new_match)
+        existing_keys.add(key)
+        appended += 1
+
+    summary = result.get("summary")
+    if not isinstance(summary, dict):
+        summary = {}
+        result["summary"] = summary
+
+    old_total = int(summary.get("totalRows", len(matches) - appended) or 0)
+    old_error = int(summary.get("errorRows", 0) or 0)
+    old_non_analyzed = int(summary.get("nonAnalyzedRows", 0) or 0)
+
+    summary["totalRows"] = old_total + appended
+    summary["errorRows"] = old_error + appended
+    summary["nonAnalyzedRows"] = old_non_analyzed + appended
+
+    if "validRows" not in summary:
+        summary["validRows"] = max(0, len(matches) - appended)
+
+    return appended
 
 
 @app.get("/daily")
-async def daily(day: str = Query("today")) -> Dict[str, Any]:
+def daily(day: str = Query("today", description="today | tomorrow | YYYY-MM-DD")) -> Dict[str, Any]:
     try:
-        target_day = normalize_day(day)
-    except Exception as exc:
-        return _empty_response(
-            status="bad_day_parameter",
-            message=f"Paramètre day invalide : {day} | {exc}",
-            target_day=str(day),
-        )
+        target_day = parse_target_day(day)
+    except Exception:
+        return {"error": "Paramètre day invalide. Utilise today, tomorrow ou YYYY-MM-DD."}
 
-    return await asyncio.to_thread(run_daily_fetch_sync, target_day)
+    fetched = run_daily_fetch(day, target_day)
 
+    if "error" in fetched:
+        return fetched
 
-@app.get("/predictions")
-async def predictions_get(day: str = Query("today")) -> Dict[str, Any]:
-    try:
-        target_day = normalize_day(day)
-    except Exception as exc:
-        return _empty_response(
-            status="bad_day_parameter",
-            message=f"Paramètre day invalide : {day} | {exc}",
-            target_day=str(day),
-        )
+    payload = fetched.get("payload", [])
 
-    return await asyncio.to_thread(run_daily_fetch_sync, target_day)
+    if not isinstance(payload, list):
+        payload = []
 
+    # IMPORTANT V6.9H :
+    # on lance l'audit AVANT le moteur pour obtenir les vrais blocs ATP officiels.
+    missing_audit = run_missing_audit(day, target_day)
 
-@app.get("/state")
-async def state() -> Dict[str, Any]:
-    try:
-        s = get_state()
-        return {
-            "status": "ok",
-            "historyRowsLoaded": s.get("history_rows_loaded", 0),
-            "rankReferenceSize": len(s.get("rank_reference_points", [])),
+    payload_before_guard_count = len(payload)
+    payload, dropped_wrong_pairs = filter_payload_against_official_pairs(payload, missing_audit)
+
+    if dropped_wrong_pairs:
+        try:
+            filtered_payload_path = OUT_DIR / f"payload_{target_day.isoformat()}_official_guard.json"
+            filtered_payload_path.write_text(
+                json.dumps(payload, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+            (OUT_DIR / "payload_latest_official_guard.json").write_text(
+                json.dumps(payload, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+        except Exception:
+            pass
+
+    if not payload:
+        result: Dict[str, Any] = {
+            "matches": [],
+            "summary": {
+                "totalRows": 0,
+                "validRows": 0,
+                "errorRows": 0,
+                "nonAnalyzedRows": 0,
+                "over80": 0,
+                "vetoCount": 0,
+                "jouables": 0,
+            },
+            "engine": {
+                "name": "Tennis Motor V7",
+                "version": "Bayesian Shrinkage",
+                "historyRowsLoaded": get_history_rows_loaded(),
+                "premiumFormula": "Bayesian shrinkage blend of SWE, ATP, Rank, Form5, Form10, SurfaceForm5, Dominance",
+                "threshold": "> 0.80",
+            },
         }
-    except Exception as exc:
-        return {
-            "status": "error",
-            "error": str(exc),
+    else:
+        if not hasattr(motor, "calculate_predictions"):
+            return {"error": "Le fichier motor.py ne contient pas calculate_predictions(matches)."}
+
+        result = motor.calculate_predictions(payload)
+
+        if not isinstance(result, dict):
+            return {"error": "Le moteur n'a pas renvoyé un objet dict valide."}
+
+    result["meta"] = {
+        "targetDay": target_day.isoformat(),
+        "targetLabel": day,
+        "mode": APP_VERSION,
+        "payloadPath": fetched.get("payloadPath", ""),
+        "auditPath": fetched.get("auditPath", ""),
+        "officialPairGuard": {
+            "enabled": True,
+            "payloadBeforeGuard": payload_before_guard_count,
+            "payloadAfterGuard": len(payload),
+            "droppedWrongPairs": len(dropped_wrong_pairs),
+            "officialDailyPairsCount": missing_audit.get("officialDailyPairsCount", 0),
+            "droppedPairs": [
+                {
+                    "playerA": row.get("playerA", ""),
+                    "playerB": row.get("playerB", ""),
+                    "reason": "Paire absente des vrais blocs ATP daily-schedule",
+                }
+                for row in dropped_wrong_pairs
+                if isinstance(row, dict)
+            ],
+        },
+    }
+
+    missing_rows = missing_audit.get("missing", [])
+    appended = 0
+
+    if isinstance(missing_rows, list):
+        appended = append_non_analyzed_matches(result, missing_rows)
+
+    if isinstance(result.get("meta"), dict):
+        result["meta"]["missingAudit"] = {
+            "enabled": missing_audit.get("enabled", False),
+            "error": missing_audit.get("error", ""),
+            "auditPath": missing_audit.get("auditPath", ""),
+            "rawMissingCount": missing_audit.get("rawMissingCount", 0),
+            "keptMissingCount": missing_audit.get("keptMissingCount", 0),
+            "ignoredMissingCount": missing_audit.get("ignoredMissingCount", 0),
+            "appendedNonAnalyzed": appended,
+            "officialDailyPairsCount": missing_audit.get("officialDailyPairsCount", 0),
         }
+
+    OUT_DIR.mkdir(exist_ok=True)
+
+    result_json_path = OUT_DIR / f"result_{target_day.isoformat()}.json"
+    result_txt_path = OUT_DIR / f"result_{target_day.isoformat()}.txt"
+    result_latest_path = OUT_DIR / "result_latest.txt"
+
+    result_json_path.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    result_text = render_backend_result(result)
+    result_txt_path.write_text(result_text, encoding="utf-8")
+    result_latest_path.write_text(result_text, encoding="utf-8")
+
+    return result
 
 
 if __name__ == "__main__":
-    import uvicorn
-
-    port = int(os.environ.get("PORT", "8000"))
-    uvicorn.run("app:app", host="0.0.0.0", port=port)
+    uvicorn.run("app:app", host="127.0.0.1", port=8000, reload=False)
