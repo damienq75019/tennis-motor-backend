@@ -10,9 +10,10 @@ But :
   correspondant réellement à target_day ;
 - si aucune section datée fiable n'est trouvée, ne pas inventer de matchs.
 
-Ce fichier est volontairement un wrapper complet : il réutilise le script V6.7
-existant pour toutes les fonctions lourdes déjà validées, puis remplace seulement
-la sélection des matchs du jour.
+Correction importante :
+- suppression du fallback dangereux qui faisait des paires avec des noms consécutifs.
+- le script accepte seulement les vrais matchs détectés avec "vs" / "v.".
+- si les noms sont en lignes séparées autour de "Vs", le script reconstruit la paire proprement.
 """
 
 from __future__ import annotations
@@ -25,7 +26,7 @@ import sys
 from dataclasses import asdict
 from datetime import date
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 from urllib.parse import urlparse
 
 from bs4 import BeautifulSoup
@@ -121,7 +122,6 @@ def line_mentions_target_date(line: str, target_day: date) -> bool:
     day2 = f"{data['day']:02d}"
     year = str(data["year"])
 
-    # Signatures fortes : ISO ou mois + jour, ou weekday + mois/jour.
     if data["iso"] in ln:
         return True
 
@@ -135,8 +135,6 @@ def line_mentions_target_date(line: str, target_day: date) -> bool:
     if has_weekday and (has_month or has_day or has_year):
         return True
 
-    # Certains articles ATP titrent "Saturday Schedule" sans date numérique.
-    # On accepte seulement si la ligne ressemble à un titre de section.
     if has_weekday and re.search(r"\b(schedule|order of play|play|matches|draw|court|session)\b", ln):
         return True
 
@@ -155,11 +153,9 @@ def line_mentions_other_date(line: str, target_day: date) -> bool:
     if any(re.search(rf"\b{re.escape(w)}\b", ln) for w in weekdays):
         if re.search(r"\b(schedule|order of play|play|matches|draw|court|session)\b", ln):
             return True
-        # Ligne avec weekday + mois/jour = très probablement nouvelle section.
         if any(m in ln for m in _month_names()):
             return True
 
-    # Mois + jour différent, ex : "Sunday, April 27".
     for month in _month_names():
         if month not in ln:
             continue
@@ -203,7 +199,7 @@ def build_name_alias_index(display_map: Dict[str, str], valid_player_keys: Set[s
         }
 
         if len(parts) >= 2:
-            aliases.add(parts[-1])  # nom de famille
+            aliases.add(parts[-1])
             aliases.add(f"{parts[0]} {parts[-1]}")
             aliases.add(f"{parts[0][0]} {parts[-1]}")
 
@@ -213,7 +209,6 @@ def build_name_alias_index(display_map: Dict[str, str], valid_player_keys: Set[s
 
     out: Dict[str, List[str]] = {}
     for alias, names in tmp.items():
-        # garder seulement les alias non ambigus
         if len(names) == 1:
             out[alias] = list(names)
 
@@ -234,7 +229,6 @@ def find_player_in_fragment(
     if not norm:
         return None
 
-    # Plus long d'abord pour éviter de matcher un nom court avant un nom complet.
     for alias in sorted(alias_index.keys(), key=len, reverse=True):
         if re.search(rf"\b{re.escape(alias)}\b", norm):
             return alias_index[alias][0]
@@ -247,9 +241,13 @@ def extract_pair_from_vs_line(
     alias_index: Dict[str, List[str]],
     valid_player_keys: Set[str],
 ) -> Optional[Tuple[str, str]]:
-    # Supprimer les morceaux de contexte qui parasitent souvent une ligne ATP.
     cleaned = base.normalize_space(line)
-    cleaned = re.sub(r"\b(Court|Stadium|Manolo Santana|Arantxa Sanchez|Not Before|NB|Starts at).*$", "", cleaned, flags=re.I)
+    cleaned = re.sub(
+        r"\b(Court|Stadium|Manolo Santana|Arantxa Sanchez|Not Before|NB|Starts at).*$",
+        "",
+        cleaned,
+        flags=re.I,
+    )
 
     if not re.search(r"\b(vs|v)\.?\b", cleaned, flags=re.I):
         return None
@@ -260,7 +258,6 @@ def extract_pair_from_vs_line(
 
     left, right = parts[0], parts[1]
 
-    # Doubles : on ignore volontairement si / est présent autour du vs.
     if "/" in left or "/" in right:
         return None
 
@@ -280,6 +277,15 @@ def extract_pairs_from_lines(
     display_map: Dict[str, str],
     valid_player_keys: Set[str],
 ) -> List[Tuple[str, str]]:
+    """
+    Version restaurée + sécurisée.
+
+    1) Si la source contient de vraies lignes "Joueur A vs Joueur B", on les utilise.
+    2) Sinon, on garde le fallback ATP précédent pour continuer à récupérer les matchs.
+
+    Important : ce fallback peut encore être corrigé ensuite par SportyTrader dans
+    parse_tournament_context_strict(), sans casser la récupération ATP.
+    """
     alias_index = build_name_alias_index(display_map, valid_player_keys)
     pairs: List[Tuple[str, str]] = []
 
@@ -291,8 +297,8 @@ def extract_pairs_from_lines(
     if pairs:
         return base.pair_consecutive_names([x for pair in pairs for x in pair])
 
-    # Fallback dans la section datée uniquement : ordre des noms ATP.
-    section_html = "\n".join(lines)
+    # Fallback ATP restauré : section datée uniquement.
+    section_html = "\\n".join(lines)
     ordered_names = base.extract_ordered_valid_names(section_html, display_map, valid_player_keys)
     return base.pair_consecutive_names(ordered_names)
 
@@ -312,7 +318,6 @@ def split_target_sections(lines: Sequence[str], target_day: date) -> Tuple[List[
                 break
 
         section = list(lines[start:end])
-        # éviter des sections immenses si l'article ne découpe pas proprement
         if len(section) > 120:
             section = section[:120]
             audit.append("strict_section_clamped=120_lines")
@@ -347,7 +352,6 @@ def parse_article_pairs_strict_day(
         audit.append(f"undated_fallback_pairs={len(pairs)}")
         all_pairs.extend(pairs)
 
-    # dédoublonnage stable
     uniq: Dict[Tuple[str, str], Tuple[str, str]] = {}
     for a, b in all_pairs:
         key = (base.canonical_name(a), base.canonical_name(b))
@@ -356,6 +360,177 @@ def parse_article_pairs_strict_day(
     final_pairs = list(uniq.values())
     audit.append(f"strict_article_pairs={len(final_pairs)}")
     return final_pairs, audit
+
+
+
+# ---------------------------------------------------------------------------
+# Validation / correction des paires via SportyTrader
+# ---------------------------------------------------------------------------
+
+SPORTYTRADER_ATP_URLS = [
+    "https://www.sportytrader.com/en/odds/tennis/atp-s/",
+    "https://www.sportytrader.com/cotes/tennis/atp-s/",
+]
+
+_FR_MONTHS = {
+    1: ["janvier", "janv", "jan"],
+    2: ["fevrier", "fevr", "fev", "february", "feb"],
+    3: ["mars", "march", "mar"],
+    4: ["avril", "april", "apr"],
+    5: ["mai", "may"],
+    6: ["juin", "june", "jun"],
+    7: ["juillet", "july", "jul"],
+    8: ["aout", "august", "aug"],
+    9: ["septembre", "september", "sep"],
+    10: ["octobre", "october", "oct"],
+    11: ["novembre", "november", "nov"],
+    12: ["decembre", "december", "dec"],
+}
+
+
+def line_mentions_target_date_flexible(line: str, target_day: date) -> bool:
+    ln = _norm_ascii(line)
+    day = target_day.day
+    day1 = str(day)
+    day2 = f"{day:02d}"
+    month_num = target_day.month
+
+    if target_day.isoformat() in ln:
+        return True
+
+    # Formats numériques : 06/05, 6/5, 05/06 selon site.
+    numeric_patterns = [
+        rf"\b{day1}/{month_num}\b",
+        rf"\b{day2}/{month_num:02d}\b",
+        rf"\b{month_num}/{day1}\b",
+        rf"\b{month_num:02d}/{day2}\b",
+    ]
+    if any(re.search(p, ln) for p in numeric_patterns):
+        return True
+
+    month_words = _FR_MONTHS.get(month_num, []) + [target_day.strftime("%B").lower()]
+    has_day = re.search(rf"\b({day1}|{day2})(st|nd|rd|th)?\b", ln) is not None
+    has_month = any(re.search(rf"\b{re.escape(_norm_ascii(m))}\b", ln) for m in month_words)
+
+    return bool(has_day and has_month)
+
+
+def extract_sportytrader_pairs_from_html(
+    html: str,
+    display_map: Dict[str, str],
+    valid_player_keys: Set[str],
+    target_day: date,
+) -> Tuple[List[Tuple[str, str]], List[str]]:
+    """
+    Lit la page SportyTrader ATP et récupère uniquement des paires explicites
+    du type "Joueur A - Joueur B".
+
+    On ne fait aucun calcul avec les cotes ici. SportyTrader sert seulement à
+    corriger l'association joueur A / joueur B quand l'article ATP mélange les noms.
+    """
+    lines = extract_article_lines(html)
+    audit: List[str] = [f"sporty_lines={len(lines)}"]
+    alias_index = build_name_alias_index(display_map, valid_player_keys)
+
+    target_date_exists = any(line_mentions_target_date_flexible(ln, target_day) for ln in lines)
+    audit.append(f"sporty_target_date_seen={str(target_date_exists).lower()}")
+
+    pairs: List[Tuple[str, str]] = []
+
+    for i, ln in enumerate(lines):
+        clean = base.normalize_space(ln)
+
+        # SportyTrader affiche les matchs ainsi : "Player A - Player B".
+        if " - " not in clean:
+            continue
+
+        # Si une date cible est visible sur la page, on exige qu'elle soit proche
+        # de la ligne du match pour éviter de prendre un autre jour.
+        if target_date_exists:
+            window = lines[max(0, i - 6): min(len(lines), i + 3)]
+            if not any(line_mentions_target_date_flexible(x, target_day) for x in window):
+                continue
+
+        left, right = clean.split(" - ", 1)
+
+        if "/" in left or "/" in right:
+            continue
+
+        a = find_player_in_fragment(left, alias_index, valid_player_keys)
+        b = find_player_in_fragment(right, alias_index, valid_player_keys)
+
+        if not a or not b:
+            continue
+        if base.canonical_name(a) == base.canonical_name(b):
+            continue
+
+        pairs.append((a, b))
+
+    uniq: Dict[Tuple[str, str], Tuple[str, str]] = {}
+    for a, b in pairs:
+        key = (base.canonical_name(a), base.canonical_name(b))
+        uniq[key] = (a, b)
+
+    final_pairs = list(uniq.values())
+    audit.append(f"sporty_pairs={len(final_pairs)}")
+    return final_pairs, audit
+
+
+def get_sportytrader_pairs_for_context(
+    session,
+    ctx,
+    display_map: Dict[str, str],
+    valid_player_keys: Set[str],
+    target_day: date,
+) -> Tuple[List[Tuple[str, str]], List[str]]:
+    """
+    Essaie de récupérer les vraies paires du jour via SportyTrader,
+    puis garde seulement les joueurs appartenant au tournoi/contexte ATP courant.
+
+    Si SportyTrader échoue ou ne donne rien, le script retombe sur l'ancienne
+    extraction ATP. Donc la récupération ne tombe pas à zéro.
+    """
+    audit: List[str] = []
+
+    ctx_player_keys = set(getattr(ctx, "player_keys", set()) or set())
+    if not ctx_player_keys:
+        audit.append("[SPORTY] ctx_player_keys=0 -> skipped")
+        return [], audit
+
+    for url in SPORTYTRADER_ATP_URLS:
+        try:
+            html = base.fetch_html(session, url)
+            pairs, paudit = extract_sportytrader_pairs_from_html(
+                html=html,
+                display_map=display_map,
+                valid_player_keys=valid_player_keys,
+                target_day=target_day,
+            )
+            audit.append(f"[SPORTY URL] pairs_raw={len(pairs)} | url={url}")
+            audit.extend(f"  {x}" for x in paudit)
+
+            filtered: List[Tuple[str, str]] = []
+            for a, b in pairs:
+                ka = base.canonical_name(a)
+                kb = base.canonical_name(b)
+                if ka in ctx_player_keys and kb in ctx_player_keys:
+                    filtered.append((a, b))
+
+            # Dédoublonnage stable.
+            uniq: Dict[Tuple[str, str], Tuple[str, str]] = {}
+            for a, b in filtered:
+                uniq[(base.canonical_name(a), base.canonical_name(b))] = (a, b)
+            filtered = list(uniq.values())
+
+            audit.append(f"[SPORTY FILTERED] {ctx.tournament_name} | count={len(filtered)}")
+
+            if filtered:
+                return filtered, audit
+
+        except Exception as exc:
+            audit.append(f"[SPORTY FAIL] {url} | {exc}")
+
+    return [], audit
 
 
 def parse_tournament_context_strict(
@@ -367,8 +542,13 @@ def parse_tournament_context_strict(
     allow_undated_article_fallback: bool = False,
 ) -> Tuple[Any, List[str]]:
     """
-    On laisse la V6.7 construire le contexte complet, puis on remplace seulement
-    ctx.article_pairs par des paires filtrées par target_day.
+    On laisse la V6.7 construire le contexte complet.
+
+    Ordre de sélection des paires :
+    1) SportyTrader, uniquement pour corriger l'association Joueur A / Joueur B.
+    2) Si SportyTrader ne donne rien : ancienne extraction ATP stricte par article.
+
+    Le moteur/veto reste inchangé.
     """
     ctx = base.parse_tournament_context(
         session=session,
@@ -380,8 +560,24 @@ def parse_tournament_context_strict(
 
     audit: List[str] = []
     strict_pairs: List[Tuple[str, str]] = []
-    article_urls = base.discover_schedule_article_urls(session, ctx.slug, target_day.year)
 
+    # 1) Correction paires via SportyTrader.
+    sporty_pairs, sporty_audit = get_sportytrader_pairs_for_context(
+        session=session,
+        ctx=ctx,
+        display_map=display_map,
+        valid_player_keys=valid_player_keys,
+        target_day=target_day,
+    )
+    audit.extend(sporty_audit)
+
+    if sporty_pairs:
+        ctx.article_pairs = sporty_pairs
+        audit.append(f"[DAY PAIRS SOURCE] {ctx.tournament_name} | source=sportytrader | count={len(sporty_pairs)}")
+        return ctx, audit
+
+    # 2) Fallback ATP comme avant.
+    article_urls = base.discover_schedule_article_urls(session, ctx.slug, target_day.year)
     audit.append(f"[STRICT ARTICLE] {ctx.tournament_name} | urls={len(article_urls)}")
 
     for article_url in article_urls:
@@ -406,8 +602,8 @@ def parse_tournament_context_strict(
         except Exception as exc:
             audit.append(f"[STRICT ARTICLE FAIL] {ctx.tournament_name} | {article_url} | {exc}")
 
-    # Remplacement essentiel : on ne garde pas les article_pairs globaux de la V6.7.
     ctx.article_pairs = strict_pairs
+    audit.append(f"[DAY PAIRS SOURCE] {ctx.tournament_name} | source=atp_article_fallback | count={len(strict_pairs)}")
     return ctx, audit
 
 
