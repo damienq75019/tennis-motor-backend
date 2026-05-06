@@ -19,7 +19,7 @@ from motor import calculate_predictions, get_state
 BASE_DIR = Path(__file__).resolve().parent
 OUTPUT_DIR = BASE_DIR / "output"
 PAYLOAD_LATEST_PATH = OUTPUT_DIR / "payload_latest.json"
-DAILY_SCRIPT_NAME = "fetch_day_lines_v6_10_daily_schedule_only.py"
+DAILY_SCRIPT_NAME = "fetch_day_lines_v6_10c_daily_schedule_line_scanner.py"
 
 app = FastAPI(title="Tennis Motor Railway Backend")
 
@@ -270,6 +270,9 @@ async def health() -> Dict[str, Any]:
             "service": "Tennis Motor Railway Backend",
             "engine": "loaded",
             "historyRowsLoaded": history_rows,
+            "dailyScript": DAILY_SCRIPT_NAME,
+            "dailyScriptFound": (BASE_DIR / DAILY_SCRIPT_NAME).exists(),
+            "cacheProtection": "payload_latest_disabled",
         }
     except Exception as exc:
         return {
