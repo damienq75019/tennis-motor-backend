@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Tennis Motor - Fetch daily lines V6.12 ATP DAILY SCHEDULE ANCHOR FIX
+Tennis Motor - Fetch daily lines V6.13 ATP DAILY SCHEDULE OFFICIAL PARSER FIX
 
 But :
 - garder le moteur / veto existant de la V6.7 ;
@@ -39,7 +39,7 @@ BASE_MODULE_CANDIDATES = [
     "fetch_day_lines_v6_5_results_context_safe",
 ]
 
-MODE = "V6_12_ATP_DAILY_SCHEDULE_ANCHOR_FIX"
+MODE = "V6_13_ATP_DAILY_SCHEDULE_OFFICIAL_PARSER_FIX"
 PAYLOAD_LATEST_PATH = Path("output") / "payload_latest.json"
 
 
@@ -221,25 +221,87 @@ def build_name_alias_index(display_map: Dict[str, str], valid_player_keys: Set[s
     return out
 
 
+
+def _slug_to_display_name_from_atp_href(href: str) -> Optional[str]:
+    """
+    Extrait un nom complet depuis un lien ATP officiel :
+    /en/players/yannick-hanfmann/h996/overview -> Yannick Hanfmann
+    """
+    h = href or ""
+    m = re.search(r"/en/players/([^/]+)/[^/]+/overview", h)
+    if not m:
+        return None
+    slug = m.group(1).strip()
+    if not slug or "{" in slug:
+        return None
+    parts = [p for p in slug.replace("-", " ").split() if p]
+    if len(parts) < 2:
+        return None
+    return base.title_name(" ".join(parts))
+
+
+def _resolve_to_known_atp_player(
+    raw: str,
+    alias_index: Dict[str, List[str]],
+    valid_player_keys: Set[str],
+    href: str = "",
+) -> Optional[str]:
+    """
+    Résout un libellé ATP court ou un href officiel vers un nom joueur ATP connu.
+
+    Sécurité :
+    - utilise d'abord le nom exact/canonique ;
+    - puis les alias initiale + nom ;
+    - puis le slug du lien ATP officiel ;
+    - refuse si ça ne correspond pas à un joueur ATP du points_map.
+    """
+    candidates: List[str] = []
+
+    cleaned = base.clean_candidate_name(raw or "")
+    cleaned = re.sub(r"\b(Q|WC|PR|LL|SE)\b", " ", cleaned, flags=re.I)
+    cleaned = base.normalize_space(cleaned.replace("(", " ").replace(")", " "))
+    if cleaned:
+        candidates.append(cleaned)
+
+    from_href = _slug_to_display_name_from_atp_href(href)
+    if from_href:
+        candidates.append(from_href)
+
+    for cand in candidates:
+        key = base.canonical_name(cand)
+        if key in valid_player_keys and base.is_name_like(cand):
+            return cand
+
+    for cand in candidates:
+        norm = _no_punct(cand)
+        if not norm:
+            continue
+        # recherche alias complète d'abord
+        for alias in sorted(alias_index.keys(), key=len, reverse=True):
+            if re.search(rf"\b{re.escape(alias)}\b", norm):
+                return alias_index[alias][0]
+
+    # Dernier secours contrôlé : initiale + nom à partir du label ATP court.
+    # Exemple: "Y. Hanfmann" -> alias "y hanfmann".
+    for cand in candidates:
+        parts = _no_punct(cand).split()
+        if len(parts) >= 2 and len(parts[0]) == 1:
+            compact = f"{parts[0]} {' '.join(parts[1:])}"
+            if compact in alias_index:
+                return alias_index[compact][0]
+            compact_last = f"{parts[0]} {parts[-1]}"
+            if compact_last in alias_index:
+                return alias_index[compact_last][0]
+
+    return None
+
+
 def find_player_in_fragment(
     fragment: str,
     alias_index: Dict[str, List[str]],
     valid_player_keys: Set[str],
 ) -> Optional[str]:
-    raw = base.clean_candidate_name(fragment)
-    key = base.canonical_name(raw)
-    if key in valid_player_keys and base.is_name_like(raw):
-        return raw
-
-    norm = _no_punct(fragment)
-    if not norm:
-        return None
-
-    for alias in sorted(alias_index.keys(), key=len, reverse=True):
-        if re.search(rf"\b{re.escape(alias)}\b", norm):
-            return alias_index[alias][0]
-
-    return None
+    return _resolve_to_known_atp_player(fragment, alias_index, valid_player_keys)
 
 
 def extract_pair_from_vs_line(
@@ -633,12 +695,14 @@ def extract_pairs_from_atp_daily_schedule_anchors(
         if not isinstance(node, Tag):
             return
         if node.name == "a" and _is_atp_player_href(node.get("href", "")):
+            href = node.get("href", "") or ""
             label = base.normalize_space(node.get_text(" ", strip=True))
-            player = find_player_in_fragment(label, alias_index, valid_player_keys)
+            player = _resolve_to_known_atp_player(label, alias_index, valid_player_keys, href=href)
             if player:
                 tokens.append(("player", player))
             else:
-                audit.append(f"anchor_player_unmatched={label}")
+                slug_name = _slug_to_display_name_from_atp_href(href) or ""
+                audit.append(f"anchor_player_unmatched={label}|slug={slug_name}|href={href[:90]}")
             return
         for child in node.children:
             walk(child)
@@ -1107,6 +1171,9 @@ def main() -> int:
         print(f"AUDIT_LATEST: {base.AUDIT_LATEST_PATH}")
         print("COUNT       : 0")
         print("Aucun match exploitable avec filtre strict par date.")
+        print("--- AUDIT TAIL ---")
+        for row in audit[-80:]:
+            print(row)
         return 0
 
     if backend_send_is_disabled(args.backend_url, args.no_send_backend):
