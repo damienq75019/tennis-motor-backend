@@ -19,6 +19,7 @@ from motor import calculate_predictions, get_state
 BASE_DIR = Path(__file__).resolve().parent
 OUTPUT_DIR = BASE_DIR / "output"
 PAYLOAD_LATEST_PATH = OUTPUT_DIR / "payload_latest.json"
+DAILY_SCRIPT_NAME = "fetch_day_lines_v6_10_daily_schedule_only.py"
 
 app = FastAPI(title="Tennis Motor Railway Backend")
 
@@ -131,10 +132,13 @@ def calculate_from_matches(matches: List[Dict[str, Any]]) -> Dict[str, Any]:
 
 
 def _read_payload_for_day(target_day: str) -> Tuple[List[Dict[str, Any]], str]:
+    """
+    Sécurité anti-cache :
+    on lit uniquement le payload daté du jour demandé.
+    On ne retombe jamais sur payload_latest.json, car il peut contenir
+    les matchs d'une ancienne journée.
+    """
     payload_path = OUTPUT_DIR / f"payload_{target_day}.json"
-
-    if not payload_path.exists():
-        payload_path = PAYLOAD_LATEST_PATH
 
     if not payload_path.exists():
         return [], ""
@@ -153,11 +157,11 @@ def run_daily_fetch_sync(target_day: str) -> Dict[str, Any]:
 
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
-    script = BASE_DIR / "fetch_day_lines_v6_9_strict_day_filter.py"
+    script = BASE_DIR / DAILY_SCRIPT_NAME
     if not script.exists():
         return _empty_response(
             status="script_missing",
-            message="fetch_day_lines_v6_9_strict_day_filter.py introuvable sur Railway.",
+            message=f"{DAILY_SCRIPT_NAME} introuvable sur Railway.",
             target_day=target_day,
         )
 
