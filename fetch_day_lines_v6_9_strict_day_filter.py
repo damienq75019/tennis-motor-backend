@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Tennis Motor - Fetch daily lines V6.15 ATP ARTICLE ORDER OF PLAY LOOSE OFFICIAL FIX
+Tennis Motor - Fetch daily lines V6.16 FORCE PLAYWRIGHT ATP SCORES
 
 But :
 - garder le moteur / veto existant de la V6.7 ;
@@ -39,7 +39,7 @@ BASE_MODULE_CANDIDATES = [
     "fetch_day_lines_v6_5_results_context_safe",
 ]
 
-MODE = "V6_15_ATP_ARTICLE_ORDER_OF_PLAY_LOOSE_OFFICIAL_FIX"
+MODE = "V6_16_FORCE_PLAYWRIGHT_ATP_SCORES"
 PAYLOAD_LATEST_PATH = Path("output") / "payload_latest.json"
 
 
@@ -569,11 +569,9 @@ def fetch_atp_daily_schedule_html(session, schedule_url: str) -> Tuple[str, List
     """
     Récupère le HTML ATP Daily Schedule.
 
-    Ordre volontaire :
-    1) HTTP direct avec gros User-Agent : la page ATP daily-schedule expose souvent
-       le programme dans le HTML déjà rendu. C'est plus stable sur Railway.
-    2) Playwright + scroll si disponible.
-    3) base.fetch_html en dernier secours.
+    V6.16 : Playwright est prioritaire.
+    Pourquoi : le HTML direct ATP contient souvent seulement le template Angular,
+    pas les vrais matchs affichés dans le navigateur.
     """
     audit: List[str] = []
     headers = {
@@ -593,60 +591,99 @@ def fetch_atp_daily_schedule_html(session, schedule_url: str) -> Tuple[str, List
     if "?" not in schedule_url:
         urls_to_try.append(schedule_url + "?matchType=Singles")
 
-    # 1) HTTP direct avec la session existante.
-    for url in urls_to_try:
-        try:
-            resp = session.get(url, headers=headers, timeout=45)
-            text = resp.text or ""
-            audit.append(f"daily_schedule_fetch=http_status:{getattr(resp, 'status_code', 'unknown')} len={len(text)} url={url}")
-            if resp.status_code == 200 and len(text) > 5000 and ("Vs" in text or "Defeats" in text or "daily-schedule" in text):
-                audit.append("daily_schedule_fetch=http_direct_ok")
-                return text, audit
-        except Exception as exc:
-            audit.append(f"daily_schedule_fetch=http_direct_failed:{type(exc).__name__}:{exc}")
-
-    # 2) Playwright + scroll, utile si ATP charge une partie du programme après rendu JS.
+    # 1) Playwright + scroll : c'est indispensable pour lire ce que ton Chrome affiche.
     try:
         from playwright.sync_api import sync_playwright  # type: ignore
 
         with sync_playwright() as p:
             browser = p.chromium.launch(
                 headless=True,
-                args=["--no-sandbox", "--disable-dev-shm-usage"],
+                args=[
+                    "--no-sandbox",
+                    "--disable-dev-shm-usage",
+                    "--disable-gpu",
+                    "--disable-blink-features=AutomationControlled",
+                ],
             )
-            page = browser.new_page(user_agent=headers["User-Agent"], viewport={"width": 1400, "height": 2400})
-            page.goto(schedule_url, wait_until="domcontentloaded", timeout=60000)
-            page.wait_for_timeout(2500)
+            page = browser.new_page(
+                user_agent=headers["User-Agent"],
+                viewport={"width": 1600, "height": 2600},
+                locale="en-US",
+            )
 
-            for selector in [
-                "#onetrust-accept-btn-handler",
-                "button:has-text('Accept')",
-                "button:has-text('I Accept')",
-                "button:has-text('Agree')",
-                "button:has-text('OK')",
-            ]:
+            final_html = ""
+            for url in urls_to_try:
                 try:
-                    page.locator(selector).first.click(timeout=1500)
-                    page.wait_for_timeout(500)
-                    break
-                except Exception:
-                    pass
+                    audit.append(f"daily_schedule_playwright_goto={url}")
+                    page.goto(url, wait_until="domcontentloaded", timeout=90000)
+                    page.wait_for_timeout(4000)
 
-            last_height = -1
-            for _ in range(18):
-                page.mouse.wheel(0, 2200)
-                page.wait_for_timeout(850)
-                height = page.evaluate("document.body.scrollHeight")
-                if height == last_height:
-                    break
-                last_height = height
+                    # Accepter cookies si le bandeau bloque.
+                    for selector in [
+                        "#onetrust-accept-btn-handler",
+                        "button:has-text('Accept')",
+                        "button:has-text('I Accept')",
+                        "button:has-text('Agree')",
+                        "button:has-text('OK')",
+                    ]:
+                        try:
+                            page.locator(selector).first.click(timeout=1200)
+                            page.wait_for_timeout(700)
+                            break
+                        except Exception:
+                            pass
 
-            html = page.content()
+                    # Scroller comme un vrai navigateur pour charger le bloc scores/schedule.
+                    for _ in range(22):
+                        page.mouse.wheel(0, 1800)
+                        page.wait_for_timeout(550)
+                    page.mouse.wheel(0, -999999)
+                    page.wait_for_timeout(1000)
+
+                    # Attendre des liens joueurs ATP si possible.
+                    try:
+                        page.wait_for_selector("a[href*='/en/players/'][href*='/overview']", timeout=10000)
+                    except Exception:
+                        pass
+
+                    # Snapshot debug intégré au HTML pour que BeautifulSoup voie le texte rendu.
+                    rendered_text = page.evaluate("() => document.body ? document.body.innerText : ''") or ""
+                    player_link_count = page.evaluate("() => document.querySelectorAll(\"a[href*='/en/players/'][href*='/overview']\").length")
+                    marker_count = len(re.findall(r"(?i)\b(vs|defeats|def\.?|retired|walkover)\b", rendered_text))
+                    html = page.content() or ""
+                    audit.append(f"daily_schedule_playwright_rendered len_html={len(html)} len_text={len(rendered_text)} player_links={player_link_count} markers={marker_count}")
+
+                    # On ajoute le innerText rendu dans une balise cachée pour le parser texte.
+                    final_html = html + "\n<pre id='__ATP_RENDERED_TEXT__'>\n" + rendered_text + "\n</pre>\n"
+
+                    if player_link_count >= 2 or marker_count >= 1 or len(rendered_text) > 1000:
+                        browser.close()
+                        audit.append("daily_schedule_fetch=playwright_priority_ok")
+                        return final_html, audit
+                except Exception as exc:
+                    audit.append(f"daily_schedule_playwright_url_failed:{type(exc).__name__}:{exc}")
+
             browser.close()
-            audit.append(f"daily_schedule_fetch=playwright_scroll_ok len={len(html)}")
-            return html, audit
+            if final_html:
+                audit.append("daily_schedule_fetch=playwright_priority_partial")
+                return final_html, audit
     except Exception as exc:
         audit.append(f"daily_schedule_fetch=playwright_failed:{type(exc).__name__}:{exc}")
+
+    # 2) HTTP direct : accepté UNIQUEMENT si le HTML contient déjà de vrais liens joueurs.
+    for url in urls_to_try:
+        try:
+            resp = session.get(url, headers=headers, timeout=45)
+            text = resp.text or ""
+            player_links = len(re.findall(r"/en/players/[^\"']+/overview", text, flags=re.I))
+            markers = len(re.findall(r"(?i)\b(vs|defeats|def\.?|retired|walkover)\b", text))
+            audit.append(f"daily_schedule_fetch=http_status:{getattr(resp, 'status_code', 'unknown')} len={len(text)} player_links={player_links} markers={markers} url={url}")
+            if resp.status_code == 200 and len(text) > 5000 and player_links >= 2 and markers >= 1:
+                audit.append("daily_schedule_fetch=http_direct_real_content_ok")
+                return text, audit
+            audit.append("daily_schedule_fetch=http_direct_rejected_template_or_empty")
+        except Exception as exc:
+            audit.append(f"daily_schedule_fetch=http_direct_failed:{type(exc).__name__}:{exc}")
 
     # 3) Secours léger : fonction existante.
     try:
@@ -656,7 +693,6 @@ def fetch_atp_daily_schedule_html(session, schedule_url: str) -> Tuple[str, List
     except Exception as exc:
         audit.append(f"daily_schedule_fetch=base_fetch_html_failed:{type(exc).__name__}:{exc}")
         return "", audit
-
 
 def extract_schedule_pair_from_line(
     line: str,
