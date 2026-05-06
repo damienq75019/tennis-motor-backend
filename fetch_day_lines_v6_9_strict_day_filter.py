@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Tennis Motor - Fetch daily lines V6.14 ATP ARTICLE ORDER OF PLAY PARSER FIX
+Tennis Motor - Fetch daily lines V6.15 ATP ARTICLE ORDER OF PLAY LOOSE OFFICIAL FIX
 
 But :
 - garder le moteur / veto existant de la V6.7 ;
@@ -39,7 +39,7 @@ BASE_MODULE_CANDIDATES = [
     "fetch_day_lines_v6_5_results_context_safe",
 ]
 
-MODE = "V6_14_ATP_ARTICLE_ORDER_OF_PLAY_PARSER_FIX"
+MODE = "V6_15_ATP_ARTICLE_ORDER_OF_PLAY_LOOSE_OFFICIAL_FIX"
 PAYLOAD_LATEST_PATH = Path("output") / "payload_latest.json"
 
 
@@ -247,19 +247,33 @@ def _resolve_to_known_atp_player(
     href: str = "",
 ) -> Optional[str]:
     """
-    Résout un libellé ATP court ou un href officiel vers un nom joueur ATP connu.
+    Résolution V6.15 : ne bloque plus une vraie paire ATP simplement parce que
+    le joueur n'est pas dans les 100 premiers du points_map.
 
-    Sécurité :
-    - utilise d'abord le nom exact/canonique ;
-    - puis les alias initiale + nom ;
-    - puis le slug du lien ATP officiel ;
-    - refuse si ça ne correspond pas à un joueur ATP du points_map.
+    Priorité :
+    1. nom exact présent dans le points_map ;
+    2. alias connu ;
+    3. slug ATP officiel ;
+    4. nom nettoyé issu de la ligne officielle ATP.
+
+    Sécurité : cette fonction est utilisée uniquement après détection d'une vraie
+    ligne ATP contenant explicitement "ATP - ... vs ..." ou une vraie ligne "Vs".
     """
     candidates: List[str] = []
 
-    cleaned = base.clean_candidate_name(raw or "")
-    cleaned = re.sub(r"\b(Q|WC|PR|LL|SE)\b", " ", cleaned, flags=re.I)
-    cleaned = base.normalize_space(cleaned.replace("(", " ").replace(")", " "))
+    def clean_player_label(x: str) -> str:
+        z = base.normalize_space(x or "")
+        z = re.sub(r"(?i)^\s*ATP\s*-\s*", "", z)
+        z = re.sub(r"(?i)\bWTA\s+Match\b.*$", "", z)
+        z = re.sub(r"\[[^\]]+\]", " ", z)          # [Q], [WC], [LL]
+        z = re.sub(r"\([^)]{2,4}\)", " ", z)        # (POL), (GER), etc.
+        z = re.sub(r"(?i)\b(Q|WC|PR|LL|SE)\b", " ", z)
+        z = re.sub(r"\b\d{1,2}\b", " ", z)          # seed éventuel
+        z = re.sub(r"[•|]+", " ", z)
+        z = base.normalize_space(z)
+        return base.clean_candidate_name(z)
+
+    cleaned = clean_player_label(raw)
     if cleaned:
         candidates.append(cleaned)
 
@@ -267,22 +281,22 @@ def _resolve_to_known_atp_player(
     if from_href:
         candidates.append(from_href)
 
+    # 1) Exact points_map.
     for cand in candidates:
         key = base.canonical_name(cand)
         if key in valid_player_keys and base.is_name_like(cand):
-            return cand
+            return base.title_name(cand)
 
+    # 2) Alias connu.
     for cand in candidates:
         norm = _no_punct(cand)
         if not norm:
             continue
-        # recherche alias complète d'abord
         for alias in sorted(alias_index.keys(), key=len, reverse=True):
             if re.search(rf"\b{re.escape(alias)}\b", norm):
                 return alias_index[alias][0]
 
-    # Dernier secours contrôlé : initiale + nom à partir du label ATP court.
-    # Exemple: "Y. Hanfmann" -> alias "y hanfmann".
+    # 3) Initiale + nom.
     for cand in candidates:
         parts = _no_punct(cand).split()
         if len(parts) >= 2 and len(parts[0]) == 1:
@@ -293,8 +307,19 @@ def _resolve_to_known_atp_player(
             if compact_last in alias_index:
                 return alias_index[compact_last][0]
 
-    return None
+    # 4) Dernier secours contrôlé : accepter le nom officiel nettoyé.
+    for cand in candidates:
+        if not cand:
+            continue
+        low = _norm_ascii(cand)
+        if "{{" in low or "}}" in low:
+            continue
+        if re.search(r"(?i)\b(wta|atp|match|court|stadium|not before|starts at|order of play)\b", cand):
+            continue
+        if base.is_name_like(cand) and len(_no_punct(cand).split()) >= 2:
+            return base.title_name(cand)
 
+    return None
 
 def find_player_in_fragment(
     fragment: str,
@@ -407,6 +432,50 @@ def extract_pair_from_atp_order_line(
     return (a, b)
 
 
+
+def extract_pairs_from_official_atp_order_lines(
+    lines: Sequence[str],
+    alias_index: Dict[str, List[str]],
+    valid_player_keys: Set[str],
+) -> Tuple[List[Tuple[str, str]], int]:
+    """
+    Parse direct des lignes officielles de l'article ATP :
+    ATP - Hubert Hurkacz (POL) vs Yannick Hanfmann (GER)
+    ATP - [WC] Matteo Arnaldi (ITA) vs Jaume Munar (ESP)
+
+    Aucun pairing par noms consécutifs.
+    """
+    pairs: List[Tuple[str, str]] = []
+    seen_lines = 0
+
+    for line in lines:
+        raw = base.normalize_space(line or "")
+        if not re.search(r"(?i)^\s*ATP\s*-", raw):
+            continue
+        seen_lines += 1
+        if "/" in raw:
+            continue
+        if not re.search(r"(?i)\bvs\b|\bv\.\b", raw):
+            continue
+
+        raw = re.sub(r"(?i)\s+WTA\s+Match\b.*$", "", raw)
+        raw = re.sub(r"(?i)\s+Not\s+Before\b.*$", "", raw)
+        parts = re.split(r"(?i)\b(?:vs|v\.)\b", raw, maxsplit=1)
+        if len(parts) != 2:
+            continue
+
+        left = _clean_atp_order_player_fragment(parts[0])
+        right = _clean_atp_order_player_fragment(parts[1])
+        a = _resolve_to_known_atp_player(left, alias_index, valid_player_keys)
+        b = _resolve_to_known_atp_player(right, alias_index, valid_player_keys)
+        if not a or not b:
+            continue
+        if base.canonical_name(a) == base.canonical_name(b):
+            continue
+        pairs.append((a, b))
+
+    return pairs, seen_lines
+
 def extract_pairs_from_lines(
     lines: Sequence[str],
     display_map: Dict[str, str],
@@ -423,7 +492,13 @@ def extract_pairs_from_lines(
     alias_index = build_name_alias_index(display_map, valid_player_keys)
     pairs: List[Tuple[str, str]] = []
 
-    # 0) Cas le plus fiable pour l'article ATP officiel "ORDER OF PLAY".
+    # 0) Cas le plus fiable : lignes officielles ATP "ATP - Joueur A vs Joueur B".
+    official_pairs, _official_lines_seen = extract_pairs_from_official_atp_order_lines(
+        lines, alias_index, valid_player_keys
+    )
+    pairs.extend(official_pairs)
+
+    # 0b) Compatibilité ancienne fonction.
     for ln in lines:
         pair = extract_pair_from_atp_order_line(ln, alias_index, valid_player_keys)
         if pair:
@@ -910,6 +985,13 @@ def parse_article_pairs_strict_day(
 
     sections, section_audit = split_target_sections(lines, target_day)
     audit.extend(section_audit)
+
+    alias_index_for_audit = build_name_alias_index(display_map, valid_player_keys)
+    _all_official_pairs_for_audit, official_order_lines_seen = extract_pairs_from_official_atp_order_lines(
+        lines, alias_index_for_audit, valid_player_keys
+    )
+    audit.append(f"official_atp_order_lines_seen={official_order_lines_seen}")
+    audit.append(f"official_atp_order_pairs_all_article={len(_all_official_pairs_for_audit)}")
 
     all_pairs: List[Tuple[str, str]] = []
     for section in sections:
