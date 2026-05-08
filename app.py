@@ -23,27 +23,10 @@ OUTPUT_DIR = BASE_DIR / "output"
 PAYLOAD_LATEST_PATH = OUTPUT_DIR / "payload_latest.json"
 DAILY_SCRIPT_NAME = "fetch_day_lines_v6_10k_daily_schedule_no_forced_veto.py"
 
-# Pages tournoi SportyTrader.
-# Important : on évite la page générale /atp-s/ car elle renvoie souvent 403 sur Railway.
-# Ces pages tournoi sont plus stables et contiennent directement les matchs + cotes.
-SPORTYTRADER_ATP_ODDS_URLS = [
-    # Rome / Internazionali BNL d'Italia
-    "https://www.sportytrader.com/en/odds/tennis/atp-s/rome-italy-347/",
-
-    # Masters 1000 / ATP principaux, pour les semaines suivantes
-    "https://www.sportytrader.com/en/odds/tennis/atp-s/madrid-spain-383/",
-    "https://www.sportytrader.com/en/odds/tennis/atp-s/monte-carlo-monaco-260/",
-    "https://www.sportytrader.com/en/odds/tennis/atp-s/roland-garros-354/",
-    "https://www.sportytrader.com/en/odds/tennis/atp-s/wimbledon-london-great-britain-356/",
-    "https://www.sportytrader.com/en/odds/tennis/atp-s/toronto-canada-360/",
-
-    # ATP 250 / 500 fréquents
-    "https://www.sportytrader.com/en/odds/tennis/atp-s/barcelona-spain-320/",
-    "https://www.sportytrader.com/en/odds/tennis/atp-s/munich-germany-321/",
-    "https://www.sportytrader.com/en/odds/tennis/atp-s/montpellier-france-523/",
-    "https://www.sportytrader.com/en/odds/tennis/atp-s/geneva-open-56537/",
-    "https://www.sportytrader.com/en/odds/tennis/atp-s/bastad-sweden-470/",
-]
+# Source cotes : Flashscore tennis.
+# On garde ATP pour les matchs + points + moteur.
+# Flashscore sert uniquement à ajouter les cotes 1 / 2 après calcul moteur.
+FLASHSCORE_TENNIS_URL = "https://www.flashscore.fr/tennis/"
 
 app = FastAPI(title="Tennis Motor Railway Backend")
 
@@ -533,7 +516,140 @@ def _find_odds_for_match(player_a: str, player_b: str, odds_rows: List[Dict[str,
     return {}
 
 
+def _last_name_key(name: str) -> str:
+    tokens = _name_tokens(name)
+    if not tokens:
+        return ""
+    return tokens[-1]
+
+
+def _player_search_keys(name: str) -> List[str]:
+    tokens = _name_tokens(name)
+    keys: List[str] = []
+
+    if not tokens:
+        return keys
+
+    full = " ".join(tokens)
+    keys.append(full)
+
+    if len(tokens) >= 2:
+        keys.append(" ".join(tokens[-2:]))
+
+    keys.append(tokens[-1])
+
+    # dédoublonnage, plus long d'abord
+    out: List[str] = []
+    for key in sorted(keys, key=len, reverse=True):
+        if key and key not in out:
+            out.append(key)
+
+    return out
+
+
+def _line_has_player(norm_line: str, player_name: str) -> bool:
+    for key in _player_search_keys(player_name):
+        if re.search(rf"\b{re.escape(key)}\b", norm_line):
+            return True
+    return False
+
+
+def _first_key_position(norm_line: str, player_name: str) -> int:
+    positions: List[int] = []
+    for key in _player_search_keys(player_name):
+        m = re.search(rf"\b{re.escape(key)}\b", norm_line)
+        if m:
+            positions.append(m.start())
+    return min(positions) if positions else 10**9
+
+
+def _extract_two_odds_from_lines(lines: List[str], start_index: int) -> List[str]:
+    odds: List[str] = []
+
+    # SportyTrader met généralement les cotes dans les lignes juste après le match.
+    for item in lines[start_index + 1: start_index + 22]:
+        value = item.strip().replace(",", ".")
+        if _looks_like_odd(value) and value not in {"1", "2"}:
+            odds.append(_extract_decimal(value))
+
+        if len(odds) >= 2:
+            return odds
+
+    # Fallback : si tout est sur une ligne.
+    nearby = " ".join(lines[start_index: start_index + 8])
+    nums = re.findall(r"\b\d{1,2}(?:[.,]\d{1,2})\b", nearby)
+    for num in nums:
+        if _looks_like_odd(num) and num.replace(",", ".") not in {"1", "2"}:
+            odds.append(_extract_decimal(num))
+        if len(odds) >= 2:
+            break
+
+    return odds[:2]
+
+
+def _find_odds_for_match_in_content(player_a: str, player_b: str, content: str) -> Dict[str, str]:
+    if not player_a or not player_b or not content:
+        return {}
+
+    lines = [re.sub(r"\s+", " ", x).strip() for x in content.splitlines() if re.sub(r"\s+", " ", x).strip()]
+    norm_lines = [_norm_name(x) for x in lines]
+
+    for i, norm_line in enumerate(norm_lines):
+        if not _line_has_player(norm_line, player_a):
+            continue
+        if not _line_has_player(norm_line, player_b):
+            continue
+
+        odds = _extract_two_odds_from_lines(lines, i)
+        if len(odds) < 2:
+            continue
+
+        pos_a = _first_key_position(norm_line, player_a)
+        pos_b = _first_key_position(norm_line, player_b)
+
+        if pos_a <= pos_b:
+            return {
+                "oddA": odds[0],
+                "oddB": odds[1],
+                "sourceLine": lines[i],
+                "orientation": "same",
+            }
+
+        return {
+            "oddA": odds[1],
+            "oddB": odds[0],
+            "sourceLine": lines[i],
+            "orientation": "reversed",
+        }
+
+    return {}
+
+
+def fetch_sportytrader_pages_texts() -> Tuple[List[Dict[str, str]], str]:
+    pages: List[Dict[str, str]] = []
+    audit: List[str] = []
+
+    for url in SPORTYTRADER_ATP_ODDS_URLS:
+        try:
+            content = _fetch_sportytrader_text(url)
+            pages.append({"url": url, "content": content})
+            audit.append(f"{url} content_len={len(content)}")
+        except Exception as exc:
+            audit.append(f"{url} error={type(exc).__name__}: {exc}")
+
+    return pages, " | ".join(audit)
+
+
 def enrich_result_with_sportytrader_odds(result: Dict[str, Any], target_day: str) -> Dict[str, Any]:
+    """
+    Ajoute les cotes SportyTrader après le calcul moteur.
+
+    Version propre :
+    - ATP reste source des matchs.
+    - On lit les pages tournoi SportyTrader.
+    - Pour chaque match ATP, on cherche directement sa ligne SportyTrader.
+    - On n'utilise jamais les cotes dans le moteur.
+    """
     if not isinstance(result, dict):
         return result
 
@@ -542,12 +658,13 @@ def enrich_result_with_sportytrader_odds(result: Dict[str, Any], target_day: str
         return result
 
     try:
-        odds_rows, odds_audit = fetch_sportytrader_atp_odds(target_day)
+        pages, odds_audit = fetch_sportytrader_pages_texts()
     except Exception as exc:
-        odds_rows = []
+        pages = []
         odds_audit = f"global_error={type(exc).__name__}: {exc}"
 
     matched_count = 0
+    found_lines: List[str] = []
 
     for match in matches:
         if not isinstance(match, dict):
@@ -556,7 +673,13 @@ def enrich_result_with_sportytrader_odds(result: Dict[str, Any], target_day: str
         player_a = str(match.get("playerA") or match.get("player_a") or "")
         player_b = str(match.get("playerB") or match.get("player_b") or "")
 
-        found = _find_odds_for_match(player_a, player_b, odds_rows)
+        found: Dict[str, str] = {}
+
+        for page in pages:
+            found = _find_odds_for_match_in_content(player_a, player_b, page.get("content", ""))
+            if found:
+                found["sourceUrl"] = page.get("url", "")
+                break
 
         if found:
             odd_a = found.get("oddA", "")
@@ -572,8 +695,13 @@ def enrich_result_with_sportytrader_odds(result: Dict[str, Any], target_day: str
             match["coteB"] = odd_b
             match["oddsSource"] = "SportyTrader"
             match["oddsStatus"] = "matched"
-            match["oddsSourceMatch"] = f'{found.get("sourcePlayerA", "")} - {found.get("sourcePlayerB", "")}'
+            match["oddsSourceMatch"] = found.get("sourceLine", "")
+            match["oddsSourceUrl"] = found.get("sourceUrl", "")
             matched_count += 1
+
+            if len(found_lines) < 8:
+                found_lines.append(f"{player_a} - {player_b} => {odd_a}/{odd_b} via {found.get('sourceLine', '')}")
+
         else:
             match.setdefault("oddA", "")
             match.setdefault("oddB", "")
@@ -587,10 +715,518 @@ def enrich_result_with_sportytrader_odds(result: Dict[str, Any], target_day: str
             match["oddsStatus"] = "not_found"
 
     result.setdefault("daily", {})
-    result["daily"]["oddsSource"] = "SportyTrader"
-    result["daily"]["oddsRowsFound"] = len(odds_rows)
+    result["daily"]["oddsSource"] = "Flashscore"
+    result["daily"]["oddsRowsFound"] = len(pages)
     result["daily"]["oddsMatched"] = matched_count
-    result["daily"]["oddsAudit"] = odds_audit[-1200:]
+    result["daily"]["oddsAudit"] = (odds_audit + " | matched_sample=" + " || ".join(found_lines))[-4000:]
+
+    return result
+
+
+
+def _flashscore_click_optional(page, labels: List[str], timeout_ms: int = 1500) -> bool:
+    for label in labels:
+        selectors = [
+            f"text={label}",
+            f"button:has-text('{label}')",
+            f"[role='button']:has-text('{label}')",
+        ]
+        for selector in selectors:
+            try:
+                page.locator(selector).first.click(timeout=timeout_ms)
+                return True
+            except Exception:
+                pass
+    return False
+
+
+def _parse_odd_text(value: str) -> str:
+    raw = (value or "").strip()
+    raw = raw.replace(",", ".")
+    raw = re.sub(r"[^0-9.]", "", raw)
+
+    if not raw:
+        return ""
+
+    try:
+        number = float(raw)
+    except Exception:
+        return ""
+
+    if number < 1.01 or number > 100.0:
+        return ""
+
+    return f"{number:.2f}".rstrip("0").rstrip(".")
+
+
+def _flashscore_extract_rows_js() -> str:
+    return r"""
+() => {
+    const clean = (s) => (s || '').replace(/\s+/g, ' ').trim();
+
+    const readText = (root, selectors) => {
+        for (const sel of selectors) {
+            const el = root.querySelector(sel);
+            if (el) {
+                const t = clean(el.textContent);
+                if (t) return t;
+            }
+        }
+        return '';
+    };
+
+    const readOdds = (root) => {
+        const odds = [];
+
+        const selectors = [
+            '[class*="event__odd"]',
+            '[class*="oddsValue"]',
+            '[class*="odds"]'
+        ];
+
+        const seen = new Set();
+
+        for (const sel of selectors) {
+            root.querySelectorAll(sel).forEach((el) => {
+                const txt = clean(el.textContent);
+                if (!txt || seen.has(txt)) return;
+                seen.add(txt);
+
+                // Cotes européennes uniquement : 1.40 / 2.36 / 10.5
+                if (/^\d{1,2}([.,]\d{1,2})?$/.test(txt)) {
+                    const val = parseFloat(txt.replace(',', '.'));
+                    if (val >= 1.01 && val <= 100) odds.push(txt);
+                }
+            });
+            if (odds.length >= 2) break;
+        }
+
+        return odds.slice(0, 2);
+    };
+
+    const rows = [];
+    const matchSelectors = [
+        '[class*="event__match"]',
+        '[id^="g_2_"]',
+        '[id^="g_1_"]'
+    ];
+
+    let nodes = [];
+    for (const sel of matchSelectors) {
+        nodes = Array.from(document.querySelectorAll(sel));
+        if (nodes.length) break;
+    }
+
+    for (const node of nodes) {
+        const playerA = readText(node, [
+            '[class*="event__participant--home"]',
+            '[class*="participant__participantNameWrapper"]:nth-of-type(1)',
+            '[class*="participantName"]:nth-of-type(1)'
+        ]);
+
+        const playerB = readText(node, [
+            '[class*="event__participant--away"]',
+            '[class*="participant__participantNameWrapper"]:nth-of-type(2)',
+            '[class*="participantName"]:nth-of-type(2)'
+        ]);
+
+        const time = readText(node, [
+            '[class*="event__time"]',
+            '[class*="event__stage"]'
+        ]);
+
+        const odds = readOdds(node);
+
+        if (playerA && playerB) {
+            rows.push({
+                playerA,
+                playerB,
+                oddA: odds[0] || '',
+                oddB: odds[1] || '',
+                time,
+                raw: clean(node.innerText || node.textContent || '')
+            });
+        }
+    }
+
+    return rows;
+}
+"""
+
+
+def _flashscore_extract_rows_from_text(content: str) -> List[Dict[str, str]]:
+    """
+    Fallback si les classes DOM changent.
+    Lit le texte visible de Flashscore en supposant des blocs :
+    heure / joueur A / joueur B / cote 1 / cote 2.
+    """
+    lines = [re.sub(r"\s+", " ", x).strip() for x in (content or "").splitlines()]
+    lines = [x for x in lines if x]
+
+    rows: List[Dict[str, str]] = []
+
+    for i, line in enumerate(lines):
+        # Matchs affichés dans Flashscore : une heure ou un statut puis 2 joueurs.
+        if not re.match(r"^(\d{1,2}:\d{2}|Annulé|Reporté|Terminé|Direct|Mi-temps|Après prolongation)$", line, re.I):
+            continue
+
+        if i + 2 >= len(lines):
+            continue
+
+        player_a = lines[i + 1]
+        player_b = lines[i + 2]
+
+        if not player_a or not player_b:
+            continue
+        if len(player_a) > 60 or len(player_b) > 60:
+            continue
+        if any(x in player_a.lower() for x in ["atp", "wta", "simples", "doubles", "classement"]):
+            continue
+        if any(x in player_b.lower() for x in ["atp", "wta", "simples", "doubles", "classement"]):
+            continue
+
+        odds: List[str] = []
+        for candidate in lines[i + 3:i + 12]:
+            parsed = _parse_odd_text(candidate)
+            if parsed and parsed not in {"1", "2"}:
+                odds.append(parsed)
+            if len(odds) >= 2:
+                break
+
+        rows.append({
+            "playerA": player_a,
+            "playerB": player_b,
+            "oddA": odds[0] if len(odds) > 0 else "",
+            "oddB": odds[1] if len(odds) > 1 else "",
+            "time": line,
+            "raw": " | ".join(lines[i:i + 10]),
+        })
+
+    return rows
+
+
+def _normalize_flashscore_initial_name(name: str) -> List[str]:
+    """
+    Flashscore affiche souvent :
+    - Cilic M. au lieu de Marin Cilic
+    - Mpetshi Perricard G. au lieu de Giovanni Mpetshi Perricard
+    """
+    return _name_tokens(name)
+
+
+def _same_player_flashscore(full_name: str, flash_name: str) -> bool:
+    if _same_player(full_name, flash_name):
+        return True
+
+    full = _name_tokens(full_name)
+    flash = _normalize_flashscore_initial_name(flash_name)
+
+    if not full or not flash:
+        return False
+
+    # Flashscore : "Cilic M." => ["cilic", "m"]
+    if len(flash) >= 2 and len(flash[-1]) == 1:
+        initial = flash[-1]
+        surname_parts = flash[:-1]
+
+        if full[0][0] == initial:
+            tail = full[-len(surname_parts):]
+            if tail == surname_parts:
+                return True
+
+        # sécurité : au moins le dernier nom + initiale
+        if full[0][0] == initial and full[-1] == surname_parts[-1]:
+            return True
+
+    # Flashscore peut parfois garder seulement le nom de famille.
+    if len(flash) == 1 and len(flash[0]) >= 4 and flash[0] == full[-1]:
+        return True
+
+    return False
+
+
+
+def _flashscore_count_match_nodes_js() -> str:
+    return r"""
+() => {
+    const selectors = [
+        '[class*="event__match"]',
+        '[id^="g_2_"]',
+        '[id^="g_1_"]'
+    ];
+
+    for (const sel of selectors) {
+        const nodes = document.querySelectorAll(sel);
+        if (nodes && nodes.length) return nodes.length;
+    }
+
+    return 0;
+}
+"""
+
+
+def _flashscore_scroll_until_stable(page, audit: List[str], max_rounds: int = 22) -> None:
+    """
+    Scroll réel de la page Flashscore.
+
+    Objectif :
+    - charger les matchs plus bas dans la page ;
+    - attendre le lazy-load ;
+    - arrêter seulement quand le nombre de lignes ne monte plus.
+    """
+    last_count = -1
+    stable_rounds = 0
+
+    for round_index in range(max_rounds):
+        try:
+            current_count = int(page.evaluate(_flashscore_count_match_nodes_js()))
+        except Exception:
+            current_count = -1
+
+        audit.append(f"scroll_round={round_index + 1} rows_before={current_count}")
+
+        try:
+            page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+        except Exception:
+            pass
+
+        try:
+            page.mouse.wheel(0, 1400)
+        except Exception:
+            pass
+
+        page.wait_for_timeout(900)
+
+        try:
+            new_count = int(page.evaluate(_flashscore_count_match_nodes_js()))
+        except Exception:
+            new_count = current_count
+
+        audit.append(f"scroll_round={round_index + 1} rows_after={new_count}")
+
+        if new_count <= last_count or new_count == current_count:
+            stable_rounds += 1
+        else:
+            stable_rounds = 0
+
+        last_count = max(last_count, new_count)
+
+        # 3 tours sans nouvelle ligne = page chargée.
+        if stable_rounds >= 3:
+            break
+
+    # Remonte légèrement en haut pour garder la page stable avant extraction finale.
+    try:
+        page.evaluate("window.scrollTo(0, 0)")
+        page.wait_for_timeout(500)
+    except Exception:
+        pass
+
+
+def fetch_flashscore_tennis_odds() -> Tuple[List[Dict[str, str]], str]:
+    audit: List[str] = []
+
+    try:
+        from playwright.sync_api import sync_playwright
+    except Exception as exc:
+        return [], f"playwright_import_error={type(exc).__name__}: {exc}"
+
+    rows: List[Dict[str, str]] = []
+
+    try:
+        with sync_playwright() as p:
+            browser = p.chromium.launch(
+                headless=True,
+                args=[
+                    "--no-sandbox",
+                    "--disable-dev-shm-usage",
+                    "--disable-blink-features=AutomationControlled",
+                ],
+            )
+
+            context = browser.new_context(
+                locale="fr-FR",
+                timezone_id="Europe/Paris",
+                viewport={"width": 1365, "height": 1800},
+                user_agent=(
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/124.0.0.0 Safari/537.36"
+                ),
+                extra_http_headers={
+                    "Accept-Language": "fr-FR,fr;q=0.9,en;q=0.8",
+                },
+            )
+
+            page = context.new_page()
+            page.goto(FLASHSCORE_TENNIS_URL, wait_until="domcontentloaded", timeout=45000)
+
+            _flashscore_click_optional(page, ["J'accepte", "Tout refuser", "Accepter", "OK"], timeout_ms=2500)
+
+            try:
+                page.wait_for_load_state("networkidle", timeout=15000)
+            except Exception:
+                pass
+
+            # Onglet COTES visible dans ta capture.
+            _flashscore_click_optional(page, ["COTES", "Cotes"], timeout_ms=2500)
+            page.wait_for_timeout(3000)
+
+            # Scroll pour charger toutes les lignes du jour.
+            _flashscore_scroll_until_stable(page, audit, max_rounds=22)
+
+            try:
+                rows = page.evaluate(_flashscore_extract_rows_js())
+                audit.append(f"dom_rows={len(rows)}")
+            except Exception as exc:
+                audit.append(f"dom_extract_error={type(exc).__name__}: {exc}")
+                rows = []
+
+            content = ""
+            if not rows:
+                try:
+                    content = page.locator("body").inner_text(timeout=15000)
+                    rows = _flashscore_extract_rows_from_text(content)
+                    audit.append(f"text_rows={len(rows)} content_len={len(content)}")
+                except Exception as exc:
+                    audit.append(f"text_extract_error={type(exc).__name__}: {exc}")
+
+            if rows:
+                sample = []
+                for row in rows[:10]:
+                    sample.append(f"{row.get('playerA')} - {row.get('playerB')} = {row.get('oddA')}/{row.get('oddB')}")
+                audit.append("sample=" + " || ".join(sample))
+
+            browser.close()
+
+    except Exception as exc:
+        audit.append(f"flashscore_error={type(exc).__name__}: {exc}")
+
+    # Nettoyage : garder seulement les lignes avec deux joueurs.
+    clean_rows: List[Dict[str, str]] = []
+    seen = set()
+
+    for row in rows:
+        a = str(row.get("playerA", "")).strip()
+        b = str(row.get("playerB", "")).strip()
+
+        if not a or not b:
+            continue
+        if "/" in a or "/" in b:
+            continue
+
+        key = (_norm_name(a), _norm_name(b))
+        if key in seen:
+            continue
+        seen.add(key)
+
+        clean_rows.append({
+            "playerA": a,
+            "playerB": b,
+            "oddA": _parse_odd_text(str(row.get("oddA", ""))),
+            "oddB": _parse_odd_text(str(row.get("oddB", ""))),
+            "time": str(row.get("time", "")),
+            "raw": str(row.get("raw", ""))[:300],
+        })
+
+    return clean_rows, " | ".join(audit)
+
+
+def _find_flashscore_odds_for_match(player_a: str, player_b: str, rows: List[Dict[str, str]]) -> Dict[str, str]:
+    for row in rows:
+        fs_a = row.get("playerA", "")
+        fs_b = row.get("playerB", "")
+
+        if _same_player_flashscore(player_a, fs_a) and _same_player_flashscore(player_b, fs_b):
+            return {
+                "oddA": row.get("oddA", ""),
+                "oddB": row.get("oddB", ""),
+                "sourcePlayerA": fs_a,
+                "sourcePlayerB": fs_b,
+                "orientation": "same",
+            }
+
+        if _same_player_flashscore(player_a, fs_b) and _same_player_flashscore(player_b, fs_a):
+            return {
+                "oddA": row.get("oddB", ""),
+                "oddB": row.get("oddA", ""),
+                "sourcePlayerA": fs_a,
+                "sourcePlayerB": fs_b,
+                "orientation": "reversed",
+            }
+
+    return {}
+
+
+def enrich_result_with_flashscore_odds(result: Dict[str, Any], target_day: str) -> Dict[str, Any]:
+    """
+    Ajoute les cotes Flashscore après le calcul moteur.
+    Le moteur reste inchangé et n'utilise jamais les cotes.
+    """
+    if not isinstance(result, dict):
+        return result
+
+    matches = result.get("matches")
+    if not isinstance(matches, list) or not matches:
+        return result
+
+    try:
+        flash_rows, flash_audit = fetch_flashscore_tennis_odds()
+    except Exception as exc:
+        flash_rows = []
+        flash_audit = f"global_error={type(exc).__name__}: {exc}"
+
+    matched_count = 0
+    matched_sample: List[str] = []
+
+    for match in matches:
+        if not isinstance(match, dict):
+            continue
+
+        player_a = str(match.get("playerA") or match.get("player_a") or "")
+        player_b = str(match.get("playerB") or match.get("player_b") or "")
+
+        found = _find_flashscore_odds_for_match(player_a, player_b, flash_rows)
+
+        if found:
+            odd_a = found.get("oddA", "")
+            odd_b = found.get("oddB", "")
+
+            match["oddA"] = odd_a
+            match["oddB"] = odd_b
+            match["playerAOdd"] = odd_a
+            match["playerBOdd"] = odd_b
+            match["player_a_odd"] = odd_a
+            match["player_b_odd"] = odd_b
+            match["coteA"] = odd_a
+            match["coteB"] = odd_b
+            match["oddsSource"] = "Flashscore"
+            match["oddsStatus"] = "matched"
+            match["oddsSourceMatch"] = f'{found.get("sourcePlayerA", "")} - {found.get("sourcePlayerB", "")}'
+            matched_count += 1
+
+            if len(matched_sample) < 8:
+                matched_sample.append(f"{player_a} - {player_b} => {odd_a}/{odd_b}")
+        else:
+            match.setdefault("oddA", "")
+            match.setdefault("oddB", "")
+            match.setdefault("playerAOdd", "")
+            match.setdefault("playerBOdd", "")
+            match.setdefault("player_a_odd", "")
+            match.setdefault("player_b_odd", "")
+            match.setdefault("coteA", "")
+            match.setdefault("coteB", "")
+            match["oddsSource"] = "Flashscore"
+            match["oddsStatus"] = "not_found"
+
+    result.setdefault("daily", {})
+    result["daily"]["oddsSource"] = "Flashscore"
+    result["daily"]["flashscoreRowsFound"] = len(flash_rows)
+    result["daily"]["flashscoreMatched"] = matched_count
+    result["daily"]["oddsRowsFound"] = len(flash_rows)
+    result["daily"]["oddsMatched"] = matched_count
+    result["daily"]["flashscoreAudit"] = (flash_audit + " | matched_sample=" + " || ".join(matched_sample))[-4000:]
+    result["daily"]["oddsAudit"] = result["daily"]["flashscoreAudit"]
 
     return result
 
@@ -721,10 +1357,10 @@ def run_daily_fetch_sync(target_day: str) -> Dict[str, Any]:
     # Ajout des cotes APRES le calcul moteur :
     # le moteur reste inchangé et n'utilise jamais les cotes.
     try:
-        result = enrich_result_with_sportytrader_odds(result, target_day)
+        result = enrich_result_with_flashscore_odds(result, target_day)
     except Exception:
         result.setdefault("daily", {})
-        result["daily"]["oddsSource"] = "SportyTrader"
+        result["daily"]["oddsSource"] = "Flashscore"
         result["daily"]["oddsStatus"] = "failed"
         result["daily"]["oddsAudit"] = traceback.format_exc()[-1200:]
 
@@ -769,7 +1405,7 @@ async def health() -> Dict[str, Any]:
             "service": "Tennis Motor Railway Backend",
             "engine": "loaded",
             "historyRowsLoaded": history_rows,
-            "oddsSource": "SportyTrader",
+            "oddsSource": "Flashscore",
         }
     except Exception as exc:
         return {
