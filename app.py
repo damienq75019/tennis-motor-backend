@@ -23,9 +23,26 @@ OUTPUT_DIR = BASE_DIR / "output"
 PAYLOAD_LATEST_PATH = OUTPUT_DIR / "payload_latest.json"
 DAILY_SCRIPT_NAME = "fetch_day_lines_v6_10k_daily_schedule_no_forced_veto.py"
 
+# Pages tournoi SportyTrader.
+# Important : on évite la page générale /atp-s/ car elle renvoie souvent 403 sur Railway.
+# Ces pages tournoi sont plus stables et contiennent directement les matchs + cotes.
 SPORTYTRADER_ATP_ODDS_URLS = [
-    "https://www.sportytrader.com/en/odds/tennis/atp-s/",
-    "https://www.sportytrader.com/en/odds/tennis/",
+    # Rome / Internazionali BNL d'Italia
+    "https://www.sportytrader.com/en/odds/tennis/atp-s/rome-italy-347/",
+
+    # Masters 1000 / ATP principaux, pour les semaines suivantes
+    "https://www.sportytrader.com/en/odds/tennis/atp-s/madrid-spain-383/",
+    "https://www.sportytrader.com/en/odds/tennis/atp-s/monte-carlo-monaco-260/",
+    "https://www.sportytrader.com/en/odds/tennis/atp-s/roland-garros-354/",
+    "https://www.sportytrader.com/en/odds/tennis/atp-s/wimbledon-london-great-britain-356/",
+    "https://www.sportytrader.com/en/odds/tennis/atp-s/toronto-canada-360/",
+
+    # ATP 250 / 500 fréquents
+    "https://www.sportytrader.com/en/odds/tennis/atp-s/barcelona-spain-320/",
+    "https://www.sportytrader.com/en/odds/tennis/atp-s/munich-germany-321/",
+    "https://www.sportytrader.com/en/odds/tennis/atp-s/montpellier-france-523/",
+    "https://www.sportytrader.com/en/odds/tennis/atp-s/geneva-open-56537/",
+    "https://www.sportytrader.com/en/odds/tennis/atp-s/bastad-sweden-470/",
 ]
 
 app = FastAPI(title="Tennis Motor Railway Backend")
@@ -205,8 +222,12 @@ def _extract_decimal(value: str) -> str:
 
 def _fetch_sportytrader_text(url: str) -> str:
     """
-    SportyTrader renvoie parfois 403 à requests sur Railway.
-    On tente d'abord requests, puis on bascule sur Playwright/Chromium.
+    Lit une page tournoi SportyTrader.
+
+    Stratégie propre :
+    - d'abord requests sur la page tournoi précise, souvent accessible ;
+    - si 403 ou contenu trop faible, fallback Playwright/Chromium ;
+    - scroll pour charger le lazy-load.
     """
     requests_error = ""
 
@@ -218,15 +239,16 @@ def _fetch_sportytrader_text(url: str) -> str:
             "User-Agent": (
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                 "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/124.0 Safari/537.36"
+                "Chrome/124.0.0.0 Safari/537.36"
             ),
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
             "Accept-Language": "en-US,en;q=0.9,fr;q=0.8",
             "Cache-Control": "no-cache",
             "Pragma": "no-cache",
+            "Referer": "https://www.sportytrader.com/en/odds/tennis/",
         }
 
-        response = requests.get(url, headers=headers, timeout=18)
+        response = requests.get(url, headers=headers, timeout=20)
         response.raise_for_status()
 
         soup = BeautifulSoup(response.text, "html.parser")
@@ -237,8 +259,11 @@ def _fetch_sportytrader_text(url: str) -> str:
         content = re.sub(r"\r", "\n", content)
         content = re.sub(r"\n{2,}", "\n", content)
 
+        # Une page tournoi lisible contient normalement "Upcoming" ou des lignes "1 1.45 2 2.83".
         if content and len(content) > 500:
             return content
+
+        requests_error = "contenu requests trop faible"
 
     except Exception as exc:
         requests_error = f"{type(exc).__name__}: {exc}"
@@ -267,6 +292,7 @@ def _fetch_sportytrader_text(url: str) -> str:
                 ),
                 extra_http_headers={
                     "Accept-Language": "en-US,en;q=0.9,fr;q=0.8",
+                    "Referer": "https://www.sportytrader.com/en/odds/tennis/",
                 },
             )
 
@@ -292,9 +318,9 @@ def _fetch_sportytrader_text(url: str) -> str:
             except Exception:
                 pass
 
-            for _ in range(8):
+            for _ in range(10):
                 page.mouse.wheel(0, 900)
-                page.wait_for_timeout(700)
+                page.wait_for_timeout(600)
 
             content = page.locator("body").inner_text(timeout=15000)
             browser.close()
@@ -313,49 +339,101 @@ def _fetch_sportytrader_text(url: str) -> str:
         )
 
 
-def _parse_sportytrader_odds_from_text(content: str, target_day: str) -> List[Dict[str, str]]:
-    date_tokens = _target_sporty_date_tokens(target_day)
-    if not content or not date_tokens:
-        return []
+def _looks_like_odd(value: str) -> bool:
+    raw = (value or "").strip().replace(",", ".")
+    if not re.fullmatch(r"\d{1,2}(?:\.\d{1,2})?", raw):
+        return False
+    try:
+        number = float(raw)
+    except Exception:
+        return False
+    return 1.01 <= number <= 25.0
 
-    one_line = re.sub(r"\s+", " ", content)
 
-    date_part = r"(?:" + "|".join(re.escape(x) for x in date_tokens) + r")"
-    time_part = r"\s*-\s*\d{1,2}:\d{2}"
-
-    pattern = re.compile(
-        date_part
-        + time_part
-        + r"\s+"
-        + r"(?P<a>[A-ZÀ-ÖØ-Þ][A-Za-zÀ-ÖØ-öø-ÿ' .\-]+?)"
-        + r"\s+-\s+"
-        + r"(?P<b>[A-ZÀ-ÖØ-Þ][A-Za-zÀ-ÖØ-öø-ÿ' .\-]+?)"
-        + r"\s+1\s+(?P<odd1>\d+(?:[.,]\d+)?)\s+2\s+(?P<odd2>\d+(?:[.,]\d+)?)",
+def _parse_match_line(line: str) -> Tuple[str, str]:
+    clean = re.sub(r"\s+", " ", line or "").strip()
+    clean = re.sub(
+        r"^\d{1,2}\s+[A-Za-zÀ-ÖØ-öø-ÿ]{3,9}\s*-\s*\d{1,2}:\d{2}\s+",
+        "",
+        clean,
         flags=re.IGNORECASE,
     )
 
+    if " - " in clean:
+        left, right = clean.split(" - ", 1)
+        left = re.sub(r"^\d+\s+", "", left).strip()
+        right = re.sub(r"\s+\d+$", "", right).strip()
+        if left and right and "/" not in left and "/" not in right:
+            return left, right
+
+    return "", ""
+
+
+def _parse_sportytrader_odds_from_text(content: str, target_day: str) -> List[Dict[str, str]]:
+    date_tokens = _target_sporty_date_tokens(target_day)
+    if not content:
+        return []
+
     rows: List[Dict[str, str]] = []
+    seen = set()
+
+    lines = [re.sub(r"\s+", " ", x).strip() for x in content.splitlines() if re.sub(r"\s+", " ", x).strip()]
+
+    for i, line in enumerate(lines):
+        player_a, player_b = _parse_match_line(line)
+        if not player_a or not player_b:
+            continue
+
+        nearby = lines[i + 1: i + 20]
+        odds = []
+
+        for item in nearby:
+            value = item.strip().replace(",", ".")
+            if _looks_like_odd(value) and value not in {"1", "2"}:
+                odds.append(_extract_decimal(value))
+            if len(odds) >= 2:
+                break
+
+        if len(odds) >= 2:
+            key = (_norm_name(player_a), _norm_name(player_b))
+            if key not in seen:
+                seen.add(key)
+                rows.append({"playerA": player_a, "playerB": player_b, "oddA": odds[0], "oddB": odds[1]})
+
+    if rows:
+        return rows
+
+    one_line = re.sub(r"\s+", " ", content)
+    pattern = re.compile(
+        r"(?:\d{1,2}\s+[A-Za-zÀ-ÖØ-öø-ÿ]{3,9}\s*-\s*\d{1,2}:\d{2}\s+)?"
+        r"(?P<a>[A-ZÀ-ÖØ-Þ][A-Za-zÀ-ÖØ-öø-ÿ' .\-]{2,60}?)"
+        r"\s+-\s+"
+        r"(?P<b>[A-ZÀ-ÖØ-Þ][A-Za-zÀ-ÖØ-öø-ÿ' .\-]{2,60}?)"
+        r"(?P<trail>.{0,280})",
+        flags=re.IGNORECASE,
+    )
 
     for m in pattern.finditer(one_line):
         player_a = re.sub(r"\s+", " ", m.group("a")).strip()
         player_b = re.sub(r"\s+", " ", m.group("b")).strip()
-        odd_a = _extract_decimal(m.group("odd1"))
-        odd_b = _extract_decimal(m.group("odd2"))
-
-        if not player_a or not player_b or not odd_a or not odd_b:
-            continue
+        trail = m.group("trail")
 
         if "/" in player_a or "/" in player_b:
             continue
 
-        rows.append(
-            {
-                "playerA": player_a,
-                "playerB": player_b,
-                "oddA": odd_a,
-                "oddB": odd_b,
-            }
-        )
+        nums = re.findall(r"\b\d{1,2}(?:[.,]\d{1,2})\b", trail)
+        odds = []
+        for num in nums:
+            if _looks_like_odd(num):
+                odds.append(_extract_decimal(num))
+            if len(odds) >= 2:
+                break
+
+        if len(odds) >= 2:
+            key = (_norm_name(player_a), _norm_name(player_b))
+            if key not in seen:
+                seen.add(key)
+                rows.append({"playerA": player_a, "playerB": player_b, "oddA": odds[0], "oddB": odds[1]})
 
     return rows
 
@@ -369,7 +447,26 @@ def fetch_sportytrader_atp_odds(target_day: str) -> Tuple[List[Dict[str, str]], 
         try:
             content = _fetch_sportytrader_text(url)
             rows = _parse_sportytrader_odds_from_text(content, target_day)
-            audit.append(f"{url} rows={len(rows)}")
+            audit.append(f"{url} rows={len(rows)} content_len={len(content)}")
+
+            if rows:
+                sample_rows = []
+                for row in rows[:6]:
+                    sample_rows.append(f"{row.get('playerA')} - {row.get('playerB')} = {row.get('oddA')}/{row.get('oddB')}")
+                audit.append("parsed_sample=" + " || ".join(sample_rows))
+
+            if not rows:
+                sample_lines = []
+                for line in content.splitlines():
+                    compact = re.sub(r"\s+", " ", line).strip()
+                    if not compact:
+                        continue
+                    if len(compact) > 120:
+                        compact = compact[:120]
+                    sample_lines.append(compact)
+                    if len(sample_lines) >= 20:
+                        break
+                audit.append("sample=" + " || ".join(sample_lines))
 
             for row in rows:
                 key = (_norm_name(row["playerA"]), _norm_name(row["playerB"]))
@@ -378,6 +475,8 @@ def fetch_sportytrader_atp_odds(target_day: str) -> Tuple[List[Dict[str, str]], 
                 seen.add(key)
                 all_rows.append(row)
 
+            # Optimisation : la première page tournoi active qui trouve des cotes suffit souvent.
+            # Mais on continue quand même pour couvrir multi-tournois.
         except Exception as exc:
             audit.append(f"{url} error={type(exc).__name__}: {exc}")
 
