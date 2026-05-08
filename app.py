@@ -164,6 +164,16 @@ def _name_tokens(value: str) -> List[str]:
 
 
 def _same_player(a: str, b: str) -> bool:
+    """
+    Comparaison joueurs robuste pour SportyTrader.
+
+    SportyTrader affiche parfois seulement le nom de famille :
+    - "Hanfmann" au lieu de "Yannick Hanfmann"
+    - "Darderi" au lieu de "Luciano Darderi"
+
+    Le moteur ne l'utilise pas. Cette fonction sert seulement à accrocher la cote
+    au bon match pour l'affichage Unity.
+    """
     na = _norm_name(a)
     nb = _norm_name(b)
 
@@ -184,6 +194,20 @@ def _same_player(a: str, b: str) -> bool:
 
     last_a = ta[-1]
     last_b = tb[-1]
+
+    # Cas SportyTrader fréquent : un côté = nom de famille uniquement.
+    if len(ta) == 1 and len(ta[0]) >= 4 and ta[0] == last_b:
+        return True
+
+    if len(tb) == 1 and len(tb[0]) >= 4 and tb[0] == last_a:
+        return True
+
+    # Cas nom composé partiel : "Mpetshi Perricard" / "Giovanni Mpetshi Perricard".
+    if len(ta) >= 2 and len(tb) >= 2:
+        tail_a = " ".join(ta[-2:])
+        tail_b = " ".join(tb[-2:])
+        if tail_a == tail_b:
+            return True
 
     if last_a == last_b:
         first_a = ta[0][0]
