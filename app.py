@@ -1132,11 +1132,61 @@ def fetch_flashscore_tennis_odds() -> Tuple[List[Dict[str, str]], str]:
     return clean_rows, " | ".join(audit)
 
 
+def _flashscore_match_keys(name: str) -> List[str]:
+    """
+    Clés très tolérantes pour matcher ATP ↔ Flashscore.
+    Exemples :
+    - Yannick Hanfmann -> ["yannick hanfmann", "hanfmann"]
+    - Alex de Minaur -> ["alex de minaur", "de minaur", "minaur"]
+    - Giovanni Mpetshi Perricard -> ["giovanni mpetshi perricard", "mpetshi perricard", "perricard"]
+    """
+    tokens = _name_tokens(name)
+    if not tokens:
+        return []
+
+    keys: List[str] = []
+    keys.append(" ".join(tokens))
+
+    if len(tokens) >= 2:
+        keys.append(" ".join(tokens[-2:]))
+
+    keys.append(tokens[-1])
+
+    out: List[str] = []
+    for key in sorted(keys, key=len, reverse=True):
+        if key and len(key) >= 3 and key not in out:
+            out.append(key)
+
+    return out
+
+
+def _contains_match_key(text: str, player_name: str) -> bool:
+    norm = _norm_name(text)
+    for key in _flashscore_match_keys(player_name):
+        if re.search(rf"\b{re.escape(key)}\b", norm):
+            return True
+    return False
+
+
+def _key_position(text: str, player_name: str) -> int:
+    norm = _norm_name(text)
+    positions: List[int] = []
+
+    for key in _flashscore_match_keys(player_name):
+        m = re.search(rf"\b{re.escape(key)}\b", norm)
+        if m:
+            positions.append(m.start())
+
+    return min(positions) if positions else 10**9
+
+
 def _find_flashscore_odds_for_match(player_a: str, player_b: str, rows: List[Dict[str, str]]) -> Dict[str, str]:
     for row in rows:
         fs_a = row.get("playerA", "")
         fs_b = row.get("playerB", "")
+        raw = row.get("raw", "") or f"{fs_a} - {fs_b}"
 
+        # Méthode normale.
         if _same_player_flashscore(player_a, fs_a) and _same_player_flashscore(player_b, fs_b):
             return {
                 "oddA": row.get("oddA", ""),
@@ -1153,6 +1203,53 @@ def _find_flashscore_odds_for_match(player_a: str, player_b: str, rows: List[Dic
                 "sourcePlayerA": fs_a,
                 "sourcePlayerB": fs_b,
                 "orientation": "reversed",
+            }
+
+        # Fallback très tolérant : Flashscore peut afficher nom + initiale ou juste nom de famille.
+        a_in_fs_a = _contains_match_key(fs_a, player_a)
+        b_in_fs_b = _contains_match_key(fs_b, player_b)
+
+        if a_in_fs_a and b_in_fs_b:
+            return {
+                "oddA": row.get("oddA", ""),
+                "oddB": row.get("oddB", ""),
+                "sourcePlayerA": fs_a,
+                "sourcePlayerB": fs_b,
+                "orientation": "same_fallback",
+            }
+
+        a_in_fs_b = _contains_match_key(fs_b, player_a)
+        b_in_fs_a = _contains_match_key(fs_a, player_b)
+
+        if a_in_fs_b and b_in_fs_a:
+            return {
+                "oddA": row.get("oddB", ""),
+                "oddB": row.get("oddA", ""),
+                "sourcePlayerA": fs_a,
+                "sourcePlayerB": fs_b,
+                "orientation": "reversed_fallback",
+            }
+
+        # Dernier fallback : chercher les deux joueurs dans la ligne brute.
+        if _contains_match_key(raw, player_a) and _contains_match_key(raw, player_b):
+            pos_a = _key_position(raw, player_a)
+            pos_b = _key_position(raw, player_b)
+
+            if pos_a <= pos_b:
+                return {
+                    "oddA": row.get("oddA", ""),
+                    "oddB": row.get("oddB", ""),
+                    "sourcePlayerA": fs_a,
+                    "sourcePlayerB": fs_b,
+                    "orientation": "raw_same",
+                }
+
+            return {
+                "oddA": row.get("oddB", ""),
+                "oddB": row.get("oddA", ""),
+                "sourcePlayerA": fs_a,
+                "sourcePlayerB": fs_b,
+                "orientation": "raw_reversed",
             }
 
     return {}
@@ -1206,7 +1303,7 @@ def enrich_result_with_flashscore_odds(result: Dict[str, Any], target_day: str) 
             matched_count += 1
 
             if len(matched_sample) < 8:
-                matched_sample.append(f"{player_a} - {player_b} => {odd_a}/{odd_b}")
+                matched_sample.append(f"{player_a} - {player_b} => {odd_a}/{odd_b} via {found.get('sourcePlayerA', '')} - {found.get('sourcePlayerB', '')} [{found.get('orientation', '')}]")
         else:
             match.setdefault("oddA", "")
             match.setdefault("oddB", "")
