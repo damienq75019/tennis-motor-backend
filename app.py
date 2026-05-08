@@ -6,6 +6,7 @@ import os
 import subprocess
 import sys
 import traceback
+import unicodedata
 from datetime import date, timedelta
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
@@ -20,6 +21,11 @@ BASE_DIR = Path(__file__).resolve().parent
 OUTPUT_DIR = BASE_DIR / "output"
 PAYLOAD_LATEST_PATH = OUTPUT_DIR / "payload_latest.json"
 DAILY_SCRIPT_NAME = "fetch_day_lines_v6_10k_daily_schedule_no_forced_veto.py"
+
+SPORTYTRADER_ATP_ODDS_URLS = [
+    "https://www.sportytrader.com/en/odds/tennis/atp-s/",
+    "https://www.sportytrader.com/en/odds/tennis/",
+]
 
 app = FastAPI(title="Tennis Motor Railway Backend")
 
@@ -119,6 +125,269 @@ def _empty_response(
         },
         "error": message,
     }
+
+
+
+def _norm_name(value: str) -> str:
+    value = value or ""
+    value = unicodedata.normalize("NFKD", value)
+    value = "".join(ch for ch in value if not unicodedata.combining(ch))
+    value = value.lower()
+    value = re.sub(r"\[[^\]]+\]", " ", value)
+    value = re.sub(r"\([^)]*\)", " ", value)
+    value = re.sub(r"[^a-z0-9]+", " ", value)
+    value = re.sub(r"\b(?:wc|q|ll|pr|alt|seed)\b", " ", value)
+    value = re.sub(r"\s+", " ", value).strip()
+    return value
+
+
+def _name_tokens(value: str) -> List[str]:
+    return [x for x in _norm_name(value).split() if len(x) >= 2]
+
+
+def _same_player(a: str, b: str) -> bool:
+    na = _norm_name(a)
+    nb = _norm_name(b)
+
+    if not na or not nb:
+        return False
+
+    if na == nb:
+        return True
+
+    ta = _name_tokens(a)
+    tb = _name_tokens(b)
+
+    if not ta or not tb:
+        return False
+
+    if set(ta) == set(tb):
+        return True
+
+    last_a = ta[-1]
+    last_b = tb[-1]
+
+    if last_a == last_b:
+        first_a = ta[0][0]
+        first_b = tb[0][0]
+        return first_a == first_b or ta[0] in tb or tb[0] in ta
+
+    return False
+
+
+def _target_sporty_date_tokens(target_day: str) -> List[str]:
+    try:
+        d = date.fromisoformat(target_day)
+    except Exception:
+        return []
+
+    month_short = d.strftime("%b")
+    month_long = d.strftime("%B")
+    day2 = f"{d.day:02d}"
+    day1 = str(d.day)
+
+    return [
+        f"{day2} {month_short}",
+        f"{day1} {month_short}",
+        f"{day2} {month_long}",
+        f"{day1} {month_long}",
+    ]
+
+
+def _extract_decimal(value: str) -> str:
+    value = (value or "").strip().replace(",", ".")
+    m = re.search(r"\d+(?:\.\d+)?", value)
+    if not m:
+        return ""
+    return m.group(0)
+
+
+def _fetch_sportytrader_text(url: str) -> str:
+    import requests
+    from bs4 import BeautifulSoup
+
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/124.0 Safari/537.36"
+        ),
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9,fr;q=0.8",
+        "Cache-Control": "no-cache",
+        "Pragma": "no-cache",
+    }
+
+    response = requests.get(url, headers=headers, timeout=18)
+    response.raise_for_status()
+
+    soup = BeautifulSoup(response.text, "html.parser")
+    for tag in soup(["script", "style", "noscript"]):
+        tag.decompose()
+
+    content = soup.get_text("\n", strip=True)
+    content = re.sub(r"\r", "\n", content)
+    content = re.sub(r"\n{2,}", "\n", content)
+    return content
+
+
+def _parse_sportytrader_odds_from_text(content: str, target_day: str) -> List[Dict[str, str]]:
+    date_tokens = _target_sporty_date_tokens(target_day)
+    if not content or not date_tokens:
+        return []
+
+    one_line = re.sub(r"\s+", " ", content)
+
+    date_part = r"(?:" + "|".join(re.escape(x) for x in date_tokens) + r")"
+    time_part = r"\s*-\s*\d{1,2}:\d{2}"
+
+    pattern = re.compile(
+        date_part
+        + time_part
+        + r"\s+"
+        + r"(?P<a>[A-ZÀ-ÖØ-Þ][A-Za-zÀ-ÖØ-öø-ÿ' .\-]+?)"
+        + r"\s+-\s+"
+        + r"(?P<b>[A-ZÀ-ÖØ-Þ][A-Za-zÀ-ÖØ-öø-ÿ' .\-]+?)"
+        + r"\s+1\s+(?P<odd1>\d+(?:[.,]\d+)?)\s+2\s+(?P<odd2>\d+(?:[.,]\d+)?)",
+        flags=re.IGNORECASE,
+    )
+
+    rows: List[Dict[str, str]] = []
+
+    for m in pattern.finditer(one_line):
+        player_a = re.sub(r"\s+", " ", m.group("a")).strip()
+        player_b = re.sub(r"\s+", " ", m.group("b")).strip()
+        odd_a = _extract_decimal(m.group("odd1"))
+        odd_b = _extract_decimal(m.group("odd2"))
+
+        if not player_a or not player_b or not odd_a or not odd_b:
+            continue
+
+        if "/" in player_a or "/" in player_b:
+            continue
+
+        rows.append(
+            {
+                "playerA": player_a,
+                "playerB": player_b,
+                "oddA": odd_a,
+                "oddB": odd_b,
+            }
+        )
+
+    return rows
+
+
+def fetch_sportytrader_atp_odds(target_day: str) -> Tuple[List[Dict[str, str]], str]:
+    audit: List[str] = []
+    all_rows: List[Dict[str, str]] = []
+    seen = set()
+
+    for url in SPORTYTRADER_ATP_ODDS_URLS:
+        try:
+            content = _fetch_sportytrader_text(url)
+            rows = _parse_sportytrader_odds_from_text(content, target_day)
+            audit.append(f"{url} rows={len(rows)}")
+
+            for row in rows:
+                key = (_norm_name(row["playerA"]), _norm_name(row["playerB"]))
+                if key in seen:
+                    continue
+                seen.add(key)
+                all_rows.append(row)
+
+        except Exception as exc:
+            audit.append(f"{url} error={type(exc).__name__}: {exc}")
+
+    return all_rows, " | ".join(audit)
+
+
+def _find_odds_for_match(player_a: str, player_b: str, odds_rows: List[Dict[str, str]]) -> Dict[str, str]:
+    for row in odds_rows:
+        st_a = row.get("playerA", "")
+        st_b = row.get("playerB", "")
+
+        if _same_player(player_a, st_a) and _same_player(player_b, st_b):
+            return {
+                "oddA": row.get("oddA", ""),
+                "oddB": row.get("oddB", ""),
+                "sourcePlayerA": st_a,
+                "sourcePlayerB": st_b,
+                "orientation": "same",
+            }
+
+        if _same_player(player_a, st_b) and _same_player(player_b, st_a):
+            return {
+                "oddA": row.get("oddB", ""),
+                "oddB": row.get("oddA", ""),
+                "sourcePlayerA": st_a,
+                "sourcePlayerB": st_b,
+                "orientation": "reversed",
+            }
+
+    return {}
+
+
+def enrich_result_with_sportytrader_odds(result: Dict[str, Any], target_day: str) -> Dict[str, Any]:
+    if not isinstance(result, dict):
+        return result
+
+    matches = result.get("matches")
+    if not isinstance(matches, list) or not matches:
+        return result
+
+    try:
+        odds_rows, odds_audit = fetch_sportytrader_atp_odds(target_day)
+    except Exception as exc:
+        odds_rows = []
+        odds_audit = f"global_error={type(exc).__name__}: {exc}"
+
+    matched_count = 0
+
+    for match in matches:
+        if not isinstance(match, dict):
+            continue
+
+        player_a = str(match.get("playerA") or match.get("player_a") or "")
+        player_b = str(match.get("playerB") or match.get("player_b") or "")
+
+        found = _find_odds_for_match(player_a, player_b, odds_rows)
+
+        if found:
+            odd_a = found.get("oddA", "")
+            odd_b = found.get("oddB", "")
+
+            match["oddA"] = odd_a
+            match["oddB"] = odd_b
+            match["playerAOdd"] = odd_a
+            match["playerBOdd"] = odd_b
+            match["player_a_odd"] = odd_a
+            match["player_b_odd"] = odd_b
+            match["coteA"] = odd_a
+            match["coteB"] = odd_b
+            match["oddsSource"] = "SportyTrader"
+            match["oddsStatus"] = "matched"
+            match["oddsSourceMatch"] = f'{found.get("sourcePlayerA", "")} - {found.get("sourcePlayerB", "")}'
+            matched_count += 1
+        else:
+            match.setdefault("oddA", "")
+            match.setdefault("oddB", "")
+            match.setdefault("playerAOdd", "")
+            match.setdefault("playerBOdd", "")
+            match.setdefault("player_a_odd", "")
+            match.setdefault("player_b_odd", "")
+            match.setdefault("coteA", "")
+            match.setdefault("coteB", "")
+            match["oddsSource"] = "SportyTrader"
+            match["oddsStatus"] = "not_found"
+
+    result.setdefault("daily", {})
+    result["daily"]["oddsSource"] = "SportyTrader"
+    result["daily"]["oddsRowsFound"] = len(odds_rows)
+    result["daily"]["oddsMatched"] = matched_count
+    result["daily"]["oddsAudit"] = odds_audit[-1200:]
+
+    return result
 
 
 def calculate_from_matches(matches: List[Dict[str, Any]]) -> Dict[str, Any]:
@@ -244,6 +513,16 @@ def run_daily_fetch_sync(target_day: str) -> Dict[str, Any]:
 
     result = calculate_from_matches(matches)
 
+    # Ajout des cotes APRES le calcul moteur :
+    # le moteur reste inchangé et n'utilise jamais les cotes.
+    try:
+        result = enrich_result_with_sportytrader_odds(result, target_day)
+    except Exception:
+        result.setdefault("daily", {})
+        result["daily"]["oddsSource"] = "SportyTrader"
+        result["daily"]["oddsStatus"] = "failed"
+        result["daily"]["oddsAudit"] = traceback.format_exc()[-1200:]
+
     result.setdefault("daily", {})
     result["daily"].update(
         {
@@ -285,6 +564,7 @@ async def health() -> Dict[str, Any]:
             "service": "Tennis Motor Railway Backend",
             "engine": "loaded",
             "historyRowsLoaded": history_rows,
+            "oddsSource": "SportyTrader",
         }
     except Exception as exc:
         return {
