@@ -203,32 +203,113 @@ def _extract_decimal(value: str) -> str:
 
 
 def _fetch_sportytrader_text(url: str) -> str:
-    import requests
-    from bs4 import BeautifulSoup
+    """
+    SportyTrader renvoie parfois 403 à requests sur Railway.
+    On tente d'abord requests, puis on bascule sur Playwright/Chromium.
+    """
+    requests_error = ""
 
-    headers = {
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/124.0 Safari/537.36"
-        ),
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Accept-Language": "en-US,en;q=0.9,fr;q=0.8",
-        "Cache-Control": "no-cache",
-        "Pragma": "no-cache",
-    }
+    try:
+        import requests
+        from bs4 import BeautifulSoup
 
-    response = requests.get(url, headers=headers, timeout=18)
-    response.raise_for_status()
+        headers = {
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/124.0 Safari/537.36"
+            ),
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.9,fr;q=0.8",
+            "Cache-Control": "no-cache",
+            "Pragma": "no-cache",
+        }
 
-    soup = BeautifulSoup(response.text, "html.parser")
-    for tag in soup(["script", "style", "noscript"]):
-        tag.decompose()
+        response = requests.get(url, headers=headers, timeout=18)
+        response.raise_for_status()
 
-    content = soup.get_text("\n", strip=True)
-    content = re.sub(r"\r", "\n", content)
-    content = re.sub(r"\n{2,}", "\n", content)
-    return content
+        soup = BeautifulSoup(response.text, "html.parser")
+        for tag in soup(["script", "style", "noscript"]):
+            tag.decompose()
+
+        content = soup.get_text("\n", strip=True)
+        content = re.sub(r"\r", "\n", content)
+        content = re.sub(r"\n{2,}", "\n", content)
+
+        if content and len(content) > 500:
+            return content
+
+    except Exception as exc:
+        requests_error = f"{type(exc).__name__}: {exc}"
+
+    try:
+        from playwright.sync_api import sync_playwright
+
+        with sync_playwright() as p:
+            browser = p.chromium.launch(
+                headless=True,
+                args=[
+                    "--no-sandbox",
+                    "--disable-dev-shm-usage",
+                    "--disable-blink-features=AutomationControlled",
+                ],
+            )
+
+            context = browser.new_context(
+                locale="en-US",
+                timezone_id="Europe/Paris",
+                viewport={"width": 1365, "height": 1800},
+                user_agent=(
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/124.0.0.0 Safari/537.36"
+                ),
+                extra_http_headers={
+                    "Accept-Language": "en-US,en;q=0.9,fr;q=0.8",
+                },
+            )
+
+            page = context.new_page()
+            page.goto(url, wait_until="domcontentloaded", timeout=45000)
+
+            for selector in [
+                "text=OK",
+                "text=Accept",
+                "text=Accept all",
+                "text=I agree",
+                "button:has-text('OK')",
+                "button:has-text('Accept')",
+            ]:
+                try:
+                    page.locator(selector).first.click(timeout=1500)
+                    break
+                except Exception:
+                    pass
+
+            try:
+                page.wait_for_load_state("networkidle", timeout=15000)
+            except Exception:
+                pass
+
+            for _ in range(8):
+                page.mouse.wheel(0, 900)
+                page.wait_for_timeout(700)
+
+            content = page.locator("body").inner_text(timeout=15000)
+            browser.close()
+
+            content = re.sub(r"\r", "\n", content or "")
+            content = re.sub(r"\n{2,}", "\n", content)
+
+            if content and len(content) > 100:
+                return content
+
+            raise RuntimeError("Playwright body vide")
+
+    except Exception as exc:
+        raise RuntimeError(
+            f"requests_failed=[{requests_error}] | playwright_failed=[{type(exc).__name__}: {exc}]"
+        )
 
 
 def _parse_sportytrader_odds_from_text(content: str, target_day: str) -> List[Dict[str, str]]:
