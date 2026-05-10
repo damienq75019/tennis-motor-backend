@@ -276,6 +276,62 @@ def save_history(rows: List[Dict[str, Any]]) -> None:
     HISTORY_PATH.write_text(json.dumps(rows, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
+def verified_recovery_rows() -> List[Dict[str, Any]]:
+    """
+    Lignes vérifiées à restaurer si Railway a perdu le fichier output/premium_history.json
+    après un redéploiement.
+
+    Important :
+    - ne restaure que les résultats déjà vérifiés ;
+    - n'ajoute pas les matchs de demain ;
+    - ne crée pas de doublon si la ligne existe déjà.
+    """
+    return [
+        {
+            "id": "2026-05-10__alexander blockx__alexander zverev__pick_alexander zverev",
+            "date": "2026-05-10",
+            "sourcePlayerA": "Alexander Zverev",
+            "sourcePlayerB": "Alexander Blockx",
+            "predictedWinner": "Alexander Zverev",
+            "opponent": "Alexander Blockx",
+            "surface": "Clay",
+            "premiumPct": 82.3,
+            "status": "PREMIUM",
+            "veto": "non",
+            "decision": "✅ Jouable",
+            "oddPredicted": "1.2",
+            "oddOpponent": "4.5",
+            "oddsSource": "Flashscore",
+            "result": "win",
+            "realWinner": "Alexander Zverev",
+            "settledAt": "2026-05-10",
+        }
+    ]
+
+
+def restore_verified_if_history_empty() -> Dict[str, Any]:
+    """
+    Répare le cas Railway : après redéploiement, output/ peut repartir vide.
+    On restaure uniquement les résultats vérifiés, jamais les pending.
+    """
+    rows = load_history()
+
+    if rows:
+        return {"restoredVerifiedRows": 0, "reason": "history_not_empty"}
+
+    seeds = []
+    for row in verified_recovery_rows():
+        row_date = str(row.get("date") or "")
+        if is_future_day(row_date):
+            continue
+        seeds.append(row)
+
+    if seeds:
+        save_history(seeds)
+
+    return {"restoredVerifiedRows": len(seeds), "reason": "history_was_empty"}
+
+
 def read_json_file(path: str) -> Dict[str, Any]:
     p = Path(path)
     return json.loads(p.read_text(encoding="utf-8"))
@@ -347,6 +403,7 @@ def record_result_json(result: Dict[str, Any], target_day: Optional[str] = None)
             "updated": 0,
         }
 
+    restore_verified_if_history_empty()
     history, cleanup_info = sanitize_history_rows(load_history())
     by_id = {str(row.get("id", "")): row for row in history if row.get("id")}
     by_unique = {
@@ -480,6 +537,19 @@ def settle_manual(predicted_or_pair: str, winner: str, target_day: Optional[str]
         row["result"] = "win" if same_player(predicted, winner) else "loss"
         row["settledAt"] = today_iso()
         changed += 1
+
+    if changed == 0:
+        # Si Railway a perdu l'historique, autorise la restauration manuelle d'un résultat vérifié.
+        for seed in verified_recovery_rows():
+            seed_date = str(seed.get("date") or "")
+            if target_day and seed_date != target_day:
+                continue
+            if same_player(predicted_or_pair, str(seed.get("predictedWinner") or "")) and same_player(winner, str(seed.get("realWinner") or "")):
+                exists = any(str(r.get("id") or "") == str(seed.get("id") or "") for r in history)
+                if not exists and not is_future_day(seed_date):
+                    history.append(seed)
+                    changed += 1
+                break
 
     save_history(history)
     summary = build_summary()
@@ -1099,8 +1169,10 @@ def stats_for_period(rows: List[Dict[str, Any]], period_days: Optional[int]) -> 
 
 
 def build_summary(write_cleaned: bool = True) -> Dict[str, Any]:
+    recovery_info = restore_verified_if_history_empty()
     rows_raw = load_history()
     rows, cleanup_info = sanitize_history_rows(rows_raw)
+    cleanup_info.update(recovery_info)
 
     if write_cleaned and cleanup_info.get("removedFutureRows", 0) + cleanup_info.get("removedDuplicateRows", 0) > 0:
         save_history(rows)
