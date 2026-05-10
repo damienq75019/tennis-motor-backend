@@ -1263,6 +1263,37 @@ def build_summary(write_cleaned: bool = True) -> Dict[str, Any]:
 
     days.sort(key=lambda x: x["date"])
 
+    # V3 graphique calendrier :
+    # On ajoute aussi les jours sans Premium entre le premier jour suivi et aujourd'hui.
+    # Ces jours gardent les valeurs cumulées, mais hadPremiumSettledToday=false.
+    # Unity pourra donc dessiner ces segments en gris.
+    if days:
+        existing_by_date = {str(d.get("date", "")): d for d in days}
+        start_day = parse_date(str(days[0].get("date", "")))
+        end_day = current_paris_date()
+
+        if start_day and start_day <= end_day:
+            full_days = []
+            cursor = start_day
+            while cursor <= end_day:
+                key = cursor.isoformat()
+                if key in existing_by_date:
+                    full_days.append(existing_by_date[key])
+                else:
+                    full_days.append({
+                        "date": key,
+                        "wins": 0,
+                        "losses": 0,
+                        "pending": 0,
+                        "winRate": 0.0,
+                        "profitUnits": 0.0,
+                        "profitEur": 0.0,
+                        "hadPremiumToday": False,
+                        "hadPremiumSettledToday": False,
+                    })
+                cursor += timedelta(days=1)
+            days = full_days
+
     cumulative_days: List[Dict[str, Any]] = []
     cumulative_wins = 0
     cumulative_losses = 0
