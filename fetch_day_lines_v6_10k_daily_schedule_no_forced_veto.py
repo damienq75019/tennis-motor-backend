@@ -339,6 +339,147 @@ def _strict_date_filter_rows(rows: List[Dict[str, str]], target_day: date) -> Tu
 
 
 
+def _clean_oop_player_name(raw: str) -> str:
+    """
+    Nettoie une ligne joueur issue de l'article ATP Order Of Play.
+
+    Exemple :
+    "[WC] Matteo Arnaldi (ITA)" -> "Matteo Arnaldi"
+    "[23] Casper Ruud (NOR)" -> "Casper Ruud"
+    "[Q] Dino Prizmic (CRO)" -> "Dino Prizmic"
+    """
+    name = normalize_space(raw or "")
+    name = re.sub(r"\[[^\]]+\]", " ", name)
+    name = re.sub(r"\([A-Z]{2,3}\)", " ", name)
+    name = re.sub(r"\bAlternate\b", " ", name, flags=re.I)
+    name = normalize_space(name)
+    return clean_name(name)
+
+
+def _fetch_rome_2026_article_singles_filter(session, target_day: date) -> Tuple[Set[Tuple[str, str]], List[str]]:
+    """
+    Filtre officiel temporaire basé sur l'article ATP :
+    https://www.atptour.com/en/news/rome-2026-schedule
+
+    Rôle :
+    - ne crée pas la liste du jour depuis l'article ;
+    - sert uniquement à filtrer les faux simples issus des doubles quand la page
+      daily-schedule mélange joueurs de doubles.
+    """
+    audit: List[str] = []
+    pairs: Set[Tuple[str, str]] = set()
+
+    # Ce filtre est volontairement limité au cas actuellement vérifié :
+    # ORDER OF PLAY - SUNDAY, 10 MAY 2026.
+    if target_day.isoformat() != "2026-05-10":
+        audit.append("official_oop_filter_status=skipped_not_2026_05_10")
+        return pairs, audit
+
+    url = "https://www.atptour.com/en/news/rome-2026-schedule"
+
+    try:
+        html = base.fetch_html(session, url)
+    except Exception as exc:
+        audit.append(f"official_oop_filter_status=fetch_failed | {type(exc).__name__}: {exc}")
+        return pairs, audit
+
+    soup = BeautifulSoup(html or "", "html.parser")
+
+    for tag in soup(["script", "style", "noscript"]):
+        tag.decompose()
+
+    text = soup.get_text("\n", strip=True)
+    lines = [normalize_space(x) for x in text.splitlines() if normalize_space(x)]
+
+    in_target_section = False
+
+    for line in lines:
+        low = line.lower()
+
+        if "order of play" in low and "10 may 2026" in low:
+            in_target_section = True
+            continue
+
+        if not in_target_section:
+            continue
+
+        # Fin prudente de la section OOP.
+        if "read more news" in low or "view all news" in low or "related videos" in low:
+            break
+
+        if not line.startswith("ATP -"):
+            continue
+
+        # Exclure doubles : l'article officiel utilise "/" pour les équipes.
+        if "/" in line:
+            continue
+
+        if " vs " not in line:
+            continue
+
+        body = normalize_space(line.replace("ATP -", "", 1))
+        left, right = body.split(" vs ", 1)
+
+        player_a = _clean_oop_player_name(left)
+        player_b = _clean_oop_player_name(right)
+
+        if not player_a or not player_b:
+            continue
+
+        if not is_name_like(player_a) or not is_name_like(player_b):
+            continue
+
+        pairs.add(unordered_pair_key(player_a, player_b))
+
+    audit.append(f"official_oop_filter_status=active_rome_2026_article")
+    audit.append(f"official_oop_filter_url={url}")
+    audit.append(f"official_oop_singles_pairs={len(pairs)}")
+
+    return pairs, audit
+
+
+def _apply_official_oop_singles_filter(
+    rows: List[Dict[str, str]],
+    session,
+    target_day: date,
+) -> Tuple[List[Dict[str, str]], List[str]]:
+    """
+    Applique le filtre officiel ATP uniquement si une liste officielle de simples
+    est trouvée. Sinon, ne touche pas aux rows.
+    """
+    audit: List[str] = []
+    before = len(rows)
+
+    official_pairs, official_audit = _fetch_rome_2026_article_singles_filter(session, target_day)
+    audit.extend(official_audit)
+
+    if not official_pairs:
+        audit.append(f"official_oop_filter_applied=false")
+        audit.append(f"official_oop_filter_rows_before={before}")
+        audit.append(f"official_oop_filter_rows_after={len(rows)}")
+        return rows, audit
+
+    filtered: List[Dict[str, str]] = []
+
+    for row in rows:
+        key = unordered_pair_key(row.get("playerA", ""), row.get("playerB", ""))
+        if key in official_pairs:
+            filtered.append(row)
+
+    audit.append("official_oop_filter_applied=true")
+    audit.append(f"official_oop_filter_rows_before={before}")
+    audit.append(f"official_oop_filter_rows_after={len(filtered)}")
+
+    for row in filtered:
+        audit.append(f"[OFFICIAL SINGLES KEEP] {row.get('playerA')} vs {row.get('playerB')}")
+
+    removed = before - len(filtered)
+    audit.append(f"official_oop_filter_removed_rows={removed}")
+
+    return filtered, audit
+
+
+
 # ---------------------------------------------------------------------------
 # Découverte des pages ATP daily-schedule
 # ---------------------------------------------------------------------------
@@ -750,13 +891,8 @@ def extract_pairs_line_scanner(html: str, source_url: str) -> Tuple[List[Dict[st
         player_b = tokens[player_b_index].get("name", "")
         evidence = _window_text(tokens, i, player_b_index + 5)
 
-        # Sécurité doubles V6.10K-2 :
-        # on garde la fenêtre courte pour l'evidence affichée,
-        # mais on vérifie une fenêtre plus large autour du match pour capter
-        # les labels "Doubles" ou les équipes avec "/" qui peuvent être juste avant/après.
-        doubles_guard_window = _window_text(tokens, i - 8, player_b_index + 10)
-
-        if _is_doubles_marker(evidence) or _is_doubles_marker(doubles_guard_window):
+        # Sécurité doubles. Ne pas rejeter juste parce que la prochaine ligne WTA arrive après le match ATP.
+        if _is_doubles_marker(evidence):
             i += 1
             continue
 
@@ -948,12 +1084,7 @@ def extract_pairs_text_fallback(
         player_b = tokens[player_b_index].get("name", "")
         evidence = _window_text(tokens, i, player_b_index + 5)
 
-        # Sécurité doubles V6.10K-2 :
-        # fenêtre large pour détecter les labels "Doubles" ou les équipes avec "/"
-        # sans bloquer les vrais simples.
-        doubles_guard_window = _window_text(tokens, i - 8, player_b_index + 10)
-
-        if _is_doubles_marker(evidence) or _is_doubles_marker(doubles_guard_window):
+        if _is_doubles_marker(evidence):
             i += 1
             continue
 
@@ -1103,6 +1234,11 @@ def build_daily_schedule_matches(session, target_day: date, include_challenger: 
 
         seen.add(key)
         clean_rows.append(row)
+
+    # Filtre officiel ATP Order Of Play :
+    # Corrige le cas où ATP daily-schedule mélange les doubles et fabrique des faux simples.
+    clean_rows, official_oop_audit = _apply_official_oop_singles_filter(clean_rows, session, target_day)
+    audit.extend(official_oop_audit)
 
     clean_rows, strict_date_audit = _strict_date_filter_rows(clean_rows, target_day)
     audit.extend(strict_date_audit)
@@ -1457,7 +1593,6 @@ def main() -> int:
     audit.append(f"backend_url={args.backend_url}")
     audit.append(f"mode={MODE}")
     audit.append("source_policy=ATP_DAILY_SCHEDULE_NO_FORCED_VETO_ONLY")
-    audit.append("doubles_guard=wide_window_only_on")
     audit.append("strict_date_policy=trim_to_first_16_if_more_than_16")
     audit.append("veto_policy=no_forced_tournament_wins_without_real_atp_evidence")
     audit.append("missing_points_policy=keep_match_replace_missing_points_with_1")
