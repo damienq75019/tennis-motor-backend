@@ -657,84 +657,6 @@ def _window_text(tokens: List[Dict[str, str]], start: int, end: int) -> str:
     return normalize_space(" | ".join(_token_text(t) for t in tokens[max(0, start):min(len(tokens), end)] if _token_text(t)))
 
 
-def _is_soft_between_team_players(text: str) -> bool:
-    """
-    Texte faible qui peut apparaître entre deux joueurs de la même équipe de double.
-    On le tolère pour détecter PLAYER / PLAYER même s'il y a seed, drapeau, Q, etc.
-    """
-    t = normalize_space(text).lower()
-
-    if not t:
-        return True
-
-    if re.fullmatch(r"\(?\s*(q|wc|ll|pr|se)\s*\)?", t, flags=re.I):
-        return True
-
-    if re.fullmatch(r"\(?\s*\d{1,2}\s*\)?", t):
-        return True
-
-    if re.fullmatch(r"[0-9\s{}^.,-]+", t):
-        return True
-
-    return False
-
-
-def _has_previous_team_player(tokens: List[Dict[str, str]], player_index: int, max_back: int = 3) -> bool:
-    """
-    Détecte le cas double où le joueur courant est le 2e joueur de l'équipe A :
-        Joueur A1 / Joueur A2 / Vs / Joueur B1 / Joueur B2
-
-    Si on laisse passer Joueur A2, le script fabrique un faux simple.
-    """
-    checked = 0
-    j = player_index - 1
-
-    while j >= 0 and checked < max_back:
-        token = tokens[j]
-
-        if token.get("type") == "PLAYER":
-            return True
-
-        text = token.get("text", "")
-        if _status_from_text(text) or _is_doubles_marker(text) or _is_wta_marker(text):
-            return False
-
-        if not _is_soft_between_team_players(text):
-            return False
-
-        checked += 1
-        j -= 1
-
-    return False
-
-
-def _has_next_team_player(tokens: List[Dict[str, str]], player_index: int, max_forward: int = 3) -> bool:
-    """
-    Détecte le cas double où le joueur B trouvé est le 1er joueur de l'équipe B
-    et qu'un autre joueur suit juste après.
-    """
-    checked = 0
-    j = player_index + 1
-
-    while j < len(tokens) and checked < max_forward:
-        token = tokens[j]
-
-        if token.get("type") == "PLAYER":
-            return True
-
-        text = token.get("text", "")
-        if _status_from_text(text) or _is_doubles_marker(text) or _is_wta_marker(text):
-            return False
-
-        if not _is_soft_between_team_players(text):
-            return False
-
-        checked += 1
-        j += 1
-
-    return False
-
-
 def _find_status_after_player(tokens: List[Dict[str, str]], start: int, max_scan: int = 10) -> Tuple[int, str]:
     """
     Cherche Vs/Defeats après joueur A.
@@ -813,14 +735,6 @@ def extract_pairs_line_scanner(html: str, source_url: str) -> Tuple[List[Dict[st
             continue
 
         player_a = token.get("name", "")
-
-        # Sécurité doubles :
-        # si ce joueur est collé à un autre joueur avant lui, il appartient probablement
-        # à une équipe de double. Ne pas fabriquer un faux simple.
-        if _has_previous_team_player(tokens, i):
-            i += 1
-            continue
-
         status_index, status = _find_status_after_player(tokens, i + 1)
 
         if status_index < 0:
@@ -836,15 +750,13 @@ def extract_pairs_line_scanner(html: str, source_url: str) -> Tuple[List[Dict[st
         player_b = tokens[player_b_index].get("name", "")
         evidence = _window_text(tokens, i, player_b_index + 5)
 
-        # Sécurité doubles :
-        # si un autre joueur suit directement joueur B, joueur B est probablement
-        # le premier joueur d'une équipe de double.
-        if _has_next_team_player(tokens, player_b_index):
-            i += 1
-            continue
+        # Sécurité doubles V6.10K-2 :
+        # on garde la fenêtre courte pour l'evidence affichée,
+        # mais on vérifie une fenêtre plus large autour du match pour capter
+        # les labels "Doubles" ou les équipes avec "/" qui peuvent être juste avant/après.
+        doubles_guard_window = _window_text(tokens, i - 8, player_b_index + 10)
 
-        # Sécurité doubles. Ne pas rejeter juste parce que la prochaine ligne WTA arrive après le match ATP.
-        if _is_doubles_marker(evidence):
+        if _is_doubles_marker(evidence) or _is_doubles_marker(doubles_guard_window):
             i += 1
             continue
 
@@ -1021,12 +933,6 @@ def extract_pairs_text_fallback(
             continue
 
         player_a = token.get("name", "")
-
-        # Sécurité doubles : joueur courant collé à un joueur précédent = 2e joueur d'équipe.
-        if _has_previous_team_player(tokens, i):
-            i += 1
-            continue
-
         status_index, status = _find_status_after_player(tokens, i + 1, max_scan=16)
 
         if status_index < 0:
@@ -1042,12 +948,12 @@ def extract_pairs_text_fallback(
         player_b = tokens[player_b_index].get("name", "")
         evidence = _window_text(tokens, i, player_b_index + 5)
 
-        # Sécurité doubles : joueur B collé à un autre joueur après lui = 1er joueur d'équipe.
-        if _has_next_team_player(tokens, player_b_index):
-            i += 1
-            continue
+        # Sécurité doubles V6.10K-2 :
+        # fenêtre large pour détecter les labels "Doubles" ou les équipes avec "/"
+        # sans bloquer les vrais simples.
+        doubles_guard_window = _window_text(tokens, i - 8, player_b_index + 10)
 
-        if _is_doubles_marker(evidence):
+        if _is_doubles_marker(evidence) or _is_doubles_marker(doubles_guard_window):
             i += 1
             continue
 
@@ -1551,7 +1457,7 @@ def main() -> int:
     audit.append(f"backend_url={args.backend_url}")
     audit.append(f"mode={MODE}")
     audit.append("source_policy=ATP_DAILY_SCHEDULE_NO_FORCED_VETO_ONLY")
-    audit.append("doubles_guard=adjacent_player_team_filter_on")
+    audit.append("doubles_guard=wide_window_only_on")
     audit.append("strict_date_policy=trim_to_first_16_if_more_than_16")
     audit.append("veto_policy=no_forced_tournament_wins_without_real_atp_evidence")
     audit.append("missing_points_policy=keep_match_replace_missing_points_with_1")
