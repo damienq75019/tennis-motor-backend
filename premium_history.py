@@ -1269,7 +1269,7 @@ def build_summary(write_cleaned: bool = True) -> Dict[str, Any]:
     # Unity pourra donc dessiner ces segments en gris.
     if days:
         existing_by_date = {str(d.get("date", "")): d for d in days}
-        start_day = parse_date(str(days[0].get("date", "")))
+        start_day = parse_iso_date(str(days[0].get("date", "")))
         end_day = current_paris_date()
 
         if start_day and start_day <= end_day:
