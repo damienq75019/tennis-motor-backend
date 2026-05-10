@@ -339,144 +339,170 @@ def _strict_date_filter_rows(rows: List[Dict[str, str]], target_day: date) -> Tu
 
 
 
-def _clean_oop_player_name(raw: str) -> str:
+def _clean_atp_oop_player_name(raw: str) -> str:
     """
-    Nettoie une ligne joueur issue de l'article ATP Order Of Play.
-
-    Exemple :
-    "[WC] Matteo Arnaldi (ITA)" -> "Matteo Arnaldi"
-    "[23] Casper Ruud (NOR)" -> "Casper Ruud"
-    "[Q] Dino Prizmic (CRO)" -> "Dino Prizmic"
+    Nettoie un joueur depuis l'article ATP Order Of Play.
+    Exemple : "[23] Casper Ruud (NOR)" -> "Casper Ruud"
     """
-    name = normalize_space(raw or "")
-    name = re.sub(r"\[[^\]]+\]", " ", name)
-    name = re.sub(r"\([A-Z]{2,3}\)", " ", name)
-    name = re.sub(r"\bAlternate\b", " ", name, flags=re.I)
-    name = normalize_space(name)
-    return clean_name(name)
+    value = normalize_space(raw or "")
+    value = re.sub(r"\[[^\]]+\]", " ", value)
+    value = re.sub(r"\([A-Z]{2,3}\)", " ", value)
+    value = re.sub(r"\bAlternate\b", " ", value, flags=re.I)
+    return clean_name(normalize_space(value))
 
 
-def _fetch_rome_2026_article_singles_filter(session, target_day: date) -> Tuple[Set[Tuple[str, str]], List[str]]:
+def _static_official_singles_pairs_for_verified_day(target_day: date) -> Set[Tuple[str, str]]:
     """
-    Filtre officiel temporaire basé sur l'article ATP :
-    https://www.atptour.com/en/news/rome-2026-schedule
+    Sécurité vérifiée manuellement sur ATP article :
+    ORDER OF PLAY - SUNDAY, 10 MAY 2026, Rome.
 
-    Rôle :
-    - ne crée pas la liste du jour depuis l'article ;
-    - sert uniquement à filtrer les faux simples issus des doubles quand la page
-      daily-schedule mélange joueurs de doubles.
+    Utilisé seulement si la page ATP article ne peut pas être parsée sur Railway.
+    Ne sert pas à créer des matchs, seulement à filtrer les faux simples issus des doubles.
+    """
+    if target_day.isoformat() != "2026-05-10":
+        return set()
+
+    official_names = [
+        ("Alexander Blockx", "Alexander Zverev"),
+        ("Lorenzo Musetti", "Francisco Cerundolo"),
+        ("Matteo Arnaldi", "Rafael Jodar"),
+        ("Casper Ruud", "Jiri Lehecka"),
+        ("Tommy Paul", "Luciano Darderi"),
+        ("Karen Khachanov", "Botic van de Zandschulp"),
+        ("Learner Tien", "Alexander Bublik"),
+        ("Ugo Humbert", "Dino Prizmic"),
+    ]
+
+    return {unordered_pair_key(a, b) for a, b in official_names}
+
+
+def _fetch_official_atp_article_singles_pairs(session, target_day: date) -> Tuple[Set[Tuple[str, str]], List[str]]:
+    """
+    Filtre officiel ATP pour le cas où daily-schedule mélange les doubles.
+
+    Important :
+    - le daily-schedule reste la source de création des lignes ;
+    - l'article ATP ne sert qu'à FILTRER les lignes déjà trouvées ;
+    - les lignes ATP contenant "/" sont des doubles et sont refusées.
     """
     audit: List[str] = []
     pairs: Set[Tuple[str, str]] = set()
 
-    # Ce filtre est volontairement limité au cas actuellement vérifié :
-    # ORDER OF PLAY - SUNDAY, 10 MAY 2026.
+    # Filtre limité au cas vérifié aujourd'hui.
     if target_day.isoformat() != "2026-05-10":
-        audit.append("official_oop_filter_status=skipped_not_2026_05_10")
+        audit.append("official_oop_filter_status=skipped_not_verified_day")
         return pairs, audit
 
     url = "https://www.atptour.com/en/news/rome-2026-schedule"
 
     try:
         html = base.fetch_html(session, url)
+        soup = BeautifulSoup(html or "", "html.parser")
+
+        for tag in soup(["script", "style", "noscript"]):
+            tag.decompose()
+
+        lines = [normalize_space(x) for x in soup.get_text("\n", strip=True).splitlines() if normalize_space(x)]
+
+        in_section = False
+
+        for line in lines:
+            low = line.lower()
+
+            if "order of play" in low and "10 may 2026" in low:
+                in_section = True
+                continue
+
+            if not in_section:
+                continue
+
+            if "read more news" in low or "view related videos" in low or "newsletters" in low:
+                break
+
+            if not line.startswith("ATP -"):
+                continue
+
+            # La preuve officielle : un slash dans une ligne ATP = double.
+            if "/" in line:
+                continue
+
+            if " vs " not in line:
+                continue
+
+            body = normalize_space(line.replace("ATP -", "", 1))
+            left, right = body.split(" vs ", 1)
+
+            player_a = _clean_atp_oop_player_name(left)
+            player_b = _clean_atp_oop_player_name(right)
+
+            if player_a and player_b and is_name_like(player_a) and is_name_like(player_b):
+                pairs.add(unordered_pair_key(player_a, player_b))
+
+        audit.append("official_oop_filter_status=article_parsed")
+        audit.append(f"official_oop_filter_url={url}")
+        audit.append(f"official_oop_singles_pairs_from_article={len(pairs)}")
+
     except Exception as exc:
-        audit.append(f"official_oop_filter_status=fetch_failed | {type(exc).__name__}: {exc}")
-        return pairs, audit
+        audit.append(f"official_oop_filter_status=article_fetch_or_parse_failed | {type(exc).__name__}: {exc}")
 
-    soup = BeautifulSoup(html or "", "html.parser")
-
-    for tag in soup(["script", "style", "noscript"]):
-        tag.decompose()
-
-    text = soup.get_text("\n", strip=True)
-    lines = [normalize_space(x) for x in text.splitlines() if normalize_space(x)]
-
-    in_target_section = False
-
-    for line in lines:
-        low = line.lower()
-
-        if "order of play" in low and "10 may 2026" in low:
-            in_target_section = True
-            continue
-
-        if not in_target_section:
-            continue
-
-        # Fin prudente de la section OOP.
-        if "read more news" in low or "view all news" in low or "related videos" in low:
-            break
-
-        if not line.startswith("ATP -"):
-            continue
-
-        # Exclure doubles : l'article officiel utilise "/" pour les équipes.
-        if "/" in line:
-            continue
-
-        if " vs " not in line:
-            continue
-
-        body = normalize_space(line.replace("ATP -", "", 1))
-        left, right = body.split(" vs ", 1)
-
-        player_a = _clean_oop_player_name(left)
-        player_b = _clean_oop_player_name(right)
-
-        if not player_a or not player_b:
-            continue
-
-        if not is_name_like(player_a) or not is_name_like(player_b):
-            continue
-
-        pairs.add(unordered_pair_key(player_a, player_b))
-
-    audit.append(f"official_oop_filter_status=active_rome_2026_article")
-    audit.append(f"official_oop_filter_url={url}")
-    audit.append(f"official_oop_singles_pairs={len(pairs)}")
+    if not pairs:
+        fallback_pairs = _static_official_singles_pairs_for_verified_day(target_day)
+        if fallback_pairs:
+            pairs = fallback_pairs
+            audit.append("official_oop_filter_status=static_verified_fallback_used")
+            audit.append(f"official_oop_singles_pairs_static={len(pairs)}")
 
     return pairs, audit
 
 
-def _apply_official_oop_singles_filter(
+def _apply_official_atp_singles_filter(
     rows: List[Dict[str, str]],
     session,
     target_day: date,
 ) -> Tuple[List[Dict[str, str]], List[str]]:
     """
-    Applique le filtre officiel ATP uniquement si une liste officielle de simples
-    est trouvée. Sinon, ne touche pas aux rows.
+    Applique un filtre de validation officielle ATP sur les paires déjà extraites.
+
+    Résultat attendu pour 2026-05-10 Rome :
+    15 lignes brutes -> 8 simples ATP officiels.
     """
     audit: List[str] = []
     before = len(rows)
 
-    official_pairs, official_audit = _fetch_rome_2026_article_singles_filter(session, target_day)
+    official_pairs, official_audit = _fetch_official_atp_article_singles_pairs(session, target_day)
     audit.extend(official_audit)
 
     if not official_pairs:
-        audit.append(f"official_oop_filter_applied=false")
+        audit.append("official_oop_filter_applied=false")
         audit.append(f"official_oop_filter_rows_before={before}")
-        audit.append(f"official_oop_filter_rows_after={len(rows)}")
+        audit.append(f"official_oop_filter_rows_after={before}")
         return rows, audit
 
-    filtered: List[Dict[str, str]] = []
+    kept: List[Dict[str, str]] = []
+    removed: List[str] = []
 
     for row in rows:
-        key = unordered_pair_key(row.get("playerA", ""), row.get("playerB", ""))
+        player_a = row.get("playerA", "")
+        player_b = row.get("playerB", "")
+        key = unordered_pair_key(player_a, player_b)
+
         if key in official_pairs:
-            filtered.append(row)
+            kept.append(row)
+        else:
+            removed.append(f"{player_a} vs {player_b}")
 
     audit.append("official_oop_filter_applied=true")
     audit.append(f"official_oop_filter_rows_before={before}")
-    audit.append(f"official_oop_filter_rows_after={len(filtered)}")
+    audit.append(f"official_oop_filter_rows_after={len(kept)}")
+    audit.append(f"official_oop_filter_removed_rows={len(removed)}")
 
-    for row in filtered:
-        audit.append(f"[OFFICIAL SINGLES KEEP] {row.get('playerA')} vs {row.get('playerB')}")
+    for row in kept[:30]:
+        audit.append(f"[OFFICIAL ATP SINGLES KEEP] {row.get('playerA')} vs {row.get('playerB')}")
 
-    removed = before - len(filtered)
-    audit.append(f"official_oop_filter_removed_rows={removed}")
+    for item in removed[:80]:
+        audit.append(f"[OFFICIAL ATP FILTER REMOVE] {item}")
 
-    return filtered, audit
+    return kept, audit
 
 
 
@@ -1235,9 +1261,9 @@ def build_daily_schedule_matches(session, target_day: date, include_challenger: 
         seen.add(key)
         clean_rows.append(row)
 
-    # Filtre officiel ATP Order Of Play :
-    # Corrige le cas où ATP daily-schedule mélange les doubles et fabrique des faux simples.
-    clean_rows, official_oop_audit = _apply_official_oop_singles_filter(clean_rows, session, target_day)
+    # Validation officielle ATP Order Of Play.
+    # Corrige les faux simples créés quand le daily-schedule mélange les équipes de double.
+    clean_rows, official_oop_audit = _apply_official_atp_singles_filter(clean_rows, session, target_day)
     audit.extend(official_oop_audit)
 
     clean_rows, strict_date_audit = _strict_date_filter_rows(clean_rows, target_day)
@@ -1593,6 +1619,7 @@ def main() -> int:
     audit.append(f"backend_url={args.backend_url}")
     audit.append(f"mode={MODE}")
     audit.append("source_policy=ATP_DAILY_SCHEDULE_NO_FORCED_VETO_ONLY")
+    audit.append("official_oop_singles_filter=atp_article_validation_on")
     audit.append("strict_date_policy=trim_to_first_16_if_more_than_16")
     audit.append("veto_policy=no_forced_tournament_wins_without_real_atp_evidence")
     audit.append("missing_points_policy=keep_match_replace_missing_points_with_1")
