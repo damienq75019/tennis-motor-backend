@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import sys
 from datetime import date, datetime, timedelta
@@ -42,7 +43,32 @@ except Exception:  # Python fallback
     ZoneInfo = None  # type: ignore
 
 
-OUTPUT_DIR = Path("output")
+def resolve_history_output_dir() -> Path:
+    """
+    Dossier de stockage de l'historique.
+
+    Priorité :
+    1) HISTORY_DIR si tu veux forcer un chemin précis.
+    2) RAILWAY_VOLUME_MOUNT_PATH si un volume Railway est attaché.
+    3) output/ en local ou sans volume.
+
+    Sur Railway, monte idéalement un volume sur /app/output :
+    - l'application écrit déjà dans output/
+    - Railway recommande de monter le volume sur /app/<dossier> pour persister
+      les chemins relatifs de l'application.
+    """
+    forced = os.getenv("HISTORY_DIR", "").strip()
+    if forced:
+        return Path(forced)
+
+    railway_volume = os.getenv("RAILWAY_VOLUME_MOUNT_PATH", "").strip()
+    if railway_volume:
+        return Path(railway_volume)
+
+    return Path("output")
+
+
+OUTPUT_DIR = resolve_history_output_dir()
 HISTORY_PATH = OUTPUT_DIR / "premium_history.json"
 SUMMARY_PATH = OUTPUT_DIR / "premium_history_summary.json"
 FLASHSCORE_TENNIS_URL = "https://www.flashscore.fr/tennis/"
@@ -260,6 +286,7 @@ def cleanup_history() -> Dict[str, Any]:
 
 def load_history() -> List[Dict[str, Any]]:
     try:
+        OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
         if not HISTORY_PATH.exists():
             return []
         data = json.loads(HISTORY_PATH.read_text(encoding="utf-8"))
@@ -1249,6 +1276,12 @@ def build_summary(write_cleaned: bool = True) -> Dict[str, Any]:
         "status": "ok",
         "historyPath": str(HISTORY_PATH),
         "summaryPath": str(SUMMARY_PATH),
+        "storage": {
+            "outputDir": str(OUTPUT_DIR),
+            "historyDirEnv": os.getenv("HISTORY_DIR", ""),
+            "railwayVolumeMountPath": os.getenv("RAILWAY_VOLUME_MOUNT_PATH", ""),
+            "persistentVolumeDetected": bool(os.getenv("RAILWAY_VOLUME_MOUNT_PATH", "")),
+        },
         "cleanup": cleanup_info,
         "summary": {
             "day": stats_for_period(rows, 1),
