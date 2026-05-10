@@ -73,6 +73,11 @@ HISTORY_PATH = OUTPUT_DIR / "premium_history.json"
 SUMMARY_PATH = OUTPUT_DIR / "premium_history_summary.json"
 FLASHSCORE_TENNIS_URL = "https://www.flashscore.fr/tennis/"
 
+# Mise fixe utilisateur : 100 euros par match Premium.
+STAKE_EUR = 100.0
+EURO_AXIS_MIN = -10000.0
+EURO_AXIS_MAX = 10000.0
+
 
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -1223,20 +1228,28 @@ def build_summary(write_cleaned: bool = True) -> Dict[str, Any]:
                 "pending": 0,
                 "winRate": 0.0,
                 "profitUnits": 0.0,
+                "profitEur": 0.0,
+                "hadPremiumToday": False,
+                "hadPremiumSettledToday": False,
             },
         )
+        bucket["hadPremiumToday"] = True
 
         odd = to_float(row.get("oddPredicted"), 0.0)
         result = row.get("result")
 
         if result == "win":
             bucket["wins"] += 1
+            bucket["hadPremiumSettledToday"] = True
             if odd > 1.0:
                 bucket["profitUnits"] += odd - 1.0
+                bucket["profitEur"] += STAKE_EUR * (odd - 1.0)
         elif result == "loss":
             bucket["losses"] += 1
+            bucket["hadPremiumSettledToday"] = True
             if odd > 1.0:
                 bucket["profitUnits"] -= 1.0
+            bucket["profitEur"] -= STAKE_EUR
         else:
             bucket["pending"] += 1
 
@@ -1245,6 +1258,7 @@ def build_summary(write_cleaned: bool = True) -> Dict[str, Any]:
         settled = bucket["wins"] + bucket["losses"]
         bucket["winRate"] = round((bucket["wins"] / settled) * 100.0, 2) if settled else 0.0
         bucket["profitUnits"] = round(bucket["profitUnits"], 3)
+        bucket["profitEur"] = round(bucket["profitEur"], 2)
         days.append(bucket)
 
     days.sort(key=lambda x: x["date"])
@@ -1253,11 +1267,13 @@ def build_summary(write_cleaned: bool = True) -> Dict[str, Any]:
     cumulative_wins = 0
     cumulative_losses = 0
     cumulative_profit = 0.0
+    cumulative_profit_eur = 0.0
 
     for bucket in days:
         cumulative_wins += int(bucket.get("wins", 0))
         cumulative_losses += int(bucket.get("losses", 0))
         cumulative_profit += float(bucket.get("profitUnits", 0.0) or 0.0)
+        cumulative_profit_eur += float(bucket.get("profitEur", 0.0) or 0.0)
 
         settled = cumulative_wins + cumulative_losses
         cumulative_win_rate = round((cumulative_wins / settled) * 100.0, 2) if settled else 0.0
@@ -1269,7 +1285,10 @@ def build_summary(write_cleaned: bool = True) -> Dict[str, Any]:
             "cumulativeSettled": settled,
             "cumulativeWinRate": cumulative_win_rate,
             "cumulativeProfitUnits": round(cumulative_profit, 3),
+            "cumulativeProfitEur": round(cumulative_profit_eur, 2),
             "pendingThatDay": int(bucket.get("pending", 0)),
+            "hadPremiumToday": bool(bucket.get("hadPremiumToday", False)),
+            "hadPremiumSettledToday": bool(bucket.get("hadPremiumSettledToday", False)),
         })
 
     return {
@@ -1294,6 +1313,11 @@ def build_summary(write_cleaned: bool = True) -> Dict[str, Any]:
             "days": days,
             "cumulativeDays": cumulative_days,
             "description": "days = jour par jour ; cumulativeDays = courbe cumulée qui ne repart jamais à zéro.",
+            "stakeEur": STAKE_EUR,
+            "euroAxisMin": EURO_AXIS_MIN,
+            "euroAxisMax": EURO_AXIS_MAX,
+            "winRateAxisMin": 0.0,
+            "winRateAxisMax": 100.0,
         },
         "rows": rows,
     }
