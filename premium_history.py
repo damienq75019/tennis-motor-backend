@@ -36,6 +36,11 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.request import Request, urlopen
 
+try:
+    from zoneinfo import ZoneInfo
+except Exception:  # Python fallback
+    ZoneInfo = None  # type: ignore
+
 
 OUTPUT_DIR = Path("output")
 HISTORY_PATH = OUTPUT_DIR / "premium_history.json"
@@ -53,8 +58,18 @@ if hasattr(sys.stderr, "reconfigure"):
 # Base utils
 # ---------------------------------------------------------------------------
 
+def current_paris_date() -> date:
+    """Date métier Tennis Motor = Europe/Paris, pas UTC Railway."""
+    try:
+        if ZoneInfo is not None:
+            return datetime.now(ZoneInfo("Europe/Paris")).date()
+    except Exception:
+        pass
+    return date.today()
+
+
 def today_iso() -> str:
-    return date.today().isoformat()
+    return current_paris_date().isoformat()
 
 
 def normalize_space(text: str) -> str:
@@ -158,6 +173,87 @@ def match_id(target_day: str, source_a: str, source_b: str, predicted: str) -> s
     return f"{target_day}__{pair[0]}__{pair[1]}__pick_{norm_name(predicted)}"
 
 
+def history_match_key(source_a: str, source_b: str, predicted: str) -> str:
+    """Clé sans date : empêche le même match Premium d'être ajouté 2 fois."""
+    pair = sorted([norm_name(source_a), norm_name(source_b)])
+    return f"{pair[0]}__{pair[1]}__pick_{norm_name(predicted)}"
+
+
+def parse_iso_date(value: Any) -> Optional[date]:
+    try:
+        return date.fromisoformat(str(value))
+    except Exception:
+        return None
+
+
+def is_future_day(day_value: Any) -> bool:
+    d = parse_iso_date(day_value)
+    if d is None:
+        return False
+    return d > current_paris_date()
+
+
+def sanitize_history_rows(rows: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    """
+    Nettoyage dur :
+    - supprime les matchs futurs ;
+    - supprime les doublons du même match/pick ;
+    - garde en priorité la ligne déjà settled win/loss.
+    """
+    cleaned_by_key: Dict[str, Dict[str, Any]] = {}
+    removed_future = 0
+    removed_duplicates = 0
+
+    def score(row: Dict[str, Any]) -> Tuple[int, int, str]:
+        result = str(row.get("result") or "")
+        settled_priority = 2 if result in {"win", "loss"} else 1
+        has_real = 1 if row.get("realWinner") else 0
+        return (settled_priority, has_real, str(row.get("settledAt") or row.get("date") or ""))
+
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+
+        row_date = str(row.get("date") or "")
+        if is_future_day(row_date):
+            removed_future += 1
+            continue
+
+        source_a = str(row.get("sourcePlayerA") or "")
+        source_b = str(row.get("sourcePlayerB") or "")
+        predicted = str(row.get("predictedWinner") or "")
+
+        if not source_a or not source_b or not predicted:
+            # On garde les lignes inconnues non exploitables au lieu de les détruire.
+            key = str(row.get("id") or f"unknown_{len(cleaned_by_key)}")
+        else:
+            key = history_match_key(source_a, source_b, predicted)
+
+        old = cleaned_by_key.get(key)
+        if old is None:
+            cleaned_by_key[key] = row
+            continue
+
+        removed_duplicates += 1
+        if score(row) > score(old):
+            cleaned_by_key[key] = row
+
+    return list(cleaned_by_key.values()), {
+        "removedFutureRows": removed_future,
+        "removedDuplicateRows": removed_duplicates,
+        "keptRows": len(cleaned_by_key),
+    }
+
+
+def cleanup_history() -> Dict[str, Any]:
+    rows = load_history()
+    cleaned, info = sanitize_history_rows(rows)
+    save_history(cleaned)
+    summary = build_summary(write_cleaned=False)
+    SUMMARY_PATH.write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
+    return {"status": "ok", **info, "summaryPath": str(SUMMARY_PATH)}
+
+
 # ---------------------------------------------------------------------------
 # JSON read/write
 # ---------------------------------------------------------------------------
@@ -224,6 +320,23 @@ def infer_target_day(result: Dict[str, Any], fallback: Optional[str] = None) -> 
 
 def record_result_json(result: Dict[str, Any], target_day: Optional[str] = None) -> Dict[str, Any]:
     day = infer_target_day(result, target_day)
+
+    # Règle officielle historique : on ne suit pas les matchs futurs.
+    # Donc /daily?day=tomorrow ne doit jamais remplir premium_history.json.
+    if is_future_day(day):
+        summary = build_summary()
+        SUMMARY_PATH.write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
+        return {
+            "status": "ok",
+            "date": day,
+            "added": 0,
+            "updated": 0,
+            "ignoredFutureDate": True,
+            "message": "Historique ignoré : match futur / demain non enregistré.",
+            "historyPath": str(HISTORY_PATH),
+            "summaryPath": str(SUMMARY_PATH),
+        }
+
     matches = result.get("matches") if isinstance(result, dict) else None
 
     if not isinstance(matches, list):
@@ -234,12 +347,18 @@ def record_result_json(result: Dict[str, Any], target_day: Optional[str] = None)
             "updated": 0,
         }
 
-    history = load_history()
+    history, cleanup_info = sanitize_history_rows(load_history())
     by_id = {str(row.get("id", "")): row for row in history if row.get("id")}
+    by_unique = {
+        history_match_key(str(row.get("sourcePlayerA") or ""), str(row.get("sourcePlayerB") or ""), str(row.get("predictedWinner") or "")): row
+        for row in history
+        if row.get("sourcePlayerA") and row.get("sourcePlayerB") and row.get("predictedWinner")
+    }
 
     added = 0
     updated = 0
     ignored = 0
+    ignored_duplicates = 0
 
     for match in matches:
         if not isinstance(match, dict):
@@ -260,8 +379,21 @@ def record_result_json(result: Dict[str, Any], target_day: Optional[str] = None)
             ignored += 1
             continue
 
-        row_id = match_id(day, source_a, source_b, predicted)
-        old = by_id.get(row_id, {})
+        unique_key = history_match_key(source_a, source_b, predicted)
+        existing_same_match = by_unique.get(unique_key)
+
+        if existing_same_match and existing_same_match.get("result") in {"win", "loss"}:
+            # Le même match est déjà réglé : ne jamais recréer un pending.
+            ignored_duplicates += 1
+            continue
+
+        if existing_same_match:
+            # Même match déjà pending : on met à jour la ligne existante au lieu de créer un doublon.
+            row_id = str(existing_same_match.get("id") or match_id(day, source_a, source_b, predicted))
+            old = existing_same_match
+        else:
+            row_id = match_id(day, source_a, source_b, predicted)
+            old = by_id.get(row_id, {})
 
         row = {
             "id": row_id,
@@ -290,9 +422,11 @@ def record_result_json(result: Dict[str, Any], target_day: Optional[str] = None)
                 row["realWinner"] = by_id[row_id].get("realWinner", "")
                 row["settledAt"] = by_id[row_id].get("settledAt", "")
             by_id[row_id] = row
+            by_unique[unique_key] = row
             updated += 1
         else:
             by_id[row_id] = row
+            by_unique[unique_key] = row
             added += 1
 
     save_history(list(by_id.values()))
@@ -305,6 +439,8 @@ def record_result_json(result: Dict[str, Any], target_day: Optional[str] = None)
         "added": added,
         "updated": updated,
         "ignoredNonPremium": ignored,
+        "ignoredDuplicates": ignored_duplicates,
+        "cleanup": cleanup_info,
         "historyPath": str(HISTORY_PATH),
         "summaryPath": str(SUMMARY_PATH),
     }
@@ -907,7 +1043,7 @@ def settle_flashscore() -> Dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 def stats_for_period(rows: List[Dict[str, Any]], period_days: Optional[int]) -> Dict[str, Any]:
-    today = date.today()
+    today = current_paris_date()
     selected: List[Dict[str, Any]] = []
 
     for row in rows:
@@ -962,8 +1098,12 @@ def stats_for_period(rows: List[Dict[str, Any]], period_days: Optional[int]) -> 
     }
 
 
-def build_summary() -> Dict[str, Any]:
-    rows = load_history()
+def build_summary(write_cleaned: bool = True) -> Dict[str, Any]:
+    rows_raw = load_history()
+    rows, cleanup_info = sanitize_history_rows(rows_raw)
+
+    if write_cleaned and cleanup_info.get("removedFutureRows", 0) + cleanup_info.get("removedDuplicateRows", 0) > 0:
+        save_history(rows)
 
     by_day: Dict[str, Dict[str, Any]] = {}
 
@@ -1037,6 +1177,7 @@ def build_summary() -> Dict[str, Any]:
         "status": "ok",
         "historyPath": str(HISTORY_PATH),
         "summaryPath": str(SUMMARY_PATH),
+        "cleanup": cleanup_info,
         "summary": {
             "day": stats_for_period(rows, 1),
             "week": stats_for_period(rows, 7),
