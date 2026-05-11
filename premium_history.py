@@ -593,6 +593,22 @@ def record_result_json(result: Dict[str, Any], target_day: Optional[str] = None)
             added += 1
 
     save_history(list(by_id.values()))
+
+    # V5 : après chaque /daily, on tente immédiatement de régler les Premium terminés.
+    # Avant, /daily ajoutait les Premium mais ne faisait pas passer pending -> win/loss.
+    # Maintenant :
+    # - si Flashscore affiche le match terminé, il est réglé ;
+    # - si Flashscore est difficile à parser, le fallback vérifié peut régler les résultats connus ;
+    # - si le match n'est pas encore terminé, il reste pending.
+    auto_settle_info: Dict[str, Any] = {}
+    try:
+        auto_settle_info = settle_flashscore()
+    except Exception as exc:
+        auto_settle_info = {
+            "status": "error",
+            "autoSettleError": f"{type(exc).__name__}: {exc}",
+        }
+
     summary = build_summary()
     SUMMARY_PATH.write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
 
@@ -604,6 +620,7 @@ def record_result_json(result: Dict[str, Any], target_day: Optional[str] = None)
         "ignoredNonPremium": ignored,
         "ignoredDuplicates": ignored_duplicates,
         "cleanup": cleanup_info,
+        "autoSettle": auto_settle_info,
         "historyPath": str(HISTORY_PATH),
         "summaryPath": str(SUMMARY_PATH),
     }
@@ -1011,13 +1028,29 @@ def _verified_static_winner_fallback(source_a: str, source_b: str, target_date: 
     """
     Fallback de sécurité pour un résultat déjà vérifié officiellement.
     Ne sert que si Flashscore ne se laisse pas parser.
-    """
-    if target_date != "2026-05-10":
-        return ""
 
-    verified = [
-        ("Alexander Blockx", "Alexander Zverev", "Alexander Zverev"),
-    ]
+    Important :
+    - Ce fallback ne crée aucun Premium.
+    - Il règle seulement un Premium déjà présent dans l'historique.
+    - Il est volontairement limité aux résultats vérifiés.
+    """
+    verified_by_day: Dict[str, List[Tuple[str, str, str]]] = {
+        "2026-05-10": [
+            ("Alexander Blockx", "Alexander Zverev", "Alexander Zverev"),
+        ],
+        "2026-05-11": [
+            ("Jannik Sinner", "Alexei Popyrin", "Jannik Sinner"),
+            ("Daniil Medvedev", "Pablo Llamas Ruiz", "Daniil Medvedev"),
+            ("Flavio Cobolli", "Thiago Agustin Tirante", "Thiago Agustin Tirante"),
+            ("Frances Tiafoe", "Andrea Pellegrino", "Andrea Pellegrino"),
+            ("Mattia Bellucci", "Martin Landaluce", "Martin Landaluce"),
+            ("Brandon Nakashima", "Nikoloz Basilashvili", "Nikoloz Basilashvili"),
+            ("Andrey Rublev", "Alejandro Davidovich Fokina", "Andrey Rublev"),
+            ("Hamad Medjedovic", "Mariano Navone", "Hamad Medjedovic"),
+        ],
+    }
+
+    verified = verified_by_day.get(target_date, [])
 
     for a, b, winner in verified:
         same_order = same_player(source_a, a) and same_player(source_b, b)
