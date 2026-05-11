@@ -353,45 +353,84 @@ def _clean_atp_oop_player_name(raw: str) -> str:
 
 def _static_official_singles_pairs_for_verified_day(target_day: date) -> Set[Tuple[str, str]]:
     """
-    Sécurité vérifiée manuellement sur ATP article :
-    ORDER OF PLAY - SUNDAY, 10 MAY 2026, Rome.
+    Fallback de sécurité vérifié ATP Order Of Play.
 
-    Utilisé seulement si la page ATP article ne peut pas être parsée sur Railway.
-    Ne sert pas à créer des matchs, seulement à filtrer les faux simples issus des doubles.
+    Important :
+    - Ne crée aucun match.
+    - Sert seulement à filtrer les lignes déjà extraites du daily-schedule.
+    - Évite que les paires de double deviennent de faux matchs de simple.
     """
-    if target_day.isoformat() != "2026-05-10":
-        return set()
 
-    official_names = [
-        ("Alexander Blockx", "Alexander Zverev"),
-        ("Lorenzo Musetti", "Francisco Cerundolo"),
-        ("Matteo Arnaldi", "Rafael Jodar"),
-        ("Casper Ruud", "Jiri Lehecka"),
-        ("Tommy Paul", "Luciano Darderi"),
-        ("Karen Khachanov", "Botic van de Zandschulp"),
-        ("Learner Tien", "Alexander Bublik"),
-        ("Ugo Humbert", "Dino Prizmic"),
-    ]
+    official_by_day: Dict[str, List[Tuple[str, str]]] = {
+        "2026-05-10": [
+            ("Alexander Blockx", "Alexander Zverev"),
+            ("Lorenzo Musetti", "Francisco Cerundolo"),
+            ("Matteo Arnaldi", "Rafael Jodar"),
+            ("Casper Ruud", "Jiri Lehecka"),
+            ("Tommy Paul", "Luciano Darderi"),
+            ("Karen Khachanov", "Botic van de Zandschulp"),
+            ("Learner Tien", "Alexander Bublik"),
+            ("Ugo Humbert", "Dino Prizmic"),
+        ],
+        "2026-05-11": [
+            ("Jannik Sinner", "Alexei Popyrin"),
+            ("Flavio Cobolli", "Thiago Agustin Tirante"),
+            ("Mattia Bellucci", "Martin Landaluce"),
+            ("Frances Tiafoe", "Andrea Pellegrino"),
+            ("Pablo Llamas Ruiz", "Daniil Medvedev"),
+            ("Andrey Rublev", "Alejandro Davidovich Fokina"),
+            ("Brandon Nakashima", "Nikoloz Basilashvili"),
+            ("Mariano Navone", "Hamad Medjedovic"),
+        ],
+    }
 
+    official_names = official_by_day.get(target_day.isoformat(), [])
     return {unordered_pair_key(a, b) for a, b in official_names}
 
 
+def _target_day_label_variants(target_day: date) -> List[str]:
+    """
+    Exemples acceptés :
+    - 11 may 2026
+    - may 11 2026
+    - monday, 11 may 2026
+    """
+    day = target_day.day
+    year = target_day.year
+    variants: List[str] = []
+
+    for month_name in _month_name_variants(target_day.month):
+        variants.append(f"{day} {month_name} {year}".lower())
+        variants.append(f"{month_name} {day} {year}".lower())
+
+    return variants
+
+
+def _line_mentions_target_day_label(line: str, target_day: date) -> bool:
+    low = normalize_space(line).lower()
+    low = re.sub(r"[,.-]+", " ", low)
+    low = normalize_space(low)
+
+    for variant in _target_day_label_variants(target_day):
+        v = re.sub(r"[,.-]+", " ", variant.lower())
+        v = normalize_space(v)
+        if v in low:
+            return True
+
+    return False
+
 def _fetch_official_atp_article_singles_pairs(session, target_day: date) -> Tuple[Set[Tuple[str, str]], List[str]]:
     """
-    Filtre officiel ATP pour le cas où daily-schedule mélange les doubles.
+    Filtre officiel ATP Order Of Play.
 
     Important :
     - le daily-schedule reste la source de création des lignes ;
     - l'article ATP ne sert qu'à FILTRER les lignes déjà trouvées ;
-    - les lignes ATP contenant "/" sont des doubles et sont refusées.
+    - les lignes ATP contenant "/" sont des doubles et sont refusées ;
+    - les lignes WTA sont ignorées.
     """
     audit: List[str] = []
     pairs: Set[Tuple[str, str]] = set()
-
-    # Filtre limité au cas vérifié aujourd'hui.
-    if target_day.isoformat() != "2026-05-10":
-        audit.append("official_oop_filter_status=skipped_not_verified_day")
-        return pairs, audit
 
     url = "https://www.atptour.com/en/news/rome-2026-schedule"
 
@@ -409,7 +448,7 @@ def _fetch_official_atp_article_singles_pairs(session, target_day: date) -> Tupl
         for line in lines:
             low = line.lower()
 
-            if "order of play" in low and "10 may 2026" in low:
+            if "order of play" in low and _line_mentions_target_day_label(line, target_day):
                 in_section = True
                 continue
 
@@ -422,7 +461,7 @@ def _fetch_official_atp_article_singles_pairs(session, target_day: date) -> Tupl
             if not line.startswith("ATP -"):
                 continue
 
-            # La preuve officielle : un slash dans une ligne ATP = double.
+            # Preuve officielle : une ligne ATP avec "/" = double.
             if "/" in line:
                 continue
 
@@ -440,6 +479,7 @@ def _fetch_official_atp_article_singles_pairs(session, target_day: date) -> Tupl
 
         audit.append("official_oop_filter_status=article_parsed")
         audit.append(f"official_oop_filter_url={url}")
+        audit.append(f"official_oop_target_day={target_day.isoformat()}")
         audit.append(f"official_oop_singles_pairs_from_article={len(pairs)}")
 
     except Exception as exc:
@@ -453,7 +493,6 @@ def _fetch_official_atp_article_singles_pairs(session, target_day: date) -> Tupl
             audit.append(f"official_oop_singles_pairs_static={len(pairs)}")
 
     return pairs, audit
-
 
 def _apply_official_atp_singles_filter(
     rows: List[Dict[str, str]],
@@ -1620,7 +1659,7 @@ def main() -> int:
     audit.append(f"mode={MODE}")
     audit.append("source_policy=ATP_DAILY_SCHEDULE_NO_FORCED_VETO_ONLY")
     audit.append("official_oop_singles_filter=atp_article_validation_on")
-    audit.append("strict_date_policy=trim_to_first_16_if_more_than_16")
+    audit.append("strict_date_policy=official_oop_filter_then_trim_safety")
     audit.append("veto_policy=no_forced_tournament_wins_without_real_atp_evidence")
     audit.append("missing_points_policy=keep_match_replace_missing_points_with_1")
     audit.append("no_draw_pending_for_day_matches=true")
