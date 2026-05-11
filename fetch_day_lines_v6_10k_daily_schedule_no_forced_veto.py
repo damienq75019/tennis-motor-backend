@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Tennis Motor - Fetch daily lines V6.10K DAILY SCHEDULE NO FORCED VETO
+Tennis Motor - Fetch daily lines V6.10L DAILY SCHEDULE ATP SINGLES STRICT
 
-Objectif V6.10K :
+Objectif V6.10L :
 - Source officielle UNIQUE des matchs du jour = pages ATP daily-schedule.
 - Ne plus fabriquer la liste du jour depuis les draws pending ou les articles ATP.
 - Exclure doubles / blocs parasites / anciennes paires.
@@ -45,7 +45,7 @@ BASE_MODULE_CANDIDATES = [
     "fetch_day_lines_v6_5_results_context_safe",
 ]
 
-MODE = "V6_10K_DAILY_SCHEDULE_NO_FORCED_VETO"
+MODE = "V6_10L_ATP_SINGLES_STRICT"
 PAYLOAD_LATEST_PATH = Path("output") / "payload_latest.json"
 
 
@@ -500,10 +500,19 @@ def _apply_official_atp_singles_filter(
     target_day: date,
 ) -> Tuple[List[Dict[str, str]], List[str]]:
     """
-    Applique un filtre de validation officielle ATP sur les paires déjà extraites.
+    V6.10L STRICT.
 
-    Résultat attendu pour 2026-05-10 Rome :
-    15 lignes brutes -> 8 simples ATP officiels.
+    Règle de sécurité :
+    - le daily-schedule peut encore mélanger simples + doubles selon le rendu HTML ;
+    - donc aucune ligne n'est acceptée sans validation ATP officielle du jour ;
+    - si la validation officielle n'est pas disponible, on retourne 0 match
+      au lieu d'inventer ou de laisser passer des doubles.
+
+    Important :
+    - l'article ATP / Order Of Play ne crée pas de match ;
+    - il sert uniquement à valider les paires déjà extraites ;
+    - les lignes ATP contenant "/" sont rejetées comme doubles dans le parseur OOP ;
+    - les lignes WTA sont ignorées parce qu'on ne garde que les lignes commençant par "ATP -".
     """
     audit: List[str] = []
     before = len(rows)
@@ -512,10 +521,16 @@ def _apply_official_atp_singles_filter(
     audit.extend(official_audit)
 
     if not official_pairs:
-        audit.append("official_oop_filter_applied=false")
+        removed = [f"{row.get('playerA', '')} vs {row.get('playerB', '')}" for row in rows]
+        audit.append("official_oop_filter_applied=true")
+        audit.append("official_oop_filter_strict_mode=true")
+        audit.append("official_oop_filter_reason=no_official_atp_singles_pairs_found")
         audit.append(f"official_oop_filter_rows_before={before}")
-        audit.append(f"official_oop_filter_rows_after={before}")
-        return rows, audit
+        audit.append("official_oop_filter_rows_after=0")
+        audit.append(f"official_oop_filter_removed_rows={len(removed)}")
+        for item in removed[:80]:
+            audit.append(f"[STRICT ATP FILTER REMOVE - UNVERIFIED] {item}")
+        return [], audit
 
     kept: List[Dict[str, str]] = []
     removed: List[str] = []
@@ -523,22 +538,30 @@ def _apply_official_atp_singles_filter(
     for row in rows:
         player_a = row.get("playerA", "")
         player_b = row.get("playerB", "")
+
+        # Sécurité absolue : si un champ contient "/" ou "double", on refuse.
+        joined = f"{player_a} {player_b} {row.get('evidence', '')}"
+        if _is_doubles_marker(joined):
+            removed.append(f"{player_a} vs {player_b} | reason=doubles_marker")
+            continue
+
         key = unordered_pair_key(player_a, player_b)
 
         if key in official_pairs:
             kept.append(row)
         else:
-            removed.append(f"{player_a} vs {player_b}")
+            removed.append(f"{player_a} vs {player_b} | reason=not_in_official_atp_singles_oop")
 
     audit.append("official_oop_filter_applied=true")
+    audit.append("official_oop_filter_strict_mode=true")
     audit.append(f"official_oop_filter_rows_before={before}")
     audit.append(f"official_oop_filter_rows_after={len(kept)}")
     audit.append(f"official_oop_filter_removed_rows={len(removed)}")
 
-    for row in kept[:30]:
+    for row in kept[:40]:
         audit.append(f"[OFFICIAL ATP SINGLES KEEP] {row.get('playerA')} vs {row.get('playerB')}")
 
-    for item in removed[:80]:
+    for item in removed[:120]:
         audit.append(f"[OFFICIAL ATP FILTER REMOVE] {item}")
 
     return kept, audit
@@ -1536,7 +1559,7 @@ def build_payload_items_direct_from_schedule_rows(
 
         player_b_is_qualifier = _player_b_is_q_from_evidence(player_b, evidence)
 
-        # V6.10K :
+        # V6.10L :
         # Ne plus forcer un veto automatique sur tous les matchs de terre battue.
         # Ancienne règle supprimée :
         #   if strict_unknown_veto and surface == "Clay": player_b_tournament_wins = 2
@@ -1657,13 +1680,13 @@ def main() -> int:
     audit.append(f"target_label={args.target_day}")
     audit.append(f"backend_url={args.backend_url}")
     audit.append(f"mode={MODE}")
-    audit.append("source_policy=ATP_DAILY_SCHEDULE_NO_FORCED_VETO_ONLY")
-    audit.append("official_oop_singles_filter=atp_article_validation_on")
+    audit.append("source_policy=ATP_DAILY_SCHEDULE_PLUS_OFFICIAL_ATP_SINGLES_VALIDATION_STRICT")
+    audit.append("official_oop_singles_filter=strict_required_when_available_else_empty")
     audit.append("strict_date_policy=official_oop_filter_then_trim_safety")
     audit.append("veto_policy=no_forced_tournament_wins_without_real_atp_evidence")
     audit.append("missing_points_policy=keep_match_replace_missing_points_with_1")
     audit.append("no_draw_pending_for_day_matches=true")
-    audit.append("no_article_schedule_for_day_matches=true")
+    audit.append("article_schedule_filter_only=true")
     audit.append(f"strict_unknown_veto={str(strict_unknown_veto).lower()}")
     audit.append(f"include_challenger={str(args.include_challenger).lower()}")
     audit.append(f"minimal_context_only={str(args.minimal_context_only).lower()}")
