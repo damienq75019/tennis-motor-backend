@@ -406,6 +406,74 @@ def infer_target_day(result: Dict[str, Any], fallback: Optional[str] = None) -> 
     return fallback or today_iso()
 
 
+def cleanup_pending_for_day_against_current_premiums(
+    history: List[Dict[str, Any]],
+    day: str,
+    matches: List[Any],
+) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    """
+    Nettoyage anti-pollution historique.
+
+    Cas corrigé :
+    - une extraction précédente a enregistré de faux Premium pending
+      issus de doubles ou de matchs parasites ;
+    - après correction du /daily, on relance l'analyse ;
+    - les pending du même jour qui ne sont plus Premium dans le résultat courant
+      sont supprimés ;
+    - les résultats déjà réglés win/loss ne sont jamais supprimés.
+
+    Important :
+    - ne touche pas au match gagné d'hier ;
+    - ne touche pas aux lignes win/loss ;
+    - ne supprime que les pending du jour ciblé.
+    """
+    current_premium_keys: Set[str] = set()
+
+    for match in matches:
+        if not isinstance(match, dict):
+            continue
+
+        if not is_premium_jouable(match):
+            continue
+
+        predicted = str(match.get("playerA") or match.get("player_a") or "")
+        opponent = str(match.get("playerB") or match.get("player_b") or "")
+        source_a = str(match.get("sourcePlayerA") or predicted)
+        source_b = str(match.get("sourcePlayerB") or opponent)
+
+        if not predicted or not opponent:
+            continue
+
+        current_premium_keys.add(history_match_key(source_a, source_b, predicted))
+
+    cleaned: List[Dict[str, Any]] = []
+    removed: List[str] = []
+
+    for row in history:
+        row_day = str(row.get("date") or "")
+        row_status = str(row.get("status") or "")
+        row_result = str(row.get("result") or "pending")
+
+        if row_day == day and row_status == "PREMIUM" and row_result == "pending":
+            source_a = str(row.get("sourcePlayerA") or "")
+            source_b = str(row.get("sourcePlayerB") or "")
+            predicted = str(row.get("predictedWinner") or "")
+
+            key = history_match_key(source_a, source_b, predicted)
+
+            if key not in current_premium_keys:
+                removed.append(f"{source_a} vs {source_b} | pick={predicted}")
+                continue
+
+        cleaned.append(row)
+
+    return cleaned, {
+        "removedStalePendingRows": len(removed),
+        "currentPremiumRows": len(current_premium_keys),
+        "removedStalePendingSample": removed[:20],
+    }
+
+
 def record_result_json(result: Dict[str, Any], target_day: Optional[str] = None) -> Dict[str, Any]:
     day = infer_target_day(result, target_day)
 
@@ -437,6 +505,12 @@ def record_result_json(result: Dict[str, Any], target_day: Optional[str] = None)
 
     restore_verified_if_history_empty()
     history, cleanup_info = sanitize_history_rows(load_history())
+
+    # Nettoyage sécurité : supprime les anciens pending du même jour
+    # qui ne sont plus Premium après correction du /daily.
+    history, stale_pending_info = cleanup_pending_for_day_against_current_premiums(history, day, matches)
+    cleanup_info.update(stale_pending_info)
+
     by_id = {str(row.get("id", "")): row for row in history if row.get("id")}
     by_unique = {
         history_match_key(str(row.get("sourcePlayerA") or ""), str(row.get("sourcePlayerB") or ""), str(row.get("predictedWinner") or "")): row
