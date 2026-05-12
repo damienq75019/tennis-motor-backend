@@ -1905,6 +1905,8 @@ async def root() -> Dict[str, Any]:
             "/daily?day=today",
             "/daily?day=tomorrow",
             "/predictions?day=today",
+            "/audit?day=today",
+            "/debug-audit?day=today",
         ],
     }
 
@@ -2020,6 +2022,20 @@ async def audit(day: str = Query("today")) -> Dict[str, Any]:
         "dailyScript": DAILY_SCRIPT_NAME,
         "audit": text,
     }
+
+
+@app.get("/debug-audit")
+async def debug_audit(day: str = Query("today")) -> Dict[str, Any]:
+    """
+    Alias sécurisé de /audit.
+
+    Objectif :
+    - lire le même fichier audit que /audit ;
+    - ne pas relancer l'analyse ;
+    - ne pas modifier l'historique ;
+    - ne pas toucher au moteur.
+    """
+    return await audit(day=day)
 
 
 if __name__ == "__main__":
