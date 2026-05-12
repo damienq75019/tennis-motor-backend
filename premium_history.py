@@ -75,8 +75,8 @@ FLASHSCORE_TENNIS_URL = "https://www.flashscore.fr/tennis/"
 
 # Mise fixe utilisateur : 100 euros par match Premium.
 STAKE_EUR = 100.0
-EURO_AXIS_MIN = -10000.0
-EURO_AXIS_MAX = 10000.0
+EURO_AXIS_MIN = -2000.0
+EURO_AXIS_MAX = 2000.0
 
 
 if hasattr(sys.stdout, "reconfigure"):
