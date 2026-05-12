@@ -1,15 +1,14 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Tennis Motor - Fetch daily lines V6.10M DAILY SCHEDULE ATP SINGLES SAFE
+Tennis Motor - Fetch daily lines V6.10L DAILY SCHEDULE ATP SINGLES STRICT
 
-Objectif V6.10M :
+Objectif V6.10L :
 - Source officielle UNIQUE des matchs du jour = pages ATP daily-schedule.
 - Ne plus fabriquer la liste du jour depuis les draws pending ou les articles ATP.
 - Exclure doubles / blocs parasites / anciennes paires.
 - Garder le moteur existant inchangé.
 - Garder la récupération points ATP existante de la V6.7.
-- Points ATP introuvables = match bloqué, jamais remplacé par 1.
 - Garder le contexte draw/results seulement pour surface + veto Q/wins, jamais pour créer les matchs.
 
 Utilisation :
@@ -46,7 +45,7 @@ BASE_MODULE_CANDIDATES = [
     "fetch_day_lines_v6_5_results_context_safe",
 ]
 
-MODE = "V6_10M_ATP_DAILY_SAFE_NO_FAKE_POINTS"
+MODE = "V6_10L_ATP_SINGLES_STRICT"
 PAYLOAD_LATEST_PATH = Path("output") / "payload_latest.json"
 
 
@@ -522,46 +521,16 @@ def _apply_official_atp_singles_filter(
     audit.extend(official_audit)
 
     if not official_pairs:
-        # V6.10M : ne plus vider toute la journée si l'article ATP Order Of Play
-        # n'est pas trouvable / pas encore mis à jour / change de format.
-        # Le daily-schedule reste la source des matchs. On applique seulement
-        # une sécurité locale anti-WTA / anti-doubles au lieu de retourner 0.
-        kept_without_oop: List[Dict[str, str]] = []
-        removed_without_oop: List[str] = []
-
-        for row in rows:
-            player_a = row.get("playerA", "")
-            player_b = row.get("playerB", "")
-            joined = f"{player_a} {player_b} {row.get('evidence', '')}"
-
-            if _is_wta_marker(joined):
-                removed_without_oop.append(f"{player_a} vs {player_b} | reason=wta_marker_without_oop")
-                continue
-
-            if _is_doubles_marker(joined):
-                removed_without_oop.append(f"{player_a} vs {player_b} | reason=doubles_marker_without_oop")
-                continue
-
-            if not is_name_like(player_a) or not is_name_like(player_b):
-                removed_without_oop.append(f"{player_a} vs {player_b} | reason=bad_name_without_oop")
-                continue
-
-            kept_without_oop.append(row)
-
-        audit.append("official_oop_filter_applied=false")
-        audit.append("official_oop_filter_strict_mode=false")
-        audit.append("official_oop_filter_reason=no_official_atp_singles_pairs_found_keep_daily_schedule_after_local_safety")
+        removed = [f"{row.get('playerA', '')} vs {row.get('playerB', '')}" for row in rows]
+        audit.append("official_oop_filter_applied=true")
+        audit.append("official_oop_filter_strict_mode=true")
+        audit.append("official_oop_filter_reason=no_official_atp_singles_pairs_found")
         audit.append(f"official_oop_filter_rows_before={before}")
-        audit.append(f"official_oop_filter_rows_after={len(kept_without_oop)}")
-        audit.append(f"official_oop_filter_removed_rows={len(removed_without_oop)}")
-
-        for row in kept_without_oop[:80]:
-            audit.append(f"[DAILY KEEP WITHOUT OOP] {row.get('playerA')} vs {row.get('playerB')}")
-
-        for item in removed_without_oop[:120]:
-            audit.append(f"[DAILY REMOVE WITHOUT OOP] {item}")
-
-        return kept_without_oop, audit
+        audit.append("official_oop_filter_rows_after=0")
+        audit.append(f"official_oop_filter_removed_rows={len(removed)}")
+        for item in removed[:80]:
+            audit.append(f"[STRICT ATP FILTER REMOVE - UNVERIFIED] {item}")
+        return [], audit
 
     kept: List[Dict[str, str]] = []
     removed: List[str] = []
@@ -1308,366 +1277,6 @@ def extract_pairs_from_daily_schedule_html(html: str, source_url: str, display_m
 
     return fallback_pairs, audit
 
-# ---------------------------------------------------------------------------
-# Fallback sécurisé Flashscore ATP SIMPLE uniquement
-# ---------------------------------------------------------------------------
-
-FLASHSCORE_TENNIS_URL = "https://www.flashscore.fr/tennis/"
-
-
-def _flashscore_header_is_atp_singles(header: str) -> bool:
-    """
-    Garde uniquement les sections ATP simples.
-    Refuse WTA, doubles, juniors, exhibitions.
-    """
-    h = normalize_space(header).lower()
-
-    if not h:
-        return False
-
-    if "wta" in h or "women" in h or "femmes" in h:
-        return False
-
-    if "double" in h or "doubles" in h:
-        return False
-
-    if "exhibition" in h or "exhibition" in h or "exhibition" in h:
-        return False
-
-    has_atp = "atp" in h
-    has_singles = "simple" in h or "singles" in h
-
-    return has_atp and has_singles
-
-
-def _clean_flashscore_player_name(raw: str) -> str:
-    value = normalize_space(raw or "")
-    value = re.sub(r"\([^)]*\)", " ", value)
-    value = re.sub(r"\[[^\]]*\]", " ", value)
-    return clean_name(normalize_space(value))
-
-
-def _build_flashscore_alias_map(display_map: Dict[str, str]) -> Dict[str, str]:
-    aliases: Dict[str, str] = {}
-
-    for full in (display_map or {}).values():
-        full_name = clean_name(str(full or ""))
-        if not full_name or not is_name_like(full_name):
-            continue
-
-        parts = full_name.split()
-        if len(parts) < 2:
-            continue
-
-        first = canonical_name(parts[0])
-        last = canonical_name(parts[-1])
-        surname = canonical_name(" ".join(parts[1:]))
-
-        if not first or not last:
-            continue
-
-        initial = first[:1]
-
-        keys = {
-            canonical_name(full_name),
-            f"{initial} {surname}",
-            f"{initial}. {surname}",
-            f"{surname} {initial}",
-            f"{surname} {initial}.",
-            f"{last} {initial}",
-            f"{last} {initial}.",
-        }
-
-        for key in keys:
-            if key and key not in aliases:
-                aliases[key] = full_name
-
-    return aliases
-
-
-def _resolve_flashscore_player_name(raw: str, alias_map: Dict[str, str]) -> str:
-    name = _clean_flashscore_player_name(raw)
-    key = canonical_name(name)
-
-    if key in alias_map:
-        return alias_map[key]
-
-    # Flashscore fréquent : "Sinner J."
-    m = re.match(r"^(.+?)\s+([A-Za-zÀ-ÿ])\.?$", name)
-    if m:
-        surname = canonical_name(m.group(1))
-        initial = canonical_name(m.group(2))[:1]
-        for candidate in (f"{surname} {initial}", f"{surname} {initial}."):
-            if candidate in alias_map:
-                return alias_map[candidate]
-
-    # Autre forme : "J. Sinner"
-    m = re.match(r"^([A-Za-zÀ-ÿ])\.?\s+(.+)$", name)
-    if m:
-        initial = canonical_name(m.group(1))[:1]
-        surname = canonical_name(m.group(2))
-        for candidate in (f"{initial} {surname}", f"{initial}. {surname}"):
-            if candidate in alias_map:
-                return alias_map[candidate]
-
-    return name
-
-
-def _flashscore_surface_from_header(header: str) -> str:
-    h = normalize_space(header).lower()
-
-    if "clay" in h or "terre" in h:
-        return "Clay"
-    if "grass" in h or "gazon" in h:
-        return "Grass"
-    if "hard" in h or "dur" in h:
-        return "Hard"
-
-    if any(x in h for x in ["rome", "madrid", "monte", "barcelona", "munich", "geneva", "hamburg"]):
-        return "Clay"
-
-    return "Hard"
-
-
-def _flashscore_extract_matches_js() -> str:
-    return r"""
-() => {
-    const clean = (s) => (s || '').replace(/\s+/g, ' ').trim();
-    const rows = [];
-    let currentHeader = '';
-
-    const nodes = Array.from(document.querySelectorAll(
-        '.event__header, [class*="event__header"], .event__match, [id^="g_2_"], [id^="g_1_"]'
-    ));
-
-    for (const node of nodes) {
-        const cls = node.className ? String(node.className) : '';
-        const id = node.id || '';
-
-        if (cls.includes('event__header')) {
-            currentHeader = clean(node.innerText || node.textContent || '');
-            continue;
-        }
-
-        const isMatch = cls.includes('event__match') || id.startsWith('g_2_') || id.startsWith('g_1_');
-        if (!isMatch) continue;
-
-        const homeEl = node.querySelector('[class*="event__participant--home"]');
-        const awayEl = node.querySelector('[class*="event__participant--away"]');
-
-        const home = clean(homeEl ? homeEl.textContent : '');
-        const away = clean(awayEl ? awayEl.textContent : '');
-        const raw = clean(node.innerText || node.textContent || '');
-
-        if (home && away) {
-            rows.push({
-                competition: currentHeader,
-                playerA: home,
-                playerB: away,
-                raw: raw
-            });
-        }
-    }
-
-    return rows;
-}
-"""
-
-
-def _click_flashscore_target_day(page: Any, target_day: date, audit: List[str]) -> None:
-    """
-    Flashscore ouvre aujourd'hui par défaut.
-    Pour tomorrow, on tente le bouton lendemain.
-    Pour today, on ne touche pas.
-    """
-    try:
-        today = base.parse_target_day("today")
-    except Exception:
-        today = date.today()
-
-    delta = (target_day - today).days
-
-    if delta == 0:
-        audit.append("flashscore_day_navigation=today_default")
-        return
-
-    # On limite volontairement à demain/hier pour éviter les mauvais clics.
-    if delta == 1:
-        labels = ["Jour suivant", "Demain", "Next day", "Tomorrow"]
-    elif delta == -1:
-        labels = ["Jour précédent", "Hier", "Previous day", "Yesterday"]
-    else:
-        audit.append(f"flashscore_day_navigation=unsupported_delta_{delta}")
-        return
-
-    for label in labels:
-        try:
-            page.get_by_title(label, exact=False).first.click(timeout=1800)
-            page.wait_for_timeout(1800)
-            audit.append(f"flashscore_day_navigation=clicked_title_{label}")
-            return
-        except Exception:
-            pass
-
-        try:
-            page.get_by_label(label, exact=False).first.click(timeout=1800)
-            page.wait_for_timeout(1800)
-            audit.append(f"flashscore_day_navigation=clicked_label_{label}")
-            return
-        except Exception:
-            pass
-
-        try:
-            page.get_by_text(label, exact=False).first.click(timeout=1800)
-            page.wait_for_timeout(1800)
-            audit.append(f"flashscore_day_navigation=clicked_text_{label}")
-            return
-        except Exception:
-            pass
-
-    audit.append(f"flashscore_day_navigation=not_clicked_delta_{delta}")
-
-
-def fetch_flashscore_atp_singles_fallback_rows(
-    target_day: date,
-    display_map: Dict[str, str],
-) -> Tuple[List[Dict[str, str]], List[str]]:
-    """
-    Secours final si ATP daily-schedule + validation stricte donnent 0.
-
-    Règle :
-    - Flashscore n'est utilisé que quand ATP donne 0.
-    - On garde uniquement les sections ATP - SIMPLE / ATP - SINGLES.
-    - On refuse WTA et doubles.
-    - On refuse les noms avec "/" pour ne pas prendre les équipes.
-    """
-    audit: List[str] = []
-    rows: List[Dict[str, str]] = []
-    alias_map = _build_flashscore_alias_map(display_map or {})
-
-    try:
-        from playwright.sync_api import sync_playwright
-    except Exception as exc:
-        audit.append(f"flashscore_fallback_status=playwright_import_failed | {type(exc).__name__}: {exc}")
-        return rows, audit
-
-    try:
-        with sync_playwright() as p:
-            browser = p.chromium.launch(
-                headless=True,
-                args=[
-                    "--no-sandbox",
-                    "--disable-dev-shm-usage",
-                    "--disable-blink-features=AutomationControlled",
-                ],
-            )
-
-            context = browser.new_context(
-                locale="fr-FR",
-                timezone_id="Europe/Paris",
-                viewport={"width": 1365, "height": 2200},
-                user_agent=(
-                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                    "AppleWebKit/537.36 (KHTML, like Gecko) "
-                    "Chrome/124.0.0.0 Safari/537.36"
-                ),
-                extra_http_headers={"Accept-Language": "fr-FR,fr;q=0.9,en;q=0.8"},
-            )
-
-            page = context.new_page()
-            page.goto(FLASHSCORE_TENNIS_URL, wait_until="domcontentloaded", timeout=45000)
-
-            for label in ["J'accepte", "Tout refuser", "Accepter", "OK"]:
-                try:
-                    page.get_by_text(label, exact=False).first.click(timeout=1800)
-                    break
-                except Exception:
-                    pass
-
-            try:
-                page.wait_for_load_state("networkidle", timeout=12000)
-            except Exception:
-                pass
-
-            _click_flashscore_target_day(page, target_day, audit)
-
-            # Charge les blocs plus bas.
-            for _ in range(8):
-                try:
-                    page.mouse.wheel(0, 1800)
-                    page.wait_for_timeout(500)
-                except Exception:
-                    pass
-
-            raw_rows = page.evaluate(_flashscore_extract_matches_js())
-            browser.close()
-
-    except Exception as exc:
-        audit.append(f"flashscore_fallback_status=failed | {type(exc).__name__}: {exc}")
-        return rows, audit
-
-    seen: Set[Tuple[str, str]] = set()
-    rejected = 0
-
-    for item in raw_rows or []:
-        comp = normalize_space(str(item.get("competition") or ""))
-        raw_a = str(item.get("playerA") or "")
-        raw_b = str(item.get("playerB") or "")
-        raw = normalize_space(str(item.get("raw") or ""))
-
-        if not _flashscore_header_is_atp_singles(comp):
-            rejected += 1
-            continue
-
-        joined = normalize_space(f"{comp} {raw_a} {raw_b} {raw}")
-
-        if _is_wta_marker(joined) or _is_doubles_marker(joined):
-            rejected += 1
-            continue
-
-        player_a = _resolve_flashscore_player_name(raw_a, alias_map)
-        player_b = _resolve_flashscore_player_name(raw_b, alias_map)
-
-        if not player_a or not player_b:
-            rejected += 1
-            continue
-
-        if not is_name_like(player_a) or not is_name_like(player_b):
-            rejected += 1
-            continue
-
-        if canonical_name(player_a) == canonical_name(player_b):
-            rejected += 1
-            continue
-
-        key = unordered_pair_key(player_a, player_b)
-        if key in seen:
-            continue
-
-        seen.add(key)
-        rows.append(
-            {
-                "playerA": player_a,
-                "playerB": player_b,
-                "source": "Flashscore ATP Singles Fallback",
-                "sourceUrl": FLASHSCORE_TENNIS_URL,
-                "evidence": normalize_space(f"{comp} | {raw}")[:320],
-                "tournament": comp,
-                "surface": _flashscore_surface_from_header(comp),
-            }
-        )
-
-    audit.append("flashscore_fallback_status=ok")
-    audit.append(f"flashscore_fallback_raw_rows={len(raw_rows or [])}")
-    audit.append(f"flashscore_fallback_kept_atp_singles={len(rows)}")
-    audit.append(f"flashscore_fallback_rejected={rejected}")
-
-    for row in rows[:60]:
-        audit.append(f"[FLASHSCORE ATP SINGLES KEEP] {row.get('playerA')} vs {row.get('playerB')} | {row.get('evidence', '')}")
-
-    return rows, audit
-
-
 def build_daily_schedule_matches(session, target_day: date, include_challenger: bool, display_map: Optional[Dict[str, str]] = None) -> Tuple[List[Any], List[str], List[Dict[str, str]], Dict[str, Optional[str]]]:
     audit: List[str] = []
     schedule_urls = discover_daily_schedule_urls(session, include_challenger=include_challenger)
@@ -1721,25 +1330,6 @@ def build_daily_schedule_matches(session, target_day: date, include_challenger: 
 
     clean_rows, strict_date_audit = _strict_date_filter_rows(clean_rows, target_day)
     audit.extend(strict_date_audit)
-
-    # Fallback ajouté sans casser le reste du fichier fourni :
-    # si ATP strict retourne 0, on essaie Flashscore ATP SIMPLE uniquement.
-    # Jamais WTA, jamais doubles, jamais équipes avec "/".
-    if not clean_rows:
-        flash_rows, flash_audit = fetch_flashscore_atp_singles_fallback_rows(
-            target_day=target_day,
-            display_map=display_map or {},
-        )
-        audit.extend(flash_audit)
-        if flash_rows:
-            clean_rows = flash_rows
-            audit.append("daily_source_final=flashscore_atp_singles_fallback")
-            audit.append(f"daily_source_final_rows={len(clean_rows)}")
-        else:
-            audit.append("daily_source_final=empty_after_atp_strict_and_flashscore")
-            audit.append("daily_source_final_rows=0")
-    else:
-        audit.append("daily_source_final=atp_daily_schedule_strict")
 
     day_matches: List[Any] = []
 
@@ -1955,10 +1545,15 @@ def build_payload_items_direct_from_schedule_rows(
             missing_points.append(
                 f"{player_a} vs {player_b} | A_points={points_a} | B_points={points_b} | tournament={tournament}"
             )
-            # V6.10M : règle verrouillée utilisateur.
-            # Points ATP introuvables = match bloqué.
-            # Jamais de remplacement par 1, jamais de point inventé.
-            continue
+            # V6.10I :
+            # NE PLUS SUPPRIMER le match si un point ATP manque.
+            # On garde les 16 matchs ATP daily-schedule.
+            # Sécurité : un point manquant est remplacé par 1 pour éviter une division/logit impossible.
+            # L'audit garde la ligne [MISSING POINTS] pour correction ultérieure des alias.
+            if points_a <= 0:
+                points_a = 1
+            if points_b <= 0:
+                points_b = 1
 
         surface = _surface_for_row(row, surfaces_by_tournament)
 
@@ -2085,11 +1680,11 @@ def main() -> int:
     audit.append(f"target_label={args.target_day}")
     audit.append(f"backend_url={args.backend_url}")
     audit.append(f"mode={MODE}")
-    audit.append("source_policy=ATP_DAILY_SAFE_THEN_FLASHSCORE_ATP_SINGLES_FALLBACK")
-    audit.append("official_oop_singles_filter=use_if_available_keep_daily_if_oop_unavailable")
+    audit.append("source_policy=ATP_DAILY_SCHEDULE_PLUS_OFFICIAL_ATP_SINGLES_VALIDATION_STRICT")
+    audit.append("official_oop_singles_filter=strict_required_when_available_else_empty")
     audit.append("strict_date_policy=official_oop_filter_then_trim_safety")
     audit.append("veto_policy=no_forced_tournament_wins_without_real_atp_evidence")
-    audit.append("missing_points_policy=block_match_no_fake_points")
+    audit.append("missing_points_policy=keep_match_replace_missing_points_with_1")
     audit.append("no_draw_pending_for_day_matches=true")
     audit.append("article_schedule_filter_only=true")
     audit.append(f"strict_unknown_veto={str(strict_unknown_veto).lower()}")
@@ -2142,10 +1737,10 @@ def main() -> int:
         result_empty = {
             "matches": [],
             "summary": {
-                "totalRows": len(schedule_rows),
+                "totalRows": 0,
                 "validRows": 0,
-                "errorRows": len(schedule_rows),
-                "nonAnalyzedRows": len(schedule_rows),
+                "errorRows": 0,
+                "nonAnalyzedRows": 0,
                 "over80": 0,
                 "vetoCount": 0,
                 "jouables": 0,
@@ -2153,14 +1748,14 @@ def main() -> int:
             "meta": {
                 "mode": MODE,
                 "targetDay": target_day.isoformat(),
-                "message": "Aucun payload exploitable. Si des matchs sont listés dans dailySchedulePairs, ils sont bloqués car points ATP introuvables ou données insuffisantes.",
+                "message": "Aucun match ATP simple exploitable trouvé via ATP daily-schedule.",
                 "dailySchedulePairs": len(day_matches),
                 "payloadItems": 0,
             },
         }
         base.write_json(result_json_path, result_empty)
-        base.write_text(result_txt_path, "Aucun payload exploitable : matchs absents ou bloqués par points ATP introuvables/données insuffisantes.")
-        base.write_text(base.RESULT_LATEST_PATH, "Aucun payload exploitable : matchs absents ou bloqués par points ATP introuvables/données insuffisantes.")
+        base.write_text(result_txt_path, "Aucun match ATP simple exploitable trouvé via ATP daily-schedule.")
+        base.write_text(base.RESULT_LATEST_PATH, "Aucun match ATP simple exploitable trouvé via ATP daily-schedule.")
 
         print(f"UNITY_INPUT : {base.UNITY_OUT_PATH}")
         print(f"LINES       : {lines_path}")
@@ -2172,7 +1767,7 @@ def main() -> int:
         print(f"AUDIT_LATEST: {base.AUDIT_LATEST_PATH}")
         print(f"RESULT_LATEST: {base.RESULT_LATEST_PATH}")
         print("COUNT       : 0")
-        print("Aucun payload exploitable : matchs absents ou bloqués par points ATP introuvables/données insuffisantes.")
+        print("Aucun match ATP simple exploitable trouvé via ATP daily-schedule.")
         return 0
 
     if backend_send_is_disabled(args.backend_url, args.no_send_backend):
