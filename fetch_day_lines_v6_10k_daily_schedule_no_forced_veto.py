@@ -45,7 +45,7 @@ BASE_MODULE_CANDIDATES = [
     "fetch_day_lines_v6_5_results_context_safe",
 ]
 
-MODE = "V6_10N_ATP_DAILY_MASTER_LOCKED"
+MODE = "V6_10O_ATP_DAILY_MASTER_WITH_VERIFIED_FALLBACK"
 PAYLOAD_LATEST_PATH = Path("output") / "payload_latest.json"
 
 
@@ -395,6 +395,63 @@ def _static_official_singles_pairs_for_verified_day(target_day: date) -> Set[Tup
 
     official_names = official_by_day.get(target_day.isoformat(), [])
     return {unordered_pair_key(a, b) for a, b in official_names}
+
+def _static_official_singles_rows_for_verified_day(target_day: date) -> List[Dict[str, str]]:
+    """
+    Fallback de secours quand le parseur ATP daily-schedule retourne 0.
+
+    Ce fallback ne passe pas par Flashscore et ne contient pas de doubles.
+    Il sert uniquement à empêcher un écran vide sur les journées vérifiées.
+    """
+    official_by_day: Dict[str, List[Tuple[str, str]]] = {
+        "2026-05-10": [
+            ("Alexander Blockx", "Alexander Zverev"),
+            ("Lorenzo Musetti", "Francisco Cerundolo"),
+            ("Matteo Arnaldi", "Rafael Jodar"),
+            ("Casper Ruud", "Jiri Lehecka"),
+            ("Tommy Paul", "Luciano Darderi"),
+            ("Karen Khachanov", "Botic van de Zandschulp"),
+            ("Learner Tien", "Alexander Bublik"),
+            ("Ugo Humbert", "Dino Prizmic"),
+        ],
+        "2026-05-11": [
+            ("Jannik Sinner", "Alexei Popyrin"),
+            ("Flavio Cobolli", "Thiago Agustin Tirante"),
+            ("Mattia Bellucci", "Martin Landaluce"),
+            ("Frances Tiafoe", "Andrea Pellegrino"),
+            ("Pablo Llamas Ruiz", "Daniil Medvedev"),
+            ("Andrey Rublev", "Alejandro Davidovich Fokina"),
+            ("Brandon Nakashima", "Nikoloz Basilashvili"),
+            ("Mariano Navone", "Hamad Medjedovic"),
+        ],
+        "2026-05-12": [
+            ("Lorenzo Musetti", "Casper Ruud"),
+            ("Jannik Sinner", "Andrea Pellegrino"),
+            ("Thiago Agustin Tirante", "Daniil Medvedev"),
+            ("Rafael Jodar", "Learner Tien"),
+            ("Luciano Darderi", "Alexander Zverev"),
+            ("Andrey Rublev", "Nikoloz Basilashvili"),
+            ("Karen Khachanov", "Dino Prizmic"),
+        ],
+    }
+
+    rows: List[Dict[str, str]] = []
+
+    for a, b in official_by_day.get(target_day.isoformat(), []):
+        rows.append(
+            {
+                "playerA": a,
+                "playerB": b,
+                "source": "ATP Verified OOP Static Fallback",
+                "sourceUrl": "https://www.atptour.com/en/news/rome-2026-schedule",
+                "evidence": f"verified_atp_oop_static_fallback {target_day.isoformat()} | {a} vs {b}",
+                "tournament": "Rome",
+                "surface": "Clay",
+            }
+        )
+
+    return rows
+
 
 
 def _target_day_label_variants(target_day: date) -> List[str]:
@@ -1402,6 +1459,19 @@ def build_daily_schedule_matches(session, target_day: date, include_challenger: 
 
     clean_rows, strict_date_audit = _strict_date_filter_rows(clean_rows, target_day)
     audit.extend(strict_date_audit)
+
+    # V6.10O : si le parseur ATP daily-schedule retourne 0 alors que la journée
+    # a été vérifiée manuellement dans l'Order Of Play ATP, on utilise ce fallback.
+    # Ça évite le cas actuel : COUNT=0 alors que l'ATP affiche bien des matchs.
+    if not clean_rows:
+        fallback_rows = _static_official_singles_rows_for_verified_day(target_day)
+        if fallback_rows:
+            clean_rows = fallback_rows
+            audit.append("verified_static_oop_fallback_used=true")
+            audit.append(f"verified_static_oop_fallback_rows={len(clean_rows)}")
+        else:
+            audit.append("verified_static_oop_fallback_used=false")
+            audit.append("verified_static_oop_fallback_reason=no_verified_rows_for_target_day")
 
     day_matches: List[Any] = []
 
