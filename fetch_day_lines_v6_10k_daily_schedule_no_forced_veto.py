@@ -1951,16 +1951,16 @@ def build_payload_items_direct_from_schedule_rows(
         points_a = _points_for_name(player_a, points_map)
         points_b = _points_for_name(player_b, points_map)
 
-        if points_a <= 0 or points_b <= 0:
-    missing_points.append(
-        f"{player_a} vs {player_b} | A_points={points_a} | B_points={points_b} | tournament={tournament}"
-    )
+               if points_a <= 0 or points_b <= 0:
+            missing_points.append(
+                f"{player_a} vs {player_b} | A_points={points_a} | B_points={points_b} | tournament={tournament}"
+            )
 
-    if points_a <= 0:
-        points_a = 1
+            if points_a <= 0:
+                points_a = 1
 
-    if points_b <= 0:
-        points_b = 1
+            if points_b <= 0:
+                points_b = 1
 
         surface = _surface_for_row(row, surfaces_by_tournament)
 
