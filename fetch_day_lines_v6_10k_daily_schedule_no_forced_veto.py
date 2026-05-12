@@ -9,7 +9,7 @@ Objectif V6.10M :
 - Exclure doubles / blocs parasites / anciennes paires.
 - Garder le moteur existant inchangé.
 - Garder la récupération points ATP existante de la V6.7.
-- Points ATP introuvables = match bloqué, jamais remplacé par 1.
+- Points ATP introuvables = match gardé avec valeur 1 + audit [MISSING POINTS].
 - Garder le contexte draw/results seulement pour surface + veto Q/wins, jamais pour créer les matchs.
 
 Utilisation :
@@ -31,8 +31,8 @@ import importlib
 import json
 import re
 import sys
+from dataclasses import asdict
 from datetime import date, timedelta
-from datetime import date
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 from urllib.parse import urlparse
@@ -46,7 +46,7 @@ BASE_MODULE_CANDIDATES = [
     "fetch_day_lines_v6_5_results_context_safe",
 ]
 
-MODE = "V6_10M_ATP_DAILY_SAFE_NO_FAKE_POINTS"
+MODE = "V6_10M_ATP_DAILY_SAFE_KEEP_POINTS_1"
 PAYLOAD_LATEST_PATH = Path("output") / "payload_latest.json"
 
 
@@ -1481,7 +1481,7 @@ def _click_flashscore_target_day(page: Any, target_day: date, audit: List[str]) 
     Pour today, on ne touche pas.
     """
     try:
-        today = base.parse_target_day("today")
+        today = parse_target_day_safe("today")
     except Exception:
         today = date.today()
 
@@ -1827,7 +1827,7 @@ def build_contexts_for_daily_urls(
                 draw_url=draw_url,
                 display_map=display_map,
                 valid_player_keys=valid_player_keys,
-                target_day=base.parse_target_day("today") if False else date.today(),
+                target_day=date.today(),
             )
 
             # Correction du nom/surface si nécessaire.
@@ -1951,7 +1951,7 @@ def build_payload_items_direct_from_schedule_rows(
         points_a = _points_for_name(player_a, points_map)
         points_b = _points_for_name(player_b, points_map)
 
-               if points_a <= 0 or points_b <= 0:
+        if points_a <= 0 or points_b <= 0:
             missing_points.append(
                 f"{player_a} vs {player_b} | A_points={points_a} | B_points={points_b} | tournament={tournament}"
             )
@@ -2058,6 +2058,8 @@ def parse_target_day_safe(raw: str) -> date:
         return today + timedelta(days=1)
 
     return date.fromisoformat(value)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("target_day", help="today | tomorrow | YYYY-MM-DD")
