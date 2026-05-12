@@ -57,14 +57,14 @@ import requests
 from bs4 import BeautifulSoup
 
 
-MODE = "V6_11B_FINAL_CLEAN_FLASHSCORE_ATP_PAGE_FALLBACK"
+MODE = "V6_11C_FINAL_CLEAN_FLASHSCORE_STRICT_TOUR_HEADER"
 OUT_DIR = Path("output")
 
 ATP_BASE = "https://www.atptour.com"
 ATP_CURRENT_URL = "https://www.atptour.com/en/scores/current"
 ATP_RANKINGS_LIVE_URL = "https://www.atptour.com/en/rankings/singles/live"
 ATP_RANKINGS_URL = "https://www.atptour.com/en/rankings/singles"
-FLASHSCORE_URL_FR = "https://www.flashscore.fr/tennis/atp-simple/"
+FLASHSCORE_URL_FR = "https://www.flashscore.fr/tennis/"
 FLASHSCORE_URL_EN_ATP = "https://www.flashscore.com/tennis/atp-singles/"
 
 REQUEST_TIMEOUT = 35
@@ -455,30 +455,53 @@ def fetch_atp_daily_rows(session: requests.Session, target_day: date, include_ch
     return out
 
 
-def flash_header_is_atp_singles(header: str, dedicated_atp_page: bool = False) -> bool:
+def flash_header_is_atp_singles(header: str) -> bool:
     """
-    Flashscore fallback.
+    V6.11C strict.
 
-    Correction V6.11B :
-    Sur la page dédiée ATP Singles, certains blocs match remontent avec header vide
-    ou header non lu par le DOM. Dans ce cas, on accepte le match tant que les deux
-    joueurs sont propres et qu'il n'y a pas de marqueur WTA/double.
+    On accepte uniquement un vrai header de tournoi ATP simple.
+    Exemples acceptés :
+      - ATP - SIMPLE: Rome (Italie), terre battue
+      - ATP - SINGLES: Rome (Italy), clay
+
+    Refusés :
+      - header vide
+      - ATP Singles générique
+      - Challenger
+      - WTA
+      - doubles
+      - ITF
     """
     h = normalize_space(header).lower()
+
+    if not h:
+        return False
 
     if is_wta_marker(h) or is_doubles_marker(h):
         return False
 
-    if "challenger" in h:
+    if "challenger" in h or "itf" in h or "utr" in h:
         return False
 
-    if dedicated_atp_page and not h:
-        return True
+    # Doit être une vraie compétition avec deux-points.
+    if ":" not in h:
+        return False
 
-    if dedicated_atp_page and ("wta" not in h) and ("double" not in h) and ("doubles" not in h):
-        return True
+    # Doit commencer par ATP et indiquer simple/singles.
+    left = h.split(":", 1)[0]
+    right = h.split(":", 1)[1].strip()
 
-    return "atp" in h and ("simple" in h or "simples" in h or "singles" in h)
+    if "atp" not in left:
+        return False
+
+    if not ("simple" in left or "singles" in left):
+        return False
+
+    # Il faut un vrai nom de tournoi après les deux-points.
+    if len(right) < 3:
+        return False
+
+    return True
 
 
 def build_alias_map(points_map: Dict[str, int]) -> Dict[str, str]:
@@ -542,12 +565,11 @@ def fetch_flashscore_rows(target_day: date, points_map: Dict[str, int], audit: L
     """
     Fallback final quand ATP est bloqué 403.
 
-    V6.11B :
-    - ouvre d'abord la page dédiée Flashscore ATP Simple ;
-    - si elle ne donne rien, ouvre la page anglaise ATP Singles ;
-    - n'utilise pas les headers comme obligation stricte, car Flashscore peut ne pas
-      les remonter dans le DOM ;
-    - refuse toujours WTA, doubles, et noms avec "/".
+    V6.11C :
+    - utilise seulement la page principale Flashscore tennis ;
+    - extrait le vrai header de compétition autour de chaque match ;
+    - garde uniquement les headers ATP - SIMPLE / ATP - SINGLES avec vrai tournoi ;
+    - refuse header vide, ATP Singles générique, WTA, doubles, ITF, Challenger.
     """
     rows: List[Dict[str, str]] = []
     aliases = build_alias_map(points_map)
@@ -561,22 +583,42 @@ def fetch_flashscore_rows(target_day: date, points_map: Dict[str, int], audit: L
     js = r"""
 () => {
   const clean = (s) => (s || '').replace(/\s+/g, ' ').trim();
-  let currentHeader = '';
-  const out = [];
-  const nodes = Array.from(document.querySelectorAll(
-    '.event__header, [class*="event__header"], .sportName, [class*="sportName"], .event__match, [id^="g_2_"], [id^="g_1_"]'
-  ));
 
-  for (const node of nodes) {
-    const cls = node.className ? String(node.className) : '';
-    const id = node.id || '';
-    const txt = clean(node.innerText || node.textContent || '');
-
-    if (cls.includes('event__header') || txt.includes('ATP -') || txt.includes('ATP Singles') || txt.includes('ATP - SIMPLE')) {
-      if (txt) currentHeader = txt;
-      continue;
+  function getHeaderForMatch(match) {
+    // 1) remonter aux conteneurs parents et chercher le header précédent dans le même parent
+    let node = match;
+    for (let depth = 0; depth < 6 && node; depth++, node = node.parentElement) {
+      let p = node.previousElementSibling;
+      while (p) {
+        const txt = clean(p.innerText || p.textContent || '');
+        const cls = p.className ? String(p.className) : '';
+        if (cls.includes('event__header') || txt.includes('ATP -') || txt.includes('WTA -')) {
+          return txt;
+        }
+        p = p.previousElementSibling;
+      }
     }
 
+    // 2) fallback : parcours global avant le match
+    const all = Array.from(document.querySelectorAll('.event__header, [class*="event__header"], .event__match, [id^="g_2_"], [id^="g_1_"]'));
+    let lastHeader = '';
+    for (const el of all) {
+      if (el === match) return lastHeader;
+      const cls = el.className ? String(el.className) : '';
+      const txt = clean(el.innerText || el.textContent || '');
+      if (cls.includes('event__header') || txt.includes('ATP -') || txt.includes('WTA -')) {
+        lastHeader = txt;
+      }
+    }
+    return '';
+  }
+
+  const out = [];
+  const matches = Array.from(document.querySelectorAll('.event__match, [id^="g_2_"], [id^="g_1_"]'));
+
+  for (const node of matches) {
+    const cls = node.className ? String(node.className) : '';
+    const id = node.id || '';
     const isMatch = cls.includes('event__match') || id.startsWith('g_2_') || id.startsWith('g_1_');
     if (!isMatch) continue;
 
@@ -585,103 +627,94 @@ def fetch_flashscore_rows(target_day: date, points_map: Dict[str, int], audit: L
     const home = clean(homeEl ? homeEl.textContent : '');
     const away = clean(awayEl ? awayEl.textContent : '');
     const raw = clean(node.innerText || node.textContent || '');
+    const competition = getHeaderForMatch(node);
 
     if (home && away) {
-      out.push({competition: currentHeader, playerA: home, playerB: away, raw});
+      out.push({competition, playerA: home, playerB: away, raw});
     }
   }
+
   return out;
 }
 """
 
-    def scrape_one(url: str) -> List[Dict[str, str]]:
-        raw_rows: List[Dict[str, str]] = []
-        try:
-            with sync_playwright() as p:
-                browser = p.chromium.launch(
-                    headless=True,
-                    args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-blink-features=AutomationControlled"],
-                )
-                ctx = browser.new_context(
-                    locale="fr-FR",
-                    timezone_id="Europe/Paris",
-                    viewport={"width": 1365, "height": 2600},
-                    user_agent=(
-                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
-                    ),
-                    extra_http_headers={"Accept-Language": "fr-FR,fr;q=0.9,en;q=0.8"},
-                )
-                page = ctx.new_page()
-                page.goto(url, wait_until="domcontentloaded", timeout=50000)
+    raw_rows: List[Dict[str, str]] = []
 
-                for label in ["J'accepte", "Tout refuser", "Accepter", "OK", "I accept"]:
-                    try:
-                        page.get_by_text(label, exact=False).first.click(timeout=1500)
-                        break
-                    except Exception:
-                        pass
+    try:
+        with sync_playwright() as p:
+            browser = p.chromium.launch(
+                headless=True,
+                args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-blink-features=AutomationControlled"],
+            )
+            ctx = browser.new_context(
+                locale="fr-FR",
+                timezone_id="Europe/Paris",
+                viewport={"width": 1365, "height": 2600},
+                user_agent=(
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+                ),
+                extra_http_headers={"Accept-Language": "fr-FR,fr;q=0.9,en;q=0.8"},
+            )
+            page = ctx.new_page()
+            page.goto(FLASHSCORE_URL_FR, wait_until="domcontentloaded", timeout=50000)
 
+            for label in ["J'accepte", "Tout refuser", "Accepter", "OK", "I accept"]:
                 try:
-                    page.wait_for_load_state("networkidle", timeout=12000)
+                    page.get_by_text(label, exact=False).first.click(timeout=1500)
+                    break
                 except Exception:
                     pass
 
-                today = now_paris_date()
-                delta = (target_day - today).days
+            try:
+                page.wait_for_load_state("networkidle", timeout=12000)
+            except Exception:
+                pass
 
-                if delta == 1:
-                    for label in ["Jour suivant", "Demain", "Next day", "Tomorrow"]:
-                        try:
-                            page.get_by_title(label, exact=False).first.click(timeout=1500)
-                            page.wait_for_timeout(1800)
-                            audit.append(f"flashscore_day_click={label}")
-                            break
-                        except Exception:
-                            pass
-                elif delta == -1:
-                    for label in ["Jour précédent", "Hier", "Previous day", "Yesterday"]:
-                        try:
-                            page.get_by_title(label, exact=False).first.click(timeout=1500)
-                            page.wait_for_timeout(1800)
-                            audit.append(f"flashscore_day_click={label}")
-                            break
-                        except Exception:
-                            pass
-                elif delta != 0:
-                    audit.append(f"flashscore_day_delta_not_supported={delta}")
+            today = now_paris_date()
+            delta = (target_day - today).days
 
-                for _ in range(10):
+            if delta == 1:
+                for label in ["Jour suivant", "Demain", "Next day", "Tomorrow"]:
                     try:
-                        page.mouse.wheel(0, 1800)
-                        page.wait_for_timeout(450)
+                        page.get_by_title(label, exact=False).first.click(timeout=1500)
+                        page.wait_for_timeout(1800)
+                        audit.append(f"flashscore_day_click={label}")
+                        break
                     except Exception:
                         pass
+            elif delta == -1:
+                for label in ["Jour précédent", "Hier", "Previous day", "Yesterday"]:
+                    try:
+                        page.get_by_title(label, exact=False).first.click(timeout=1500)
+                        page.wait_for_timeout(1800)
+                        audit.append(f"flashscore_day_click={label}")
+                        break
+                    except Exception:
+                        pass
+            elif delta != 0:
+                audit.append(f"flashscore_day_delta_not_supported={delta}")
 
-                raw_rows = page.evaluate(js)
-                browser.close()
+            # Scroll contrôlé pour charger les sections du jour.
+            for _ in range(8):
+                try:
+                    page.mouse.wheel(0, 1600)
+                    page.wait_for_timeout(450)
+                except Exception:
+                    pass
 
-        except Exception as exc:
-            audit.append(f"flashscore_scrape_failed={url} | {type(exc).__name__}: {exc}")
-            return []
+            raw_rows = page.evaluate(js)
+            browser.close()
 
-        audit.append(f"flashscore_scrape_url={url}")
-        audit.append(f"flashscore_raw_rows_for_url={len(raw_rows or [])}")
-        return raw_rows or []
+    except Exception as exc:
+        audit.append(f"flashscore_status=failed | {type(exc).__name__}: {exc}")
+        return rows
 
-    all_raw: List[Dict[str, str]] = []
-    for url in [FLASHSCORE_URL_FR, FLASHSCORE_URL_EN_ATP]:
-        url_rows = scrape_one(url)
-        all_raw.extend(url_rows)
-        if url_rows:
-            # On continue quand même vers l'autre page seulement si la première donne très peu.
-            if len(url_rows) >= 4:
-                break
-
-    seen: Set[Tuple[str, str]] = set()
+    seen: Set[Tuple[str, str, str]] = set()
     rejected = 0
+    rejected_samples: List[str] = []
 
-    for item in all_raw:
+    for item in raw_rows or []:
         comp = normalize_space(str(item.get("competition", "")))
         raw_a = normalize_space(str(item.get("playerA", "")))
         raw_b = normalize_space(str(item.get("playerB", "")))
@@ -689,12 +722,16 @@ def fetch_flashscore_rows(target_day: date, points_map: Dict[str, int], audit: L
 
         joined = normalize_space(f"{comp} {raw_a} {raw_b} {raw}")
 
-        if is_wta_marker(joined) or is_doubles_marker(joined):
+        if not flash_header_is_atp_singles(comp):
             rejected += 1
+            if len(rejected_samples) < 20:
+                rejected_samples.append(f"header={comp!r} | {raw_a} vs {raw_b}")
             continue
 
-        if not flash_header_is_atp_singles(comp, dedicated_atp_page=True):
+        if is_wta_marker(joined) or is_doubles_marker(joined):
             rejected += 1
+            if len(rejected_samples) < 20:
+                rejected_samples.append(f"wta/double | header={comp!r} | {raw_a} vs {raw_b}")
             continue
 
         player_a = resolve_flash_name(raw_a, aliases)
@@ -702,9 +739,12 @@ def fetch_flashscore_rows(target_day: date, points_map: Dict[str, int], audit: L
 
         if not is_name_like(player_a) or not is_name_like(player_b):
             rejected += 1
+            if len(rejected_samples) < 20:
+                rejected_samples.append(f"bad_name | header={comp!r} | {raw_a} vs {raw_b}")
             continue
 
-        key = unordered_pair_key(player_a, player_b)
+        pair = unordered_pair_key(player_a, player_b)
+        key = (pair[0], pair[1], canonical_name(comp))
         if key in seen:
             continue
         seen.add(key)
@@ -713,19 +753,25 @@ def fetch_flashscore_rows(target_day: date, points_map: Dict[str, int], audit: L
             "playerA": player_a,
             "playerB": player_b,
             "surface": surface_from_text(comp, comp),
-            "tournament": comp or "ATP Singles",
-            "source": "Flashscore ATP Singles Dedicated Page",
+            "tournament": comp,
+            "source": "Flashscore Main ATP Singles Strict Header",
             "sourceUrl": FLASHSCORE_URL_FR,
             "evidence": normalize_space(f"{comp} | {raw}")[:320],
         })
 
     audit.append("flashscore_status=ok")
-    audit.append(f"flashscore_raw_rows={len(all_raw)}")
+    audit.append(f"flashscore_scrape_url={FLASHSCORE_URL_FR}")
+    audit.append(f"flashscore_raw_rows={len(raw_rows or [])}")
     audit.append(f"flashscore_atp_singles_rows={len(rows)}")
     audit.append(f"flashscore_rejected_rows={rejected}")
-    audit.append("flashscore_filter=dedicated_atp_page_accept_header_empty")
+    audit.append("flashscore_filter=strict_real_atp_tournament_header_required")
+
+    for s in rejected_samples:
+        audit.append(f"[FLASH REJECT SAMPLE] {s}")
+
     for r in rows[:80]:
         audit.append(f"[FLASH ATP KEEP] {r['playerA']} vs {r['playerB']} | {r['tournament']}")
+
     return rows
 
 
