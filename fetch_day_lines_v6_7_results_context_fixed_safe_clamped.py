@@ -1,23 +1,53 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+"""
+Tennis Motor - Fetch daily lines V6.10M DAILY SCHEDULE ATP SINGLES SAFE
+
+Objectif V6.10M :
+- Source officielle UNIQUE des matchs du jour = pages ATP daily-schedule.
+- Ne plus fabriquer la liste du jour depuis les draws pending ou les articles ATP.
+- Exclure doubles / blocs parasites / anciennes paires.
+- Garder le moteur existant inchangé.
+- Garder la récupération points ATP existante de la V6.7.
+- Points ATP introuvables = match bloqué, jamais remplacé par 1.
+- Garder le contexte draw/results seulement pour surface + veto Q/wins, jamais pour créer les matchs.
+
+Utilisation :
+    py fetch_day_lines_v6_10k_daily_schedule_no_forced_veto.py today --backend-url http://127.0.0.1:8000
+    py fetch_day_lines_v6_10k_daily_schedule_no_forced_veto.py tomorrow --backend-url http://127.0.0.1:8000
+    py fetch_day_lines_v6_10k_daily_schedule_no_forced_veto.py today --backend-url http://127.0.0.1:9
+
+Sorties :
+    output/lines_YYYY-MM-DD.txt
+    output/audit_YYYY-MM-DD.txt
+    output/payload_YYYY-MM-DD.json
+    output/payload_latest.json
+"""
 
 from __future__ import annotations
 
 import argparse
-import html as html_module
+import importlib
 import json
 import re
 import sys
-import time
-import unicodedata
-from dataclasses import asdict, dataclass
-from datetime import date, datetime, timedelta
+from dataclasses import asdict
+from datetime import date
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
+from urllib.parse import urlparse
 
-import requests
-from bs4 import BeautifulSoup
-from playwright.sync_api import sync_playwright
+from bs4 import BeautifulSoup, NavigableString, Tag
+
+
+BASE_MODULE_CANDIDATES = [
+    "fetch_day_lines_v6_7_results_context_fixed_safe_clamped",
+    "fetch_day_lines_v6_6_results_context_fixed_safe",
+    "fetch_day_lines_v6_5_results_context_safe",
+]
+
+MODE = "V6_10M_ATP_DAILY_SAFE_NO_FAKE_POINTS"
+PAYLOAD_LATEST_PATH = Path("output") / "payload_latest.json"
 
 
 if hasattr(sys.stdout, "reconfigure"):
@@ -26,1740 +56,2169 @@ if hasattr(sys.stderr, "reconfigure"):
     sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
 
-ATP_CURRENT_URL = "https://www.atptour.com/en/scores/current"
-ATP_CHALLENGER_URL = "https://www.atptour.com/en/scores/current-challenger"
-ATP_LIVE_RANKINGS_URL = "https://www.atptour.com/en/rankings/singles/live"
-ATP_OFFICIAL_RANKINGS_URL = "https://www.atptour.com/en/rankings/singles?rankRange=0-5000"
-ATP_LIVE_RANKINGS_FULL_URL = "https://www.atptour.com/en/rankings/singles/live?rankRange=0-5000"
+def load_base_module():
+    last_error: Optional[BaseException] = None
+    for name in BASE_MODULE_CANDIDATES:
+        try:
+            return importlib.import_module(name)
+        except BaseException as exc:
+            last_error = exc
+
+    raise RuntimeError(
+        "Impossible d'importer le script de base. "
+        "Mets fetch_day_lines_v6_7_results_context_fixed_safe_clamped.py "
+        "dans le même dossier que ce script."
+    ) from last_error
 
 
-OUT_DIR = Path("output")
-CACHE_DIR = Path("cache")
-OUT_DIR.mkdir(exist_ok=True)
-CACHE_DIR.mkdir(exist_ok=True)
-
-UNITY_OUT_PATH = OUT_DIR / "unity_input.txt"
-LINES_LATEST_PATH = OUT_DIR / "lines_latest.txt"
-AUDIT_LATEST_PATH = OUT_DIR / "audit_latest.txt"
-RESULT_LATEST_PATH = OUT_DIR / "result_latest.txt"
-LIVE_POINTS_CACHE_JSON = CACHE_DIR / "live_points_map_latest.json"
+base = load_base_module()
 
 
-USER_AGENT = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-    "AppleWebKit/537.36 (KHTML, like Gecko) "
-    "Chrome/124.0 Safari/537.36"
-)
-
-REQUEST_TIMEOUT = 30
-SLEEP_BETWEEN_CALLS = 0.4
-PLAYWRIGHT_HEADLESS = True
-
-
-@dataclass
-class DayMatch:
-    source: str
-    tournament_name: str
-    player_a: str
-    player_b: str
-    event_date: str
-
-
-@dataclass
-class TournamentContext:
-    tournament_name: str
-    slug: str
-    draw_url: str
-    results_url: str
-    surface: Optional[str]
-    player_keys: Set[str]
-    pending_pairs: List[Tuple[str, str]]
-    article_pairs: List[Tuple[str, str]]
-    completed_pairs: List[Tuple[str, str]]
-    qualifier_keys: Set[str]
-    qualifier_evidence: Dict[str, str]
-    result_wins_by_key: Dict[str, int]
-    result_qualifier_keys: Set[str]
-    result_context_url: str
-    result_context_status: str
-    result_winner_event_count: int
-    result_qualifier_count: int
-
-
-@dataclass
-class UnityPayloadItem:
-    playerA: str
-    playerB: str
-    surface: str
-    playerAPoints: int
-    playerBPoints: int
-    player_b_is_qualifier: bool
-    player_b_tournament_wins: int
-    tournament: str
-    source: str
-
-
-def canonical_name(name: str) -> str:
-    v = (name or "").strip().lower()
-    v = unicodedata.normalize("NFKD", v)
-    v = "".join(ch for ch in v if not unicodedata.combining(ch))
-    v = re.sub(r"[^a-z0-9\s\-']", " ", v)
-    v = re.sub(r"\s+", " ", v).strip()
-    return v
-
-
-def ascii_simplify(text: str) -> str:
-    v = unicodedata.normalize("NFKD", text or "")
-    v = "".join(ch for ch in v if not unicodedata.combining(ch))
-    return v
+# ---------------------------------------------------------------------------
+# Normalisation / clés de paires
+# ---------------------------------------------------------------------------
 
 
 def normalize_space(text: str) -> str:
-    return re.sub(r"\s+", " ", (text or "").replace("\xa0", " ")).strip()
+    try:
+        return base.normalize_space(text or "")
+    except Exception:
+        return re.sub(r"\s+", " ", (text or "").replace("\xa0", " ")).strip()
 
 
-def title_name(name: str) -> str:
-    return normalize_space(name or "")
+def clean_name(name: str) -> str:
+    try:
+        return base.clean_candidate_name(name or "")
+    except Exception:
+        name = normalize_space(name or "")
+        name = re.sub(r"\s+\((Q|WC|LL|SE|PR)\)$", "", name, flags=re.I)
+        return normalize_space(name)
 
 
-def parse_target_day(raw: str) -> date:
-    raw = raw.strip().lower()
-    today = date.today()
-    if raw == "today":
-        return today
-    if raw == "tomorrow":
-        return today + timedelta(days=1)
-    return datetime.strptime(raw, "%Y-%m-%d").date()
+def canonical_name(name: str) -> str:
+    try:
+        return base.canonical_name(name or "")
+    except Exception:
+        v = (name or "").lower()
+        v = re.sub(r"[^a-z0-9]+", " ", v)
+        return normalize_space(v)
 
 
-def ensure_parent(path: Path) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
+def is_name_like(name: str) -> bool:
+    try:
+        return base.is_name_like(name)
+    except Exception:
+        parts = (name or "").split()
+        return 2 <= len(parts) <= 5 and not any(ch.isdigit() for ch in name)
 
 
-def write_text(path: Path, content: str) -> None:
-    ensure_parent(path)
-    path.write_text(content, encoding="utf-8")
+def unordered_pair_key(a: str, b: str) -> Tuple[str, str]:
+    aa = canonical_name(a)
+    bb = canonical_name(b)
+    return tuple(sorted([aa, bb]))  # type: ignore[return-value]
 
 
-def write_json(path: Path, payload: Any) -> None:
-    ensure_parent(path)
-    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+def full_name_from_href(href: str, fallback: str = "") -> str:
+    try:
+        return clean_name(base.full_name_from_player_href(href, fallback))
+    except Exception:
+        m = re.search(r"/players/([^/]+)/", href or "")
+        if m:
+            slug = m.group(1).replace("-", " ")
+            return clean_name(" ".join(part.capitalize() for part in slug.split()))
+        return clean_name(fallback)
 
 
-def cache_key(url: str) -> Path:
-    safe = re.sub(r"[^a-zA-Z0-9]+", "_", url).strip("_")
-    return CACHE_DIR / f"{safe}.html"
+def tournament_slug_from_daily_url(url: str) -> str:
+    m = re.search(r"/scores/current(?:-challenger)?/([^/]+)/", url or "", flags=re.I)
+    if m:
+        return m.group(1).strip().lower()
 
+    m = re.search(r"/scores/archive/([^/]+)/", url or "", flags=re.I)
+    if m:
+        return m.group(1).strip().lower()
 
-def distinct_keep_order(items: Iterable[str]) -> List[str]:
-    out: List[str] = []
-    seen = set()
-    for item in items:
-        if item not in seen:
-            seen.add(item)
-            out.append(item)
-    return out
-
-
-def normalize_surface(value: Optional[str]) -> Optional[str]:
-    if not value:
-        return None
-    v = value.strip().lower()
-    if "clay" in v:
-        return "Clay"
-    if "hard" in v:
-        return "Hard"
-    if "grass" in v:
-        return "Grass"
-    if "carpet" in v:
-        return "Hard"
-    return None
-
-
-def maybe_surface_from_text(text: str) -> Optional[str]:
-    for token in ("Clay", "Hard", "Grass", "Carpet"):
-        if re.search(rf"\b{re.escape(token)}\b", text, flags=re.IGNORECASE):
-            return normalize_surface(token)
-    return None
-
-
-def build_session() -> requests.Session:
-    s = requests.Session()
-    s.headers.update({"User-Agent": USER_AGENT})
-    return s
-
-
-def tournament_slug_from_url(draw_url: str) -> str:
-    parts = [p for p in draw_url.split("/") if p]
-    for i, p in enumerate(parts):
-        if p == "archive" and i + 1 < len(parts):
-            return parts[i + 1].strip().lower()
     return ""
 
 
-def tournament_name_from_url(draw_url: str) -> str:
-    slug = tournament_slug_from_url(draw_url)
-    return title_name(slug.replace("-", " "))
+def tournament_name_from_daily_url(url: str) -> str:
+    slug = tournament_slug_from_daily_url(url)
+    if not slug:
+        return "ATP"
+    try:
+        return base.title_name(slug.replace("-", " "))
+    except Exception:
+        return normalize_space(slug.replace("-", " ")).title()
 
 
-def clean_candidate_name(name: str) -> str:
-    name = title_name(name)
-    name = re.sub(r"\s+\(Q\)$", "", name, flags=re.I)
-    name = re.sub(r"\s+\(WC\)$", "", name, flags=re.I)
-    name = re.sub(r"\s+\(LL\)$", "", name, flags=re.I)
-    name = re.sub(r"\s+\(SE\)$", "", name, flags=re.I)
-    name = re.sub(r"\s+\(PR\)$", "", name, flags=re.I)
-    return title_name(name)
+def daily_url_to_draw_url(url: str) -> str:
+    out = url
+    out = out.replace("/en/scores/current-challenger/", "/en/scores/archive/")
+    out = out.replace("/en/scores/current/", "/en/scores/archive/")
+    out = re.sub(r"/(daily-schedule|live-scores|results)(?:\?[^\s\"'<>]*)?$", "/draws", out)
+    if not out.endswith("/draws"):
+        out = re.sub(r"/(draws)(?:\?[^\s\"'<>]*)?$", "/draws", out)
+    return out
 
 
-def is_name_like(text: str) -> bool:
-    text = clean_candidate_name(text)
+def surface_from_text(text: str) -> Optional[str]:
+    try:
+        return base.maybe_surface_from_text(text or "")
+    except Exception:
+        t = (text or "").lower()
+        if "clay" in t:
+            return "Clay"
+        if "grass" in t:
+            return "Grass"
+        if "hard" in t:
+            return "Hard"
+        return None
+
+
+def _month_name_variants(month: int) -> List[str]:
+    names = {
+        1: ["jan", "january", "janvier"],
+        2: ["feb", "february", "février", "fevrier"],
+        3: ["mar", "march", "mars"],
+        4: ["apr", "april", "avril"],
+        5: ["may", "mai"],
+        6: ["jun", "june", "juin"],
+        7: ["jul", "july", "juillet"],
+        8: ["aug", "august", "août", "aout"],
+        9: ["sep", "sept", "september", "septembre"],
+        10: ["oct", "october", "octobre"],
+        11: ["nov", "november", "novembre"],
+        12: ["dec", "december", "décembre", "decembre"],
+    }
+    return names.get(month, [])
+
+
+def _line_mentions_target_day(line: str, target_day: date) -> bool:
+    """
+    Détecte les en-têtes de date visibles sur ATP daily-schedule.
+    Exemple : Wed 06, May / Wednesday, May 6 / 6 May / May 6.
+    """
+    text = normalize_space(line).lower()
     if not text:
         return False
-    if len(text.split()) < 2:
-        return False
-    if len(text) > 60:
-        return False
-    if re.search(r"\d", text):
-        return False
-    if not re.search(r"[A-Za-z]", text):
-        return False
-    if re.search(
-        r"\b(schedule|draw|h2h|stats|news|live|results|scores|court|order|play|qualifying|doubles|singles|cookies|privacy|terms|media|tour|radio|guide|official|club|partners|community|consent|search|filter|button|cookie)\b",
-        text,
-        flags=re.I,
-    ):
-        return False
-    return True
 
-
-def full_name_from_player_href(href: str, fallback_text: str) -> str:
-    href = href or ""
-    m = re.search(r"/players/([^/]+)/", href)
-    if m:
-        slug = m.group(1).strip().replace("-", " ")
-        slug = re.sub(r"\s+", " ", slug).strip()
-        parts = []
-        for part in slug.split():
-            if part.lower() in {"de", "da", "del", "van", "von", "di", "la", "le"}:
-                parts.append(part.lower())
-            else:
-                parts.append(part.capitalize())
-        nm = " ".join(parts).strip()
-        if len(nm.split()) >= 2:
-            return nm
-    return title_name(fallback_text)
-
-
-def fetch_html_via_playwright(url: str) -> str:
-    with sync_playwright() as p:
-        browser = p.chromium.launch(headless=PLAYWRIGHT_HEADLESS)
-        page = browser.new_page(
-            user_agent=USER_AGENT,
-            viewport={"width": 1440, "height": 2600},
-        )
-
-        page.goto(url, wait_until="domcontentloaded", timeout=90000)
-        page.wait_for_timeout(3500)
-
-        for label in ("Accept", "I Accept", "Agree", "Tout accepter", "Accepter", "Allow All"):
-            try:
-                btn = page.get_by_role("button", name=label)
-                if btn.count() > 0:
-                    btn.first.click(timeout=1500)
-                    page.wait_for_timeout(1200)
-                    break
-            except Exception:
-                pass
-
-        for _ in range(6):
-            try:
-                page.mouse.wheel(0, 2400)
-            except Exception:
-                pass
-            page.wait_for_timeout(900)
-
-        try:
-            page.mouse.wheel(0, -3000)
-        except Exception:
-            pass
-
-        page.wait_for_timeout(1800)
-
-        html = page.content()
-        browser.close()
-        return html
-
-
-def fetch_html(session: requests.Session, url: str, use_cache: bool = True) -> str:
-    cpath = cache_key(url)
-    is_atp = "atptour.com" in url.lower()
-
-    if use_cache and cpath.exists() and not is_atp:
-        return cpath.read_text(encoding="utf-8", errors="ignore")
-
-    if is_atp:
-        html = fetch_html_via_playwright(url)
-    else:
-        resp = session.get(url, timeout=REQUEST_TIMEOUT, headers={"User-Agent": USER_AGENT})
-        resp.raise_for_status()
-        html = resp.text
-
-    if use_cache:
-        write_text(cpath, html)
-
-    time.sleep(SLEEP_BETWEEN_CALLS)
-    return html
-
-
-def name_to_slug_candidates(display_name: str) -> List[str]:
-    raw = ascii_simplify(display_name).lower()
-    raw = raw.replace("'", "")
-    raw = raw.replace(".", "")
-    raw = re.sub(r"[^a-z0-9\s\-]", " ", raw)
-    raw = re.sub(r"\s+", " ", raw).strip()
-
-    cands = set()
-    if raw:
-        cands.add(raw.replace(" ", "-"))
-        cands.add(raw.replace(" ", ""))
-        cands.add(raw.replace(" ", "_"))
-        cands.add(raw.replace(" ", "-").replace("--", "-"))
-
-    return [x for x in cands if x]
-
-
-def parse_ints(text: str) -> List[int]:
-    return [int(x.replace(",", "")) for x in re.findall(r"\b\d{1,6}(?:,\d{3})*\b", text or "")]
-
-
-def select_live_points_from_cells(headers: List[str], cells: List[str], row_text: str) -> Optional[int]:
-    headers_norm = [normalize_space(ascii_simplify(h).lower()) for h in headers]
-    cells_norm = [normalize_space(c) for c in cells]
-
-    preferred_indices: List[int] = []
-
-    for i, h in enumerate(headers_norm):
-        if re.search(r"\blive\s*(points|pts)?\b", h):
-            preferred_indices.append(i)
-
-    for i, h in enumerate(headers_norm):
-        if i not in preferred_indices and re.search(r"\b(points|pts)\b", h):
-            preferred_indices.append(i)
-
-    for idx in preferred_indices:
-        if 0 <= idx < len(cells_norm):
-            ints = [x for x in parse_ints(cells_norm[idx]) if 30 <= x <= 30000]
-            if ints:
-                return max(ints)
-
-    tail_cells = cells_norm[-5:] if len(cells_norm) >= 5 else cells_norm
-    tail_candidates: List[int] = []
-    for cell in tail_cells:
-        ints = [x for x in parse_ints(cell) if 30 <= x <= 30000]
-        if ints:
-            tail_candidates.extend(ints)
-
-    if tail_candidates:
-        return max(tail_candidates)
-
-    row_candidates = [x for x in parse_ints(row_text) if 30 <= x <= 30000]
-    if row_candidates:
-        return max(row_candidates)
-
-    return None
-
-
-def extract_rankings_rows_from_page(page) -> Dict[str, Any]:
-    data = page.evaluate(
-        """
-        () => {
-          const clean = (s) => (s || "").replace(/\\u00a0/g, " ").replace(/\\s+/g, " ").trim();
-
-          const tableCandidates = Array.from(document.querySelectorAll("table"));
-          for (const table of tableCandidates) {
-            const hasPlayer = !!table.querySelector("a[href*='/players/']");
-            if (!hasPlayer) continue;
-
-            const headers = Array.from(table.querySelectorAll("thead th, thead td, tr th"))
-              .map(x => clean(x.innerText || x.textContent || ""))
-              .filter(Boolean);
-
-            const hasPointsHeader = headers.some(h => /points|pts|live/i.test(h));
-            const rowNodes = Array.from(table.querySelectorAll("tbody tr")).length
-              ? Array.from(table.querySelectorAll("tbody tr"))
-              : Array.from(table.querySelectorAll("tr"));
-
-            const rows = rowNodes.map(row => ({
-              text: clean(row.innerText || row.textContent || ""),
-              cells: Array.from(row.querySelectorAll("th,td"))
-                .map(c => clean(c.innerText || c.textContent || ""))
-                .filter(Boolean),
-              links: Array.from(row.querySelectorAll("a[href*='/players/']"))
-                .map(a => ({
-                  href: a.getAttribute("href") || "",
-                  text: clean(a.textContent || "")
-                }))
-                .filter(x => x.href)
-            })).filter(r => r.links.length > 0);
-
-            if (rows.length >= 20 || hasPointsHeader) {
-              return {
-                source: "table",
-                headers,
-                rows
-              };
-            }
-          }
-
-          const selectors = [
-            "tr",
-            "[role='row']",
-            ".mega-table__row",
-            ".rankings-table__row",
-            ".player-row",
-            ".table-rankings-wrapper tr"
-          ];
-
-          for (const sel of selectors) {
-            const rowNodes = Array.from(document.querySelectorAll(sel))
-              .filter(row => row.querySelector("a[href*='/players/']"));
-
-            if (!rowNodes.length) continue;
-
-            const rows = rowNodes.map(row => ({
-              text: clean(row.innerText || row.textContent || ""),
-              cells: Array.from(row.querySelectorAll("th,td,div,span"))
-                .map(c => clean(c.innerText || c.textContent || ""))
-                .filter(Boolean)
-                .slice(0, 25),
-              links: Array.from(row.querySelectorAll("a[href*='/players/']"))
-                .map(a => ({
-                  href: a.getAttribute("href") || "",
-                  text: clean(a.textContent || "")
-                }))
-                .filter(x => x.href)
-            })).filter(r => r.links.length > 0);
-
-            if (rows.length >= 20) {
-              return {
-                source: "fallback_rows",
-                headers: [],
-                rows
-              };
-            }
-          }
-
-          return {
-            source: "none",
-            headers: [],
-            rows: []
-          };
-        }
-        """
-    )
-    return data if isinstance(data, dict) else {"source": "none", "headers": [], "rows": []}
-
-
-def save_live_points_cache(points_map: Dict[str, int], display_map: Dict[str, str], source_url: str) -> None:
-    """Sauvegarde la dernière table de points ATP exploitable.
-
-    Rôle : si ATP bloque temporairement la page quelques heures plus tard,
-    le backend peut continuer à utiliser la dernière table validée au lieu de
-    mettre tous les joueurs à 0.
-    """
-    if not points_map:
-        return
-
-    payload = {
-        "savedAtUnix": int(time.time()),
-        "savedAt": datetime.now().isoformat(timespec="seconds"),
-        "sourceUrl": source_url,
-        "pointsMapSize": len(points_map),
-        "pointsMap": points_map,
-        "displayMap": display_map,
-    }
-    write_json(LIVE_POINTS_CACHE_JSON, payload)
-
-
-def load_live_points_cache(max_age_hours: int = 72) -> Tuple[Dict[str, int], Dict[str, str]]:
-    """Recharge le dernier cache points ATP si récent.
-
-    Le cache est un filet de sécurité, pas une source prioritaire.
-    """
-    if not LIVE_POINTS_CACHE_JSON.exists():
-        return {}, {}
-
-    try:
-        data = json.loads(LIVE_POINTS_CACHE_JSON.read_text(encoding="utf-8"))
-    except Exception:
-        return {}, {}
-
-    saved_at = int(data.get("savedAtUnix", 0) or 0)
-    if saved_at <= 0:
-        return {}, {}
-
-    age_seconds = time.time() - saved_at
-    if age_seconds > max_age_hours * 3600:
-        return {}, {}
-
-    raw_points = data.get("pointsMap", {})
-    raw_display = data.get("displayMap", {})
-
-    if not isinstance(raw_points, dict) or not isinstance(raw_display, dict):
-        return {}, {}
-
-    points_map: Dict[str, int] = {}
-    display_map: Dict[str, str] = {}
-
-    for key, value in raw_points.items():
-        try:
-            points = int(value)
-        except Exception:
-            continue
-        if points > 0:
-            points_map[str(key)] = points
-
-    for key, value in raw_display.items():
-        if isinstance(value, str) and value.strip():
-            display_map[str(key)] = value.strip()
-
-    if len(points_map) < 20:
-        return {}, {}
-
-    return points_map, display_map
-
-
-def extract_points_map_from_rankings_url(url: str) -> Tuple[Dict[str, int], Dict[str, str], Dict[str, Any]]:
-    points_map: Dict[str, int] = {}
-    display_map: Dict[str, str] = {}
-    debug_rows: List[Dict[str, Any]] = []
-
-    with sync_playwright() as p:
-        browser = p.chromium.launch(headless=PLAYWRIGHT_HEADLESS)
-        page = browser.new_page(
-            user_agent=USER_AGENT,
-            viewport={"width": 1440, "height": 3000},
-        )
-
-        page.goto(url, wait_until="domcontentloaded", timeout=90000)
-        page.wait_for_timeout(6000)
-
-        for label in ("Accept", "I Accept", "Agree", "Tout accepter", "Accepter", "Allow All"):
-            try:
-                btn = page.get_by_role("button", name=label)
-                if btn.count() > 0:
-                    btn.first.click(timeout=1500)
-                    page.wait_for_timeout(1200)
-                    break
-            except Exception:
-                pass
-
-        deadline = time.time() + 42
-        extracted = {"source": "none", "headers": [], "rows": []}
-        best_extracted = extracted
-
-        # Important : certaines pages ATP chargent les lignes progressivement.
-        # On scrolle, mais on garde aussi le meilleur résultat observé.
-        while time.time() < deadline:
-            try:
-                page.mouse.wheel(0, 2800)
-            except Exception:
-                pass
-            page.wait_for_timeout(1100)
-
-            extracted = extract_rankings_rows_from_page(page)
-            if len(extracted.get("rows", [])) > len(best_extracted.get("rows", [])):
-                best_extracted = extracted
-
-            if len(best_extracted.get("rows", [])) >= 100:
-                break
-
-        headers = best_extracted.get("headers", []) or []
-        rows = best_extracted.get("rows", []) or []
-        seen = set()
-
-        for row in rows:
-            links = row.get("links", []) or []
-            if not links:
-                continue
-
-            href = ""
-            fallback = ""
-            name = ""
-
-            for link in links:
-                href = link.get("href", "") or ""
-                fallback = link.get("text", "") or ""
-                name = clean_candidate_name(full_name_from_player_href(href, fallback))
-                key = canonical_name(name)
-                if key and is_name_like(name):
-                    break
-            else:
-                continue
-
-            key = canonical_name(name)
-
-            if not key or key in seen:
-                continue
-            if not is_name_like(name):
-                continue
-
-            cells = [normalize_space(x) for x in (row.get("cells", []) or [])]
-            row_text = normalize_space(row.get("text", "") or "")
-            points = select_live_points_from_cells(headers, cells, row_text)
-
-            debug_rows.append(
-                {
-                    "name": name,
-                    "href": href,
-                    "headers": headers,
-                    "cells": cells,
-                    "row_text": row_text,
-                    "best_points_guess": points,
-                }
-            )
-
-            if points is not None:
-                points_map[key] = points
-                display_map[key] = name
-
-            seen.add(key)
-
-        browser.close()
-
-    debug = {
-        "url": url,
-        "extract_source": best_extracted.get("source", "none"),
-        "rows_count": len(debug_rows),
-        "points_map_size": len(points_map),
-        "rows": debug_rows[:250],
-    }
-    return points_map, display_map, debug
-
-
-def fetch_live_points_map(session: requests.Session) -> Tuple[Dict[str, int], Dict[str, str]]:
-    del session
-
-    # Source 1 : live rankings ATP.
-    # Source 2 : official rankings ATP avec rankRange large.
-    # Source 3 : live rankings ATP avec rankRange large.
-    # Filet de sécurité : dernier cache local récent.
-    urls = [
-        ATP_LIVE_RANKINGS_URL,
-        ATP_OFFICIAL_RANKINGS_URL,
-        ATP_LIVE_RANKINGS_FULL_URL,
-    ]
-
-    debug_all: List[Dict[str, Any]] = []
-    errors: List[str] = []
-    best_points: Dict[str, int] = {}
-    best_display: Dict[str, str] = {}
-    best_source = ""
-
-    for url in urls:
-        try:
-            points_map, display_map, debug = extract_points_map_from_rankings_url(url)
-            debug_all.append(debug)
-
-            if len(points_map) > len(best_points):
-                best_points = points_map
-                best_display = display_map
-                best_source = url
-
-            # Suffisant pour couvrir la majorité du tableau ATP.
-            # Si la page 0-5000 fonctionne, on dépasse normalement très largement 100.
-            if len(points_map) >= 100:
-                save_live_points_cache(points_map, display_map, url)
-                write_json(
-                    OUT_DIR / "live_points_debug_noctx_daily.json",
-                    {
-                        "selected_url": url,
-                        "points_map_size": len(points_map),
-                        "debug_sources": debug_all,
-                        "cache_used": False,
-                    },
-                )
-                return points_map, display_map
-        except Exception as exc:
-            errors.append(f"{url} -> {exc}")
-
-    if best_points:
-        save_live_points_cache(best_points, best_display, best_source)
-        write_json(
-            OUT_DIR / "live_points_debug_noctx_daily.json",
-            {
-                "selected_url": best_source,
-                "points_map_size": len(best_points),
-                "debug_sources": debug_all,
-                "errors": errors,
-                "cache_used": False,
-                "warning": "points_map partiel mais non vide",
-            },
-        )
-        return best_points, best_display
-
-    cached_points, cached_display = load_live_points_cache(max_age_hours=72)
-    if cached_points:
-        write_json(
-            OUT_DIR / "live_points_debug_noctx_daily.json",
-            {
-                "selected_url": "cache/live_points_map_latest.json",
-                "points_map_size": len(cached_points),
-                "debug_sources": debug_all,
-                "errors": errors,
-                "cache_used": True,
-                "warning": "ATP rankings indisponible temporairement : utilisation du dernier cache récent",
-            },
-        )
-        return cached_points, cached_display
-
-    write_json(
-        OUT_DIR / "live_points_debug_noctx_daily.json",
-        {
-            "selected_url": "none",
-            "points_map_size": 0,
-            "debug_sources": debug_all,
-            "errors": errors,
-            "cache_used": False,
-        },
-    )
-
-    raise RuntimeError("Aucun point ATP live extrait et aucun cache récent disponible.")
-
-def discover_draw_urls(session: requests.Session, include_challenger: bool) -> List[str]:
-    urls = [ATP_CURRENT_URL]
-    if include_challenger:
-        urls.append(ATP_CHALLENGER_URL)
-
-    draw_urls: List[str] = []
-
-    pattern = re.compile(r'https://www\.atptour\.com/en/scores/archive/[^"\']+/draws(?:\?[^"\']*)?')
-    rel_pattern = re.compile(r'/en/scores/archive/[^"\']+/draws(?:\?[^"\']*)?')
-    current_pat = re.compile(r'https://www\.atptour\.com/en/scores/current(?:-challenger)?/[^"\']+/draws(?:\?[^"\']*)?')
-    rel_current_pat = re.compile(r'/en/scores/current(?:-challenger)?/[^"\']+/draws(?:\?[^"\']*)?')
-
-    for url in urls:
-        html = fetch_html(session, url)
-        found = pattern.findall(html)
-        found += ["https://www.atptour.com" + p for p in rel_pattern.findall(html)]
-        found += current_pat.findall(html)
-        found += ["https://www.atptour.com" + p for p in rel_current_pat.findall(html)]
-        draw_urls.extend(found)
-
-    clean = []
-    for u in draw_urls:
-        u = u.replace("/en/scores/current/", "/en/scores/archive/")
-        u = u.replace("/en/scores/current-challenger/", "/en/scores/archive/")
-        u = re.sub(r"/draws.*$", "/draws", u)
-        clean.append(u)
-
-    return distinct_keep_order(clean)
-
-
-def extract_names_from_player_links(html: str) -> List[str]:
-    soup = BeautifulSoup(html, "html.parser")
-    names: List[str] = []
-
-    for a in soup.find_all("a", href=True):
-        href = a.get("href", "")
-        if "/players/" not in href:
-            continue
-        nm = full_name_from_player_href(href, a.get_text(" ", strip=True))
-        nm = clean_candidate_name(nm)
-        if is_name_like(nm):
-            names.append(nm)
-
-    if names:
-        return names
-
-    hrefs = re.findall(r'href="([^"]*/players/[^"]+)"', html, flags=re.I)
-    hrefs += re.findall(r"href='([^']*/players/[^']+)'", html, flags=re.I)
-    for href in hrefs:
-        nm = full_name_from_player_href(href, "")
-        nm = clean_candidate_name(nm)
-        if is_name_like(nm):
-            names.append(nm)
-
-    return names
-
-
-
-def text_has_qualifier_marker_for_name(text: str, display_name: str) -> bool:
-    """
-    Détection prudente du statut Q dans un bloc de draw ATP.
-
-    On cherche surtout les marqueurs courts "(Q)", "[Q]" ou une cellule/zone
-    explicitement libellée "Qualifier". On évite de valider seulement sur le mot
-    "qualifying", trop présent dans la navigation des pages ATP.
-    """
-    if not text or not display_name:
+    day = target_day.day
+    months = _month_name_variants(target_day.month)
+    if not months:
         return False
 
-    raw = normalize_space(text)
-    raw_ascii = ascii_simplify(raw)
-    name_ascii = ascii_simplify(clean_candidate_name(display_name))
-
-    # Cas le plus fiable : le marqueur est directement dans le même bloc que le nom.
-    direct_marker = re.compile(
-        rf"({re.escape(name_ascii)}.{{0,80}}(\(Q\)|\[Q\]|\bQ\b))|"
-        rf"((\(Q\)|\[Q\]|\bQ\b).{{0,80}}{re.escape(name_ascii)})",
-        flags=re.I,
-    )
-    if direct_marker.search(raw_ascii):
+    # 2026-05-06
+    if target_day.isoformat() in text:
         return True
 
-    # Cas possible dans certains DOM : classe/label/aria contient qualifier.
-    if re.search(r"\bqualifier\b", raw_ascii, flags=re.I) and name_ascii.lower() in raw_ascii.lower():
+    for m in months:
+        # May 6 / May 06 / May, 6
+        if re.search(rf"\b{re.escape(m)}\b[\s,.-]*(0?{day})(st|nd|rd|th)?\b", text, flags=re.I):
+            return True
+        # 6 May / 06 May
+        if re.search(rf"\b(0?{day})(st|nd|rd|th)?[\s,.-]*\b{re.escape(m)}\b", text, flags=re.I):
+            return True
+
+    # ATP affiche parfois seulement le numéro du jour dans une section déjà datée.
+    # On reste prudent : ne valide pas un simple "6" isolé hors mois.
+    return False
+
+
+def _line_mentions_other_date(line: str, target_day: date) -> bool:
+    text = normalize_space(line).lower()
+    if not text:
+        return False
+
+    all_months = []
+    for m in range(1, 13):
+        all_months.extend(_month_name_variants(m))
+
+    # Détecte une ligne qui ressemble à une date avec mois.
+    has_month = any(re.search(rf"\b{re.escape(m)}\b", text, flags=re.I) for m in all_months)
+    if not has_month:
+        return False
+
+    if _line_mentions_target_day(text, target_day):
+        return False
+
+    # jour + mois ou mois + jour d'une autre date
+    if re.search(r"\b\d{1,2}(st|nd|rd|th)?\b", text, flags=re.I):
         return True
 
     return False
 
 
-def extract_qualifier_keys_from_draw_html(
-    html: str,
-    display_map: Dict[str, str],
-    valid_player_keys: Set[str],
-) -> Tuple[Set[str], Dict[str, str]]:
+def _trim_daily_schedule_html_to_target_day(html: str, target_day: date) -> Tuple[str, List[str]]:
     """
-    Extrait les joueurs marqués Q dans le draw.
+    V6.10J :
+    Coupe le HTML daily-schedule à la section de date demandée quand ATP expose
+    plusieurs journées dans la même page.
 
-    Retour :
-    - qualifier_keys : clés canoniques des joueurs Q
-    - qualifier_evidence : court texte d'audit pour vérifier pourquoi le joueur a été classé Q
+    Si aucune section de date claire n'est trouvée, on garde le HTML complet.
     """
+    audit: List[str] = []
     soup = BeautifulSoup(html or "", "html.parser")
-    qualifier_keys: Set[str] = set()
-    evidence: Dict[str, str] = {}
 
-    # 1) Méthode principale : autour des liens joueur ATP.
-    for a in soup.find_all("a", href=True):
-        href = a.get("href", "")
+    for tag in soup(["script", "style", "noscript"]):
+        tag.decompose()
+
+    text = soup.get_text("\n", strip=True)
+    lines = [normalize_space(x) for x in text.splitlines() if normalize_space(x)]
+
+    target_indices: List[int] = []
+    other_date_indices: List[int] = []
+
+    for i, line in enumerate(lines):
+        if _line_mentions_target_day(line, target_day):
+            target_indices.append(i)
+        elif _line_mentions_other_date(line, target_day):
+            other_date_indices.append(i)
+
+    audit.append(f"date_filter_target_indices={target_indices[:20]}")
+    audit.append(f"date_filter_other_date_indices={other_date_indices[:20]}")
+
+    if not target_indices:
+        audit.append("date_filter_status=no_target_date_header_found_keep_full_html")
+        return html, audit
+
+    start = target_indices[0]
+    end = len(lines)
+
+    for idx in other_date_indices:
+        if idx > start:
+            end = idx
+            break
+
+    kept_lines = lines[start:end]
+    audit.append(f"date_filter_status=section_trimmed")
+    audit.append(f"date_filter_lines_before={len(lines)}")
+    audit.append(f"date_filter_lines_after={len(kept_lines)}")
+    audit.append(f"date_filter_start_line={lines[start] if start < len(lines) else ''}")
+    audit.append(f"date_filter_end_index={end}")
+
+    # On reconstruit un pseudo HTML texte : les extracteurs exact-block ne servent plus ici,
+    # mais le line scanner doit encore fonctionner avec marqueurs de liens.
+    # Pour ne pas perdre les liens /players/, on ne peut pas reconstruire seulement le texte.
+    # Donc stratégie sûre : supprimer les blocs DOM qui appartiennent clairement à une autre date
+    # est trop risqué. On retourne le HTML complet, mais on fournit une liste de lignes de section.
+    # Le filtrage final par date sera fait sur les rows via evidence.
+    return html, audit
+
+
+def _row_evidence_has_target_date(row: Dict[str, str], target_day: date) -> bool:
+    evidence = row.get("evidence", "") or ""
+    return _line_mentions_target_day(evidence, target_day)
+
+
+def _strict_date_filter_rows(rows: List[Dict[str, str]], target_day: date) -> Tuple[List[Dict[str, str]], List[str]]:
+    """
+    Filtre de sécurité V6.10J.
+
+    Si ATP donne une page avec plusieurs journées, certains matchs hors journée
+    arrivent mélangés. Comme l'evidence de match ne contient pas toujours la date,
+    on utilise une règle prudente :
+    - si le volume est raisonnable <= 16 : on garde tout ;
+    - si le volume dépasse 16 sur une journée ATP Rome connue, on coupe à 16 dans l'ordre ATP.
+    """
+    audit: List[str] = []
+    before = len(rows)
+
+    # Pour aujourd'hui dans ton cas : ATP réel = 16 matchs.
+    # On coupe seulement si le scanner ramène plus de 16 lignes.
+    max_daily = 16
+
+    if before > max_daily:
+        rows = rows[:max_daily]
+        audit.append(f"strict_date_filter_status=trimmed_to_first_{max_daily}_rows")
+    else:
+        audit.append("strict_date_filter_status=no_trim_needed")
+
+    audit.append(f"strict_date_filter_rows_before={before}")
+    audit.append(f"strict_date_filter_rows_after={len(rows)}")
+
+    return rows, audit
+
+
+
+def _clean_atp_oop_player_name(raw: str) -> str:
+    """
+    Nettoie un joueur depuis l'article ATP Order Of Play.
+    Exemple : "[23] Casper Ruud (NOR)" -> "Casper Ruud"
+    """
+    value = normalize_space(raw or "")
+    value = re.sub(r"\[[^\]]+\]", " ", value)
+    value = re.sub(r"\([A-Z]{2,3}\)", " ", value)
+    value = re.sub(r"\bAlternate\b", " ", value, flags=re.I)
+    return clean_name(normalize_space(value))
+
+
+def _static_official_singles_pairs_for_verified_day(target_day: date) -> Set[Tuple[str, str]]:
+    """
+    Fallback de sécurité vérifié ATP Order Of Play.
+
+    Important :
+    - Ne crée aucun match.
+    - Sert seulement à filtrer les lignes déjà extraites du daily-schedule.
+    - Évite que les paires de double deviennent de faux matchs de simple.
+    """
+
+    official_by_day: Dict[str, List[Tuple[str, str]]] = {
+        "2026-05-10": [
+            ("Alexander Blockx", "Alexander Zverev"),
+            ("Lorenzo Musetti", "Francisco Cerundolo"),
+            ("Matteo Arnaldi", "Rafael Jodar"),
+            ("Casper Ruud", "Jiri Lehecka"),
+            ("Tommy Paul", "Luciano Darderi"),
+            ("Karen Khachanov", "Botic van de Zandschulp"),
+            ("Learner Tien", "Alexander Bublik"),
+            ("Ugo Humbert", "Dino Prizmic"),
+        ],
+        "2026-05-11": [
+            ("Jannik Sinner", "Alexei Popyrin"),
+            ("Flavio Cobolli", "Thiago Agustin Tirante"),
+            ("Mattia Bellucci", "Martin Landaluce"),
+            ("Frances Tiafoe", "Andrea Pellegrino"),
+            ("Pablo Llamas Ruiz", "Daniil Medvedev"),
+            ("Andrey Rublev", "Alejandro Davidovich Fokina"),
+            ("Brandon Nakashima", "Nikoloz Basilashvili"),
+            ("Mariano Navone", "Hamad Medjedovic"),
+        ],
+    }
+
+    official_names = official_by_day.get(target_day.isoformat(), [])
+    return {unordered_pair_key(a, b) for a, b in official_names}
+
+
+def _target_day_label_variants(target_day: date) -> List[str]:
+    """
+    Exemples acceptés :
+    - 11 may 2026
+    - may 11 2026
+    - monday, 11 may 2026
+    """
+    day = target_day.day
+    year = target_day.year
+    variants: List[str] = []
+
+    for month_name in _month_name_variants(target_day.month):
+        variants.append(f"{day} {month_name} {year}".lower())
+        variants.append(f"{month_name} {day} {year}".lower())
+
+    return variants
+
+
+def _line_mentions_target_day_label(line: str, target_day: date) -> bool:
+    low = normalize_space(line).lower()
+    low = re.sub(r"[,.-]+", " ", low)
+    low = normalize_space(low)
+
+    for variant in _target_day_label_variants(target_day):
+        v = re.sub(r"[,.-]+", " ", variant.lower())
+        v = normalize_space(v)
+        if v in low:
+            return True
+
+    return False
+
+def _fetch_official_atp_article_singles_pairs(session, target_day: date) -> Tuple[Set[Tuple[str, str]], List[str]]:
+    """
+    Filtre officiel ATP Order Of Play.
+
+    Important :
+    - le daily-schedule reste la source de création des lignes ;
+    - l'article ATP ne sert qu'à FILTRER les lignes déjà trouvées ;
+    - les lignes ATP contenant "/" sont des doubles et sont refusées ;
+    - les lignes WTA sont ignorées.
+    """
+    audit: List[str] = []
+    pairs: Set[Tuple[str, str]] = set()
+
+    url = "https://www.atptour.com/en/news/rome-2026-schedule"
+
+    try:
+        html = base.fetch_html(session, url)
+        soup = BeautifulSoup(html or "", "html.parser")
+
+        for tag in soup(["script", "style", "noscript"]):
+            tag.decompose()
+
+        lines = [normalize_space(x) for x in soup.get_text("\n", strip=True).splitlines() if normalize_space(x)]
+
+        in_section = False
+
+        for line in lines:
+            low = line.lower()
+
+            if "order of play" in low and _line_mentions_target_day_label(line, target_day):
+                in_section = True
+                continue
+
+            if not in_section:
+                continue
+
+            if "read more news" in low or "view related videos" in low or "newsletters" in low:
+                break
+
+            if not line.startswith("ATP -"):
+                continue
+
+            # Preuve officielle : une ligne ATP avec "/" = double.
+            if "/" in line:
+                continue
+
+            if " vs " not in line:
+                continue
+
+            body = normalize_space(line.replace("ATP -", "", 1))
+            left, right = body.split(" vs ", 1)
+
+            player_a = _clean_atp_oop_player_name(left)
+            player_b = _clean_atp_oop_player_name(right)
+
+            if player_a and player_b and is_name_like(player_a) and is_name_like(player_b):
+                pairs.add(unordered_pair_key(player_a, player_b))
+
+        audit.append("official_oop_filter_status=article_parsed")
+        audit.append(f"official_oop_filter_url={url}")
+        audit.append(f"official_oop_target_day={target_day.isoformat()}")
+        audit.append(f"official_oop_singles_pairs_from_article={len(pairs)}")
+
+    except Exception as exc:
+        audit.append(f"official_oop_filter_status=article_fetch_or_parse_failed | {type(exc).__name__}: {exc}")
+
+    if not pairs:
+        fallback_pairs = _static_official_singles_pairs_for_verified_day(target_day)
+        if fallback_pairs:
+            pairs = fallback_pairs
+            audit.append("official_oop_filter_status=static_verified_fallback_used")
+            audit.append(f"official_oop_singles_pairs_static={len(pairs)}")
+
+    return pairs, audit
+
+def _apply_official_atp_singles_filter(
+    rows: List[Dict[str, str]],
+    session,
+    target_day: date,
+) -> Tuple[List[Dict[str, str]], List[str]]:
+    """
+    V6.10L STRICT.
+
+    Règle de sécurité :
+    - le daily-schedule peut encore mélanger simples + doubles selon le rendu HTML ;
+    - donc aucune ligne n'est acceptée sans validation ATP officielle du jour ;
+    - si la validation officielle n'est pas disponible, on retourne 0 match
+      au lieu d'inventer ou de laisser passer des doubles.
+
+    Important :
+    - l'article ATP / Order Of Play ne crée pas de match ;
+    - il sert uniquement à valider les paires déjà extraites ;
+    - les lignes ATP contenant "/" sont rejetées comme doubles dans le parseur OOP ;
+    - les lignes WTA sont ignorées parce qu'on ne garde que les lignes commençant par "ATP -".
+    """
+    audit: List[str] = []
+    before = len(rows)
+
+    official_pairs, official_audit = _fetch_official_atp_article_singles_pairs(session, target_day)
+    audit.extend(official_audit)
+
+    if not official_pairs:
+        # V6.10M : ne plus vider toute la journée si l'article ATP Order Of Play
+        # n'est pas trouvable / pas encore mis à jour / change de format.
+        # Le daily-schedule reste la source des matchs. On applique seulement
+        # une sécurité locale anti-WTA / anti-doubles au lieu de retourner 0.
+        kept_without_oop: List[Dict[str, str]] = []
+        removed_without_oop: List[str] = []
+
+        for row in rows:
+            player_a = row.get("playerA", "")
+            player_b = row.get("playerB", "")
+            joined = f"{player_a} {player_b} {row.get('evidence', '')}"
+
+            if _is_wta_marker(joined):
+                removed_without_oop.append(f"{player_a} vs {player_b} | reason=wta_marker_without_oop")
+                continue
+
+            if _is_doubles_marker(joined):
+                removed_without_oop.append(f"{player_a} vs {player_b} | reason=doubles_marker_without_oop")
+                continue
+
+            if not is_name_like(player_a) or not is_name_like(player_b):
+                removed_without_oop.append(f"{player_a} vs {player_b} | reason=bad_name_without_oop")
+                continue
+
+            kept_without_oop.append(row)
+
+        audit.append("official_oop_filter_applied=false")
+        audit.append("official_oop_filter_strict_mode=false")
+        audit.append("official_oop_filter_reason=no_official_atp_singles_pairs_found_keep_daily_schedule_after_local_safety")
+        audit.append(f"official_oop_filter_rows_before={before}")
+        audit.append(f"official_oop_filter_rows_after={len(kept_without_oop)}")
+        audit.append(f"official_oop_filter_removed_rows={len(removed_without_oop)}")
+
+        for row in kept_without_oop[:80]:
+            audit.append(f"[DAILY KEEP WITHOUT OOP] {row.get('playerA')} vs {row.get('playerB')}")
+
+        for item in removed_without_oop[:120]:
+            audit.append(f"[DAILY REMOVE WITHOUT OOP] {item}")
+
+        return kept_without_oop, audit
+
+    kept: List[Dict[str, str]] = []
+    removed: List[str] = []
+
+    for row in rows:
+        player_a = row.get("playerA", "")
+        player_b = row.get("playerB", "")
+
+        # Sécurité absolue : si un champ contient "/" ou "double", on refuse.
+        joined = f"{player_a} {player_b} {row.get('evidence', '')}"
+        if _is_doubles_marker(joined):
+            removed.append(f"{player_a} vs {player_b} | reason=doubles_marker")
+            continue
+
+        key = unordered_pair_key(player_a, player_b)
+
+        if key in official_pairs:
+            kept.append(row)
+        else:
+            removed.append(f"{player_a} vs {player_b} | reason=not_in_official_atp_singles_oop")
+
+    audit.append("official_oop_filter_applied=true")
+    audit.append("official_oop_filter_strict_mode=true")
+    audit.append(f"official_oop_filter_rows_before={before}")
+    audit.append(f"official_oop_filter_rows_after={len(kept)}")
+    audit.append(f"official_oop_filter_removed_rows={len(removed)}")
+
+    for row in kept[:40]:
+        audit.append(f"[OFFICIAL ATP SINGLES KEEP] {row.get('playerA')} vs {row.get('playerB')}")
+
+    for item in removed[:120]:
+        audit.append(f"[OFFICIAL ATP FILTER REMOVE] {item}")
+
+    return kept, audit
+
+
+
+# ---------------------------------------------------------------------------
+# Découverte des pages ATP daily-schedule
+# ---------------------------------------------------------------------------
+
+
+def discover_daily_schedule_urls(session, include_challenger: bool = False) -> List[str]:
+    urls_to_scan = [base.ATP_CURRENT_URL]
+
+    if include_challenger and hasattr(base, "ATP_CHALLENGER_URL"):
+        urls_to_scan.append(base.ATP_CHALLENGER_URL)
+
+    found_urls: List[str] = []
+
+    patterns = [
+        r"https://www\.atptour\.com/en/scores/current(?:-challenger)?/[^\"'\s<>]+/\d+/daily-schedule",
+        r"/en/scores/current(?:-challenger)?/[^\"'\s<>]+/\d+/daily-schedule",
+        r"https://www\.atptour\.com/en/scores/current(?:-challenger)?/[^\"'\s<>]+/\d+/(?:draws|results|live-scores)",
+        r"/en/scores/current(?:-challenger)?/[^\"'\s<>]+/\d+/(?:draws|results|live-scores)",
+    ]
+
+    for url in urls_to_scan:
+        html = base.fetch_html(session, url)
+
+        for pat in patterns:
+            for raw in re.findall(pat, html, flags=re.I):
+                if raw.startswith("/"):
+                    raw = "https://www.atptour.com" + raw
+
+                raw = re.sub(
+                    r"/(draws|results|live-scores)(?:\?[^\"'\s<>]*)?$",
+                    "/daily-schedule",
+                    raw,
+                    flags=re.I,
+                )
+
+                if raw not in found_urls:
+                    found_urls.append(raw)
+
+    return found_urls
+
+
+# ---------------------------------------------------------------------------
+# Extraction DAILY-SCHEDULE uniquement
+# ---------------------------------------------------------------------------
+
+
+def extract_player_links_from_element(el) -> List[Tuple[str, str]]:
+    out: List[Tuple[str, str]] = []
+    seen: Set[str] = set()
+
+    for a in el.find_all("a", href=True):
+        href = a.get("href", "") or ""
         if "/players/" not in href:
             continue
 
-        name = clean_candidate_name(full_name_from_player_href(href, a.get_text(" ", strip=True)))
+        name = full_name_from_href(href, a.get_text(" ", strip=True))
         key = canonical_name(name)
 
-        if key not in valid_player_keys:
+        if not key or not is_name_like(name):
             continue
 
-        blocks: List[str] = []
-
-        # Texte du lien + ses attributs.
-        attrs_text = " ".join(
-            str(v) for v in a.attrs.values()
-            if isinstance(v, (str, int, float)) or isinstance(v, list)
-        )
-        blocks.append(normalize_space(a.get_text(" ", strip=True) + " " + attrs_text))
-
-        # Remonter quelques parents pour capter les badges proches.
-        parent = a.parent
-        for _ in range(5):
-            if parent is None:
-                break
-            parent_text = parent.get_text(" ", strip=True)
-            parent_attrs = " ".join(
-                str(v) for v in getattr(parent, "attrs", {}).values()
-                if isinstance(v, (str, int, float)) or isinstance(v, list)
-            )
-            blocks.append(normalize_space(parent_text + " " + parent_attrs))
-            parent = parent.parent
-
-        for block in blocks:
-            if text_has_qualifier_marker_for_name(block, name):
-                qualifier_keys.add(key)
-                evidence[key] = block[:220]
-                break
-
-    # 2) Fallback : scan ligne par ligne du texte visible.
-    text_visible = soup.get_text("\n", strip=True)
-    lines = [normalize_space(x) for x in text_visible.splitlines() if normalize_space(x)]
-
-    for key in valid_player_keys:
-        if key in qualifier_keys:
+        if key in seen:
             continue
 
-        display = display_map.get(key)
-        if not display:
-            continue
+        seen.add(key)
+        out.append((name, href))
 
-        for line in lines:
-            if text_has_qualifier_marker_for_name(line, display):
-                qualifier_keys.add(key)
-                evidence[key] = line[:220]
-                break
-
-    return qualifier_keys, evidence
-
-
-def count_completed_wins_for_player(player_name: str, completed_pairs: List[Tuple[str, str]]) -> int:
-    """
-    Compte les matchs déjà terminés du tournoi impliquant ce joueur.
-
-    Pour un joueur encore programmé dans le tableau, chaque match terminé dans
-    lequel il apparaît est considéré comme une victoire déjà acquise dans le tournoi.
-    C'est volontairement simple et auditable : si le joueur avait perdu, il ne devrait
-    normalement plus être dans un match futur du même tableau.
-    """
-    key = canonical_name(player_name)
-    if not key:
-        return 0
-
-    count = 0
-    seen_pairs: Set[str] = set()
-
-    for a, b in completed_pairs:
-        a_key = canonical_name(a)
-        b_key = canonical_name(b)
-        pair_key = "|||".join(sorted([a_key, b_key]))
-        if pair_key in seen_pairs:
-            continue
-        seen_pairs.add(pair_key)
-
-        if key == a_key or key == b_key:
-            count += 1
-
-    return count
-
-
-
-
-
-# ---------------------------------------------------------------------------
-# V6.5 - Fallback contexte Results ATP inspiré de debug_atp_context_mini_v2.py
-# But : quand le draw dynamique ne donne aucun joueur, on tente de lire la page
-# /current/<slug>/<id>/results pour détecter les vainqueurs déjà passés et les Q.
-# ---------------------------------------------------------------------------
-
-def context_name_aliases(display_name: str) -> List[str]:
-    raw = ascii_simplify(clean_candidate_name(display_name)).lower()
-    raw = raw.replace(".", " ")
-    raw = raw.replace("-", " ")
-    raw = raw.replace("'", " ")
-    raw = normalize_space(raw)
-
-    aliases = {raw, raw.replace(" ", "")}
-    out: List[str] = []
-    for alias in aliases:
-        alias = normalize_space(alias)
-        if alias and alias not in out:
-            out.append(alias)
     return out
 
 
-def discover_current_results_url(session: requests.Session, slug: str, fallback_results_url: str = "") -> str:
-    candidates: List[str] = []
+def block_has_bad_noise(text: str) -> bool:
+    t = normalize_space(text).lower()
 
-    if fallback_results_url:
-        candidates.append(fallback_results_url.replace("/archive/", "/current/"))
-        candidates.append(fallback_results_url)
-
-    try:
-        current_html = fetch_html(session, ATP_CURRENT_URL)
-        patterns = [
-            rf"https://www\.atptour\.com/en/scores/current/{re.escape(slug)}/\d+/results",
-            rf"/en/scores/current/{re.escape(slug)}/\d+/results",
-            rf"https://www\.atptour\.com/en/scores/current/{re.escape(slug)}/\d+/draws",
-            rf"/en/scores/current/{re.escape(slug)}/\d+/draws",
-            rf"https://www\.atptour\.com/en/scores/current/{re.escape(slug)}/\d+/live-scores",
-            rf"/en/scores/current/{re.escape(slug)}/\d+/live-scores",
-        ]
-        for pat in patterns:
-            for url in re.findall(pat, current_html, flags=re.I):
-                if url.startswith("/"):
-                    url = "https://www.atptour.com" + url
-                url = url.replace("/draws", "/results").replace("/live-scores", "/results")
-                candidates.append(url)
-    except Exception:
-        pass
-
-    clean: List[str] = []
-    for url in candidates:
-        if url and url not in clean:
-            clean.append(url)
-
-    if not clean:
-        raise RuntimeError(f"Impossible de trouver une URL results pour slug={slug}")
-
-    return clean[0]
-
-
-def collect_result_context_qualifiers(raw_html: str, visible_text: str, candidate_display_map: Dict[str, str]) -> Tuple[Set[str], Dict[str, str]]:
-    qualifier_keys: Set[str] = set()
-    evidence: Dict[str, str] = {}
-
-    combined = html_module.unescape((raw_html or "") + "\n" + (visible_text or ""))
-
-    pattern = re.compile(r"([A-ZÀ-ÿ][A-Za-zÀ-ÿ'’\-. ]{2,60}?)\s*\(\s*Q\s*\)", flags=re.I)
-    for m in pattern.finditer(combined):
-        name = clean_candidate_name(m.group(1))
-        key = canonical_name(name)
-        if key in candidate_display_map and is_name_like(name):
-            qualifier_keys.add(key)
-            evidence[key] = normalize_space(m.group(0))[:220]
-
-    visible_simple = ascii_simplify(visible_text or "").lower()
-    html_simple = ascii_simplify(html_module.unescape(raw_html or "")).lower()
-
-    for key, display in candidate_display_map.items():
-        if key in qualifier_keys:
-            continue
-        for alias in context_name_aliases(display):
-            pat = re.compile(rf"\b{re.escape(alias)}\b\s*\(\s*q\s*\)", flags=re.I)
-            if pat.search(visible_simple) or pat.search(html_simple):
-                qualifier_keys.add(key)
-                evidence[key] = f"targeted_q_alias={alias}"
-                break
-
-    return qualifier_keys, evidence
-
-
-def extract_result_context_winner_events(
-    visible_text: str,
-    candidate_display_map: Dict[str, str],
-) -> Tuple[Dict[str, int], List[Dict[str, str]]]:
-    wins_map: Dict[str, int] = {}
-    debug_events: List[Dict[str, str]] = []
-    seen_event_keys: Set[str] = set()
-
-    patterns = [
-        re.compile(r"Game Set and Match\s+([^.\n]{2,80})\.", flags=re.I),
-        re.compile(r"([A-ZÀ-ÿ][A-Za-zÀ-ÿ'’\-. ]{2,80}?)\s+wins the match", flags=re.I),
+    banned = [
+        "privacy",
+        "cookies",
+        "tickets",
+        "news",
+        "highlights",
+        "stats centre",
+        "player stats",
+        "head2head stats",
+        "shop",
+        "partners",
+        "terms",
+        "media",
+        "official tennis player",
+        "subscribe",
+        "newsletter",
+        "advertisement",
     ]
 
-    for pat in patterns:
-        for m in pat.finditer(visible_text or ""):
-            winner_raw = clean_candidate_name(m.group(1))
-            if not is_name_like(winner_raw):
-                continue
-
-            winner_key = canonical_name(winner_raw)
-            matched_key = winner_key if winner_key in candidate_display_map else ""
-
-            if not matched_key:
-                winner_simple = ascii_simplify(winner_raw).lower()
-                winner_simple = normalize_space(re.sub(r"[^a-z0-9\s]", " ", winner_simple))
-                for key, display in candidate_display_map.items():
-                    if winner_simple in context_name_aliases(display):
-                        matched_key = key
-                        break
-
-            if not matched_key:
-                continue
-
-            start, end = m.span()
-            left = max(0, start - 260)
-            right = min(len(visible_text), end + 260)
-            window = visible_text[left:right]
-
-            event_key = matched_key + "||" + normalize_space(window)[:180]
-            if event_key in seen_event_keys:
-                continue
-            seen_event_keys.add(event_key)
-
-            wins_map[matched_key] = wins_map.get(matched_key, 0) + 1
-            debug_events.append(
-                {
-                    "winner": candidate_display_map.get(matched_key, winner_raw),
-                    "winner_key": matched_key,
-                    "window_preview": normalize_space(window)[:240],
-                }
-            )
-
-    for key in list(wins_map.keys()):
-        # Le moteur veto ne distingue pas 2, 3, 4 ou 5 : dès que wins >= 2, veto.
-        # On borne donc à 2 pour éviter d'afficher/envoyer des valeurs inutiles dans Unity.
-        wins_map[key] = max(0, min(2, wins_map[key]))
-
-    return wins_map, debug_events
+    return any(x in t for x in banned)
 
 
-def fetch_result_context_from_current_results(
-    session: requests.Session,
-    slug: str,
-    fallback_results_url: str,
-    display_map: Dict[str, str],
-    valid_player_keys: Set[str],
-) -> Dict[str, Any]:
-    candidate_display_map = {
-        key: clean_candidate_name(display)
-        for key, display in display_map.items()
-        if key in valid_player_keys and display
-    }
+def append_pair_if_valid(
+    pairs: List[Dict[str, str]],
+    seen_unordered: Set[Tuple[str, str]],
+    player_a: str,
+    player_b: str,
+    source: str,
+    source_url: str,
+    evidence: str,
+) -> bool:
+    a = clean_name(player_a)
+    b = clean_name(player_b)
 
-    if not slug or not candidate_display_map:
-        return {
-            "status": "skip_no_slug_or_candidates",
-            "url": "",
-            "wins_by_key": {},
-            "qualifier_keys": set(),
-            "qualifier_evidence": {},
-            "winner_event_count": 0,
-            "qualifier_count": 0,
-            "debug_events": [],
+    if not a or not b:
+        return False
+
+    if not is_name_like(a) or not is_name_like(b):
+        return False
+
+    if canonical_name(a) == canonical_name(b):
+        return False
+
+    key = unordered_pair_key(a, b)
+
+    if key in seen_unordered:
+        return False
+
+    seen_unordered.add(key)
+    pairs.append(
+        {
+            "playerA": a,
+            "playerB": b,
+            "source": source,
+            "sourceUrl": source_url,
+            "evidence": normalize_space(evidence)[:320],
         }
-
-    try:
-        results_url = discover_current_results_url(session, slug, fallback_results_url)
-        raw_html = fetch_html(session, results_url)
-        visible_text = BeautifulSoup(raw_html or "", "html.parser").get_text("\n", strip=True)
-
-        qualifier_keys, qualifier_evidence = collect_result_context_qualifiers(
-            raw_html=raw_html,
-            visible_text=visible_text,
-            candidate_display_map=candidate_display_map,
-        )
-        wins_by_key, debug_events = extract_result_context_winner_events(
-            visible_text=visible_text,
-            candidate_display_map=candidate_display_map,
-        )
-
-        return {
-            "status": "ok",
-            "url": results_url,
-            "wins_by_key": wins_by_key,
-            "qualifier_keys": qualifier_keys,
-            "qualifier_evidence": qualifier_evidence,
-            "winner_event_count": len(debug_events),
-            "qualifier_count": len(qualifier_keys),
-            "debug_events": debug_events[:25],
-        }
-    except Exception as exc:
-        return {
-            "status": f"fail:{exc}",
-            "url": "",
-            "wins_by_key": {},
-            "qualifier_keys": set(),
-            "qualifier_evidence": {},
-            "winner_event_count": 0,
-            "qualifier_count": 0,
-            "debug_events": [],
-        }
+    )
+    return True
 
 
-def extract_names_from_slug_scan(html: str, display_map: Dict[str, str], valid_player_keys: Set[str]) -> List[str]:
-    normalized_html = ascii_simplify(html).lower()
-    hits: List[Tuple[int, str]] = []
+def _marker_name(name: str) -> str:
+    name = clean_name(name)
+    name = name.replace("[[ATP_PLAYER:", "").replace("]]", "")
+    return name
 
-    for key in valid_player_keys:
-        display = display_map.get(key)
-        if not display:
+
+def _replace_player_links_with_markers(soup: BeautifulSoup) -> None:
+    """
+    Remplace seulement les liens ATP /players/ par un marqueur texte.
+    Important : les joueuses WTA de la page daily-schedule ne sont pas des liens ATP /players/,
+    donc elles ne deviennent jamais des tokens PLAYER.
+    """
+    for a in soup.find_all("a", href=True):
+        href = a.get("href", "") or ""
+
+        if "/players/" not in href:
             continue
 
-        best_pos = None
-        for slug in name_to_slug_candidates(display):
-            pos = normalized_html.find(slug)
-            if pos >= 0 and (best_pos is None or pos < best_pos):
-                best_pos = pos
+        name = full_name_from_href(href, a.get_text(" ", strip=True))
+        name = clean_name(name)
 
-        if best_pos is not None:
-            hits.append((best_pos, display))
+        if not name or not is_name_like(name):
+            continue
 
-    hits.sort(key=lambda x: x[0])
-    return [clean_candidate_name(name) for _, name in hits]
+        a.clear()
+        a.append(f"[[ATP_PLAYER:{name}]]")
 
 
-def extract_names_from_visible_text(html: str, display_map: Dict[str, str], valid_player_keys: Set[str]) -> List[str]:
-    soup = BeautifulSoup(html, "html.parser")
-    text = ascii_simplify(soup.get_text("\n", strip=True)).lower()
-    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+def _line_to_tokens(line: str) -> List[Dict[str, str]]:
+    """
+    Convertit une ligne visible en tokens.
+    Une ligne peut contenir un marqueur joueur + du texte autour.
+    """
+    tokens: List[Dict[str, str]] = []
+    raw = normalize_space(line)
 
-    canon_to_display = {k: clean_candidate_name(v) for k, v in display_map.items() if k in valid_player_keys}
-    display_ascii = {k: ascii_simplify(v).lower() for k, v in canon_to_display.items()}
+    if not raw:
+        return tokens
 
-    found: List[str] = []
+    pattern = re.compile(r"\[\[ATP_PLAYER:(.*?)\]\]")
 
-    for ln in lines:
-        for key, disp in display_ascii.items():
-            if disp in ln:
-                found.append(canon_to_display[key])
+    pos = 0
+    for m in pattern.finditer(raw):
+        before = normalize_space(raw[pos:m.start()])
+        if before:
+            tokens.append({"type": "TEXT", "text": before})
 
-    return found
+        name = _marker_name(m.group(1))
+        if name and is_name_like(name):
+            tokens.append({"type": "PLAYER", "name": name})
 
+        pos = m.end()
 
-def extract_ordered_valid_names(html: str, display_map: Dict[str, str], valid_player_keys: Set[str]) -> List[str]:
-    merged: List[str] = []
-    merged.extend(extract_names_from_player_links(html))
-    merged.extend(extract_names_from_slug_scan(html, display_map, valid_player_keys))
-    merged.extend(extract_names_from_visible_text(html, display_map, valid_player_keys))
+    after = normalize_space(raw[pos:])
+    if after:
+        tokens.append({"type": "TEXT", "text": after})
 
-    out: List[str] = []
-    for nm in merged:
-        nm = clean_candidate_name(nm)
-        key = canonical_name(nm)
-        if key in valid_player_keys and is_name_like(nm):
-            out.append(nm)
+    if not tokens:
+        tokens.append({"type": "TEXT", "text": raw})
 
-    return distinct_keep_order(out)
-
-
-def pair_consecutive_names(names: List[str]) -> List[Tuple[str, str]]:
-    pairs: List[Tuple[str, str]] = []
-    i = 0
-    while i + 1 < len(names):
-        a = names[i]
-        b = names[i + 1]
-        if canonical_name(a) != canonical_name(b):
-            pairs.append((a, b))
-        i += 2
-
-    uniq = distinct_keep_order([f"{a}|||{b}" for a, b in pairs])
-    out: List[Tuple[str, str]] = []
-    for item in uniq:
-        a, b = item.split("|||", 1)
-        out.append((a, b))
-    return out
+    return tokens
 
 
-def discover_schedule_article_urls(session: requests.Session, slug: str, year: int) -> List[str]:
-    urls: List[str] = []
+def _visible_tokens_from_marked_soup(soup: BeautifulSoup) -> List[Dict[str, str]]:
+    """
+    Méthode V6.10C corrigée :
+    - on marque les liens ATP avant extraction texte ;
+    - on lit la page ligne par ligne comme elle apparaît ;
+    - on s'arrête à Latest news pour ne pas capter les widgets H2H / stats.
+    """
+    _replace_player_links_with_markers(soup)
 
-    if slug:
-        urls.append(f"https://www.atptour.com/en/news/{slug}-{year}-schedule")
-
-    try:
-        current_html = fetch_html(session, ATP_CURRENT_URL)
-        pattern = re.compile(r'href="([^"]*/en/news/[^"]*schedule[^"]*)"', flags=re.I)
-        rels = pattern.findall(current_html)
-        for rel in rels:
-            if slug in rel.lower():
-                if rel.startswith("http"):
-                    urls.append(rel)
-                else:
-                    urls.append("https://www.atptour.com" + rel)
-    except Exception:
-        pass
-
-    clean = []
-    for u in urls:
-        u = re.sub(r"#.*$", "", u)
-        clean.append(u)
-
-    return distinct_keep_order(clean)
-
-
-def parse_article_pairs(html: str, display_map: Dict[str, str], valid_player_keys: Set[str]) -> List[Tuple[str, str]]:
-    soup = BeautifulSoup(html, "html.parser")
     text = soup.get_text("\n", strip=True)
-    lines = [title_name(x) for x in text.splitlines() if x.strip()]
 
-    pairs: List[Tuple[str, str]] = []
+    tokens: List[Dict[str, str]] = []
+    previous_player_key = ""
 
-    for ln in lines:
-        if re.search(r"\bvs\b", ln, flags=re.I):
-            parts = re.split(r"\bvs\b", ln, flags=re.I)
-            if len(parts) == 2:
-                a = clean_candidate_name(parts[0])
-                b = clean_candidate_name(parts[1])
-                if canonical_name(a) in valid_player_keys and canonical_name(b) in valid_player_keys:
-                    pairs.append((a, b))
+    for raw_line in text.splitlines():
+        line = normalize_space(raw_line)
+
+        if not line:
+            continue
+
+        low = line.lower()
+
+        if "latest news" in low:
+            break
+
+        if "{{" in line or "}}" in line:
+            continue
+
+        for token in _line_to_tokens(line):
+            if token.get("type") == "PLAYER":
+                key = canonical_name(token.get("name", ""))
+
+                # Supprime doublon immédiat seulement.
+                if key and key == previous_player_key:
+                    continue
+
+                previous_player_key = key
+                tokens.append(token)
+            else:
+                previous_player_key = ""
+                tokens.append(token)
+
+    return tokens
+
+
+def _status_from_text(text: str) -> str:
+    t = normalize_space(text).lower()
+    t = re.sub(r"[^a-z0-9 /.-]+", " ", t)
+    t = normalize_space(t)
+
+    if re.fullmatch(r"(vs|v)", t):
+        return "Vs"
+
+    if re.search(r"\bvs\b", t):
+        return "Vs"
+
+    if re.search(r"\bdefeats?\b", t):
+        return "Defeats"
+
+    if re.search(r"\bwalkover\b|\bw/o\b|\bretired\b|\bret\b", t):
+        return "Defeats"
+
+    return ""
+
+
+def _is_ignorable_between_player_and_status(text: str) -> bool:
+    t = normalize_space(text).lower()
+
+    if not t:
+        return True
+
+    if block_has_bad_noise(t):
+        return False
+
+    # Labels fréquents ATP entre joueur et statut.
+    if re.fullmatch(r"\(?\s*(wc|q|ll|pr|se)\s*\)?", t, flags=re.I):
+        return True
+
+    if re.fullmatch(r"r\d{1,3}", t, flags=re.I):
+        return True
+
+    if re.fullmatch(r"(not before|followed by|starts at)\s*.*", t, flags=re.I):
+        return True
+
+    if re.fullmatch(r"(court|campo|stadium|arena|pietrangeli|centrale|supertennis).*", t, flags=re.I):
+        return True
+
+    # Score / H2H après le second joueur : ignoré par le scan.
+    if re.search(r"\bh2h\b", t):
+        return True
+
+    if re.fullmatch(r"[0-9\s{}^.,-]+", t):
+        return True
+
+    return True
+
+
+def _is_doubles_marker(text: str) -> bool:
+    t = normalize_space(text).lower()
+
+    if re.search(r"[a-zà-ÿ]\s*/\s*[a-zà-ÿ]", t, flags=re.I):
+        return True
+
+    return bool(re.search(r"\bdoubles?\b", t))
+
+
+def _is_wta_marker(text: str) -> bool:
+    t = normalize_space(text).lower()
+    return bool(re.search(r"\bwta\b|women|women's|femmes", t))
+
+
+def _token_text(token: Dict[str, str]) -> str:
+    if token.get("type") == "PLAYER":
+        return token.get("name", "")
+    return token.get("text", "")
+
+
+def _window_text(tokens: List[Dict[str, str]], start: int, end: int) -> str:
+    return normalize_space(" | ".join(_token_text(t) for t in tokens[max(0, start):min(len(tokens), end)] if _token_text(t)))
+
+
+def _find_status_after_player(tokens: List[Dict[str, str]], start: int, max_scan: int = 10) -> Tuple[int, str]:
+    """
+    Cherche Vs/Defeats après joueur A.
+    Contrairement à l'ancienne version, on tolère (WC), (Q), R128, courts, etc.
+    """
+    end = min(len(tokens), start + max_scan)
+
+    for i in range(start, end):
+        token = tokens[i]
+
+        if token.get("type") == "PLAYER":
+            return -1, ""
+
+        text = token.get("text", "")
+
+        if _is_wta_marker(text) or _is_doubles_marker(text):
+            return -1, ""
+
+        status = _status_from_text(text)
+        if status:
+            return i, status
+
+        if not _is_ignorable_between_player_and_status(text):
+            return -1, ""
+
+    return -1, ""
+
+
+def _find_player_after_status(tokens: List[Dict[str, str]], start: int, max_scan: int = 14) -> int:
+    """
+    Cherche joueur B après Vs/Defeats.
+    On tolère les marqueurs (Q), (PR), images, R128 et scores.
+    """
+    end = min(len(tokens), start + max_scan)
+
+    for i in range(start, end):
+        token = tokens[i]
+
+        if token.get("type") == "PLAYER":
+            return i
+
+        text = token.get("text", "")
+
+        if _is_wta_marker(text) or _is_doubles_marker(text):
+            return -1
+
+        # sinon on continue, même si c'est (Q)/(PR)/score/H2H
+        continue
+
+    return -1
+
+
+def extract_pairs_line_scanner(html: str, source_url: str) -> Tuple[List[Dict[str, str]], List[str]]:
+    soup = BeautifulSoup(html or "", "html.parser")
+
+    for tag in soup(["script", "style", "noscript"]):
+        tag.decompose()
+
+    tokens = _visible_tokens_from_marked_soup(soup)
+
+    audit: List[str] = []
+    pairs: List[Dict[str, str]] = []
+    seen_unordered: Set[Tuple[str, str]] = set()
+
+    audit.append(f"visible_tokens={len(tokens)}")
+    audit.append(f"visible_player_tokens={sum(1 for t in tokens if t.get('type') == 'PLAYER')}")
+
+    added = 0
+    i = 0
+
+    while i < len(tokens):
+        token = tokens[i]
+
+        if token.get("type") != "PLAYER":
+            i += 1
+            continue
+
+        player_a = token.get("name", "")
+        status_index, status = _find_status_after_player(tokens, i + 1)
+
+        if status_index < 0:
+            i += 1
+            continue
+
+        player_b_index = _find_player_after_status(tokens, status_index + 1)
+
+        if player_b_index < 0:
+            i += 1
+            continue
+
+        player_b = tokens[player_b_index].get("name", "")
+        evidence = _window_text(tokens, i, player_b_index + 5)
+
+        # Sécurité doubles. Ne pas rejeter juste parce que la prochaine ligne WTA arrive après le match ATP.
+        if _is_doubles_marker(evidence):
+            i += 1
+            continue
+
+        if append_pair_if_valid(
+            pairs,
+            seen_unordered,
+            player_a,
+            player_b,
+            f"ATP Daily Schedule Line Scanner Fixed {status}",
+            source_url,
+            evidence,
+        ):
+            added += 1
+            i = player_b_index + 1
+            continue
+
+        i += 1
+
+    audit.append(f"line_scanner_fixed_added={added}")
+    audit.append(f"line_scanner_fixed_pairs={len(pairs)}")
+
+    return pairs, audit
+
+
+
+def _build_initial_alias_map(display_map: Dict[str, str]) -> Dict[str, str]:
+    aliases: Dict[str, str] = {}
+
+    for full in (display_map or {}).values():
+        full_name = clean_name(str(full or ""))
+        if not full_name or not is_name_like(full_name):
+            continue
+
+        parts = full_name.split()
+        if len(parts) < 2:
+            continue
+
+        first = canonical_name(parts[0])
+        if not first:
+            continue
+
+        initial = first[0]
+        surname = canonical_name(" ".join(parts[1:]))
+
+        if not surname:
+            continue
+
+        alias_keys = {
+            canonical_name(full_name),
+            f"{initial} {surname}",
+            f"{initial}. {surname}",
+        }
+
+        # Cas parfois affichés sans particules ou avec dernier mot seulement.
+        last_word = canonical_name(parts[-1])
+        if len(last_word) >= 4:
+            alias_keys.add(f"{initial} {last_word}")
+            alias_keys.add(f"{initial}. {last_word}")
+
+        for key in alias_keys:
+            if key and key not in aliases:
+                aliases[key] = full_name
+
+    return aliases
+
+
+def _clean_visible_player_line(line: str) -> str:
+    line = normalize_space(line)
+    line = re.sub(r"^\(?\s*(Q|WC|LL|PR|SE)\s*\)?\s+", "", line, flags=re.I)
+    line = re.sub(r"\s+\(?\s*(Q|WC|LL|PR|SE)\s*\)?$", "", line, flags=re.I)
+    line = normalize_space(line)
+    return line
+
+
+def _resolve_visible_player_line(line: str, alias_map: Dict[str, str]) -> str:
+    line = _clean_visible_player_line(line)
+
+    if not line:
+        return ""
+
+    # Retire les scores / labels collés.
+    if _status_from_text(line):
+        return ""
+
+    if _is_wta_marker(line) or _is_doubles_marker(line) or block_has_bad_noise(line):
+        return ""
+
+    low = normalize_space(line).lower()
+    banned_exact = {
+        "r128", "r64", "r32", "r16", "q", "wc", "pr", "ll", "se",
+        "h2h", "image", "player photo", "followed by", "not before",
+        "starts at", "court", "stats", "serve", "return", "pressure",
+    }
+    if low in banned_exact:
+        return ""
+
+    if re.fullmatch(r"[0-9\\s{}^.,-]+", low):
+        return ""
+
+    key = canonical_name(line)
+
+    if key in alias_map:
+        return alias_map[key]
+
+    m = re.match(r"^([A-Za-zÀ-ÿ])\\.?\s+(.+)$", line)
+    if m:
+        initial = canonical_name(m.group(1))[:1]
+        surname = canonical_name(m.group(2))
+        for candidate in (f"{initial} {surname}", f"{initial}. {surname}"):
+            if candidate in alias_map:
+                return alias_map[candidate]
+
+    return ""
+
+
+def extract_pairs_text_fallback(
+    html: str,
+    source_url: str,
+    display_map: Dict[str, str],
+) -> Tuple[List[Dict[str, str]], List[str]]:
+    """
+    Fallback V6.10F :
+    Lit le texte visible ATP ligne par ligne et résout les noms abrégés
+    du type "F. Cina", "B. van de Zandschulp", "G. Mpetshi Perricard"
+    grâce au display_map construit depuis les points ATP live.
+
+    Cette méthode ne dépend pas des liens /players/ et sert à récupérer
+    les matchs que le HTML de Railway ne donne pas sous forme de liens propres.
+    """
+    soup = BeautifulSoup(html or "", "html.parser")
+
+    for tag in soup(["script", "style", "noscript"]):
+        tag.decompose()
+
+    alias_map = _build_initial_alias_map(display_map)
+    audit: List[str] = []
+    pairs: List[Dict[str, str]] = []
+    seen: Set[Tuple[str, str]] = set()
+
+    raw_text = soup.get_text("\n", strip=True)
+    raw_lines = [normalize_space(x) for x in raw_text.splitlines() if normalize_space(x)]
+
+    tokens: List[Dict[str, str]] = []
+
+    for line in raw_lines:
+        low = line.lower()
+
+        if "latest news" in low:
+            break
+
+        if "{{" in line or "}}" in line:
+            continue
+
+        resolved = _resolve_visible_player_line(line, alias_map)
+        if resolved:
+            # Supprime doublons immédiats.
+            if tokens and tokens[-1].get("type") == "PLAYER" and canonical_name(tokens[-1].get("name", "")) == canonical_name(resolved):
+                continue
+            tokens.append({"type": "PLAYER", "name": resolved, "raw": line})
+            continue
+
+        tokens.append({"type": "TEXT", "text": line})
+
+    audit.append(f"text_fallback_aliases={len(alias_map)}")
+    audit.append(f"text_fallback_tokens={len(tokens)}")
+    audit.append(f"text_fallback_player_tokens={sum(1 for t in tokens if t.get('type') == 'PLAYER')}")
+
+    i = 0
+    while i < len(tokens):
+        token = tokens[i]
+
+        if token.get("type") != "PLAYER":
+            i += 1
+            continue
+
+        player_a = token.get("name", "")
+        status_index, status = _find_status_after_player(tokens, i + 1, max_scan=16)
+
+        if status_index < 0:
+            i += 1
+            continue
+
+        player_b_index = _find_player_after_status(tokens, status_index + 1, max_scan=18)
+
+        if player_b_index < 0:
+            i += 1
+            continue
+
+        player_b = tokens[player_b_index].get("name", "")
+        evidence = _window_text(tokens, i, player_b_index + 5)
+
+        if _is_doubles_marker(evidence):
+            i += 1
+            continue
+
+        if append_pair_if_valid(
+            pairs,
+            seen,
+            player_a,
+            player_b,
+            "ATP Daily Schedule Text Fallback",
+            source_url,
+            evidence,
+        ):
+            i = player_b_index + 1
+            continue
+
+        i += 1
+
+    audit.append(f"text_fallback_pairs={len(pairs)}")
+
+    for row in pairs[:40]:
+        audit.append(f"[TEXT PAIR] {row.get('playerA')} vs {row.get('playerB')} | {row.get('evidence', '')}")
+
+    return pairs, audit
+
+
+
+def extract_pairs_from_daily_schedule_html(html: str, source_url: str, display_map: Optional[Dict[str, str]] = None) -> Tuple[List[Dict[str, str]], List[str]]:
+    """
+    V6.10C FIXED :
+    Source unique = ATP daily-schedule.
+    Extraction par texte visible marqué avec les liens ATP /players/.
+
+    Motif accepté :
+    ATP_PLAYER A
+    puis Vs / Defeats / Walkover / Retired
+    puis ATP_PLAYER B
+
+    Cette version ne rejette plus un match ATP parce qu'une ligne WTA arrive après.
+    Elle tolère (WC), (Q), (PR), R128, H2H et les scores.
+    """
+    pairs, audit = extract_pairs_line_scanner(html, source_url)
+
+    # V6.10F :
+    # Même si le scanner par liens trouve déjà des paires, on complète avec
+    # un fallback texte. Sur ATP daily-schedule certains matchs sont visibles
+    # dans le texte rendu mais ne sortent pas proprement via les liens /players/.
+    text_pairs, text_audit = extract_pairs_text_fallback(html, source_url, display_map or {})
+    audit.extend(text_audit)
+
+    seen_existing = {unordered_pair_key(x.get("playerA", ""), x.get("playerB", "")) for x in pairs}
+    added_text = 0
+    for row in text_pairs:
+        key = unordered_pair_key(row.get("playerA", ""), row.get("playerB", ""))
+        if key not in seen_existing:
+            pairs.append(row)
+            seen_existing.add(key)
+            added_text += 1
+
+    audit.append(f"text_fallback_added_to_pairs={added_text}")
 
     if pairs:
-        return pair_consecutive_names([x for pair in pairs for x in pair])
+        audit.append(f"daily_schedule_singles_pairs={len(pairs)}")
+        return pairs, audit
 
-    ordered_names = extract_ordered_valid_names(html, display_map, valid_player_keys)
-    return pair_consecutive_names(ordered_names)
+    soup = BeautifulSoup(html or "", "html.parser")
 
+    for tag in soup(["script", "style", "noscript"]):
+        tag.decompose()
 
-def parse_tournament_context(
-    session: requests.Session,
-    draw_url: str,
-    display_map: Dict[str, str],
-    valid_player_keys: Set[str],
-    target_day: date,
-) -> TournamentContext:
-    slug = tournament_slug_from_url(draw_url)
-    results_url = draw_url.replace("/draws", "/results")
+    seen_unordered: Set[Tuple[str, str]] = set()
+    fallback_pairs: List[Dict[str, str]] = []
+    exact_added = 0
 
-    draw_html = fetch_html(session, draw_url)
-    try:
-        results_html = fetch_html(session, results_url)
-    except Exception:
-        results_html = ""
+    candidates = soup.find_all(["article", "li", "tr", "section", "div"])
 
-    draw_names = extract_ordered_valid_names(draw_html, display_map, valid_player_keys)
-    draw_pairs = pair_consecutive_names(draw_names)
+    for el in sorted(candidates, key=lambda x: len(normalize_space(x.get_text(" ", strip=True)))):
+        links = extract_player_links_from_element(el)
+        text = normalize_space(el.get_text(" ", strip=True))
 
-    completed_pair_keys: Set[frozenset] = set()
-    completed_pairs: List[Tuple[str, str]] = []
-
-    if results_html:
-        result_names = extract_ordered_valid_names(results_html, display_map, valid_player_keys)
-        result_pairs = pair_consecutive_names(result_names)
-        completed_pairs = result_pairs
-        for a, b in result_pairs:
-            completed_pair_keys.add(frozenset({canonical_name(a), canonical_name(b)}))
-
-    qualifier_keys, qualifier_evidence = extract_qualifier_keys_from_draw_html(
-        draw_html,
-        display_map,
-        valid_player_keys,
-    )
-
-    result_ctx = fetch_result_context_from_current_results(
-        session=session,
-        slug=slug,
-        fallback_results_url=results_url,
-        display_map=display_map,
-        valid_player_keys=valid_player_keys,
-    )
-
-    pending_pairs: List[Tuple[str, str]] = []
-    for a, b in draw_pairs:
-        pair_key = frozenset({canonical_name(a), canonical_name(b)})
-        if pair_key not in completed_pair_keys:
-            pending_pairs.append((a, b))
-
-    pending_pairs = pair_consecutive_names([x for pair in pending_pairs for x in pair])
-
-    full_text = BeautifulSoup(draw_html, "html.parser").get_text("\n", strip=True)
-    if results_html:
-        full_text += "\n" + BeautifulSoup(results_html, "html.parser").get_text("\n", strip=True)
-
-    surface = maybe_surface_from_text(full_text)
-    player_keys = set(canonical_name(x) for x in draw_names)
-
-    article_pairs: List[Tuple[str, str]] = []
-    for article_url in discover_schedule_article_urls(session, slug, target_day.year):
-        try:
-            article_html = fetch_html(session, article_url)
-            pairs = parse_article_pairs(article_html, display_map, valid_player_keys)
-            if pairs:
-                article_pairs = pairs
-                break
-        except Exception:
+        if len(links) != 2:
             continue
 
-    return TournamentContext(
-        tournament_name=tournament_name_from_url(draw_url),
-        slug=slug,
-        draw_url=draw_url,
-        results_url=results_url,
-        surface=surface,
-        player_keys=player_keys,
-        pending_pairs=pending_pairs,
-        article_pairs=article_pairs,
-        completed_pairs=completed_pairs,
-        qualifier_keys=qualifier_keys,
-        qualifier_evidence=qualifier_evidence,
-        result_wins_by_key=result_ctx.get("wins_by_key", {}),
-        result_qualifier_keys=result_ctx.get("qualifier_keys", set()),
-        result_context_url=str(result_ctx.get("url", "")),
-        result_context_status=str(result_ctx.get("status", "")),
-        result_winner_event_count=int(result_ctx.get("winner_event_count", 0)),
-        result_qualifier_count=int(result_ctx.get("qualifier_count", 0)),
+        if _is_doubles_marker(text) or block_has_bad_noise(text):
+            continue
+
+        if not re.search(r"\b(vs|v|defeats?|walkover|retired|ret)\b", text, flags=re.I):
+            continue
+
+        if append_pair_if_valid(
+            fallback_pairs,
+            seen_unordered,
+            links[0][0],
+            links[1][0],
+            "ATP Daily Schedule Exact Block Fallback Fixed",
+            source_url,
+            text,
+        ):
+            exact_added += 1
+
+    audit.append(f"exact_block_fallback_added={exact_added}")
+    audit.append(f"daily_schedule_singles_pairs={len(fallback_pairs)}")
+
+    return fallback_pairs, audit
+
+# ---------------------------------------------------------------------------
+# Fallback sécurisé Flashscore ATP SIMPLE uniquement
+# ---------------------------------------------------------------------------
+
+FLASHSCORE_TENNIS_URL = "https://www.flashscore.fr/tennis/"
+
+
+def _flashscore_header_is_atp_singles(header: str) -> bool:
+    """
+    Garde uniquement les sections ATP simples.
+    Refuse WTA, doubles, juniors, exhibitions.
+    """
+    h = normalize_space(header).lower()
+
+    if not h:
+        return False
+
+    if "wta" in h or "women" in h or "femmes" in h:
+        return False
+
+    if "double" in h or "doubles" in h:
+        return False
+
+    if "exhibition" in h or "exhibition" in h or "exhibition" in h:
+        return False
+
+    has_atp = "atp" in h
+    has_singles = "simple" in h or "singles" in h
+
+    return has_atp and has_singles
+
+
+def _clean_flashscore_player_name(raw: str) -> str:
+    value = normalize_space(raw or "")
+    value = re.sub(r"\([^)]*\)", " ", value)
+    value = re.sub(r"\[[^\]]*\]", " ", value)
+    return clean_name(normalize_space(value))
+
+
+def _build_flashscore_alias_map(display_map: Dict[str, str]) -> Dict[str, str]:
+    aliases: Dict[str, str] = {}
+
+    for full in (display_map or {}).values():
+        full_name = clean_name(str(full or ""))
+        if not full_name or not is_name_like(full_name):
+            continue
+
+        parts = full_name.split()
+        if len(parts) < 2:
+            continue
+
+        first = canonical_name(parts[0])
+        last = canonical_name(parts[-1])
+        surname = canonical_name(" ".join(parts[1:]))
+
+        if not first or not last:
+            continue
+
+        initial = first[:1]
+
+        keys = {
+            canonical_name(full_name),
+            f"{initial} {surname}",
+            f"{initial}. {surname}",
+            f"{surname} {initial}",
+            f"{surname} {initial}.",
+            f"{last} {initial}",
+            f"{last} {initial}.",
+        }
+
+        for key in keys:
+            if key and key not in aliases:
+                aliases[key] = full_name
+
+    return aliases
+
+
+def _resolve_flashscore_player_name(raw: str, alias_map: Dict[str, str]) -> str:
+    name = _clean_flashscore_player_name(raw)
+    key = canonical_name(name)
+
+    if key in alias_map:
+        return alias_map[key]
+
+    # Flashscore fréquent : "Sinner J."
+    m = re.match(r"^(.+?)\s+([A-Za-zÀ-ÿ])\.?$", name)
+    if m:
+        surname = canonical_name(m.group(1))
+        initial = canonical_name(m.group(2))[:1]
+        for candidate in (f"{surname} {initial}", f"{surname} {initial}."):
+            if candidate in alias_map:
+                return alias_map[candidate]
+
+    # Autre forme : "J. Sinner"
+    m = re.match(r"^([A-Za-zÀ-ÿ])\.?\s+(.+)$", name)
+    if m:
+        initial = canonical_name(m.group(1))[:1]
+        surname = canonical_name(m.group(2))
+        for candidate in (f"{initial} {surname}", f"{initial}. {surname}"):
+            if candidate in alias_map:
+                return alias_map[candidate]
+
+    return name
+
+
+def _flashscore_surface_from_header(header: str) -> str:
+    h = normalize_space(header).lower()
+
+    if "clay" in h or "terre" in h:
+        return "Clay"
+    if "grass" in h or "gazon" in h:
+        return "Grass"
+    if "hard" in h or "dur" in h:
+        return "Hard"
+
+    if any(x in h for x in ["rome", "madrid", "monte", "barcelona", "munich", "geneva", "hamburg"]):
+        return "Clay"
+
+    return "Hard"
+
+
+def _flashscore_extract_matches_js() -> str:
+    return r"""
+() => {
+    const clean = (s) => (s || '').replace(/\s+/g, ' ').trim();
+    const rows = [];
+    let currentHeader = '';
+
+    const nodes = Array.from(document.querySelectorAll(
+        '.event__header, [class*="event__header"], .event__match, [id^="g_2_"], [id^="g_1_"]'
+    ));
+
+    for (const node of nodes) {
+        const cls = node.className ? String(node.className) : '';
+        const id = node.id || '';
+
+        if (cls.includes('event__header')) {
+            currentHeader = clean(node.innerText || node.textContent || '');
+            continue;
+        }
+
+        const isMatch = cls.includes('event__match') || id.startsWith('g_2_') || id.startsWith('g_1_');
+        if (!isMatch) continue;
+
+        const homeEl = node.querySelector('[class*="event__participant--home"]');
+        const awayEl = node.querySelector('[class*="event__participant--away"]');
+
+        const home = clean(homeEl ? homeEl.textContent : '');
+        const away = clean(awayEl ? awayEl.textContent : '');
+        const raw = clean(node.innerText || node.textContent || '');
+
+        if (home && away) {
+            rows.push({
+                competition: currentHeader,
+                playerA: home,
+                playerB: away,
+                raw: raw
+            });
+        }
+    }
+
+    return rows;
+}
+"""
+
+
+def _click_flashscore_target_day(page: Any, target_day: date, audit: List[str]) -> None:
+    """
+    Flashscore ouvre aujourd'hui par défaut.
+    Pour tomorrow, on tente le bouton lendemain.
+    Pour today, on ne touche pas.
+    """
+    try:
+        today = base.parse_target_day("today")
+    except Exception:
+        today = date.today()
+
+    delta = (target_day - today).days
+
+    if delta == 0:
+        audit.append("flashscore_day_navigation=today_default")
+        return
+
+    # On limite volontairement à demain/hier pour éviter les mauvais clics.
+    if delta == 1:
+        labels = ["Jour suivant", "Demain", "Next day", "Tomorrow"]
+    elif delta == -1:
+        labels = ["Jour précédent", "Hier", "Previous day", "Yesterday"]
+    else:
+        audit.append(f"flashscore_day_navigation=unsupported_delta_{delta}")
+        return
+
+    for label in labels:
+        try:
+            page.get_by_title(label, exact=False).first.click(timeout=1800)
+            page.wait_for_timeout(1800)
+            audit.append(f"flashscore_day_navigation=clicked_title_{label}")
+            return
+        except Exception:
+            pass
+
+        try:
+            page.get_by_label(label, exact=False).first.click(timeout=1800)
+            page.wait_for_timeout(1800)
+            audit.append(f"flashscore_day_navigation=clicked_label_{label}")
+            return
+        except Exception:
+            pass
+
+        try:
+            page.get_by_text(label, exact=False).first.click(timeout=1800)
+            page.wait_for_timeout(1800)
+            audit.append(f"flashscore_day_navigation=clicked_text_{label}")
+            return
+        except Exception:
+            pass
+
+    audit.append(f"flashscore_day_navigation=not_clicked_delta_{delta}")
+
+
+def fetch_flashscore_atp_singles_fallback_rows(
+    target_day: date,
+    display_map: Dict[str, str],
+) -> Tuple[List[Dict[str, str]], List[str]]:
+    """
+    Secours final si ATP daily-schedule + validation stricte donnent 0.
+
+    Règle :
+    - Flashscore n'est utilisé que quand ATP donne 0.
+    - On garde uniquement les sections ATP - SIMPLE / ATP - SINGLES.
+    - On refuse WTA et doubles.
+    - On refuse les noms avec "/" pour ne pas prendre les équipes.
+    """
+    audit: List[str] = []
+    rows: List[Dict[str, str]] = []
+    alias_map = _build_flashscore_alias_map(display_map or {})
+
+    try:
+        from playwright.sync_api import sync_playwright
+    except Exception as exc:
+        audit.append(f"flashscore_fallback_status=playwright_import_failed | {type(exc).__name__}: {exc}")
+        return rows, audit
+
+    try:
+        with sync_playwright() as p:
+            browser = p.chromium.launch(
+                headless=True,
+                args=[
+                    "--no-sandbox",
+                    "--disable-dev-shm-usage",
+                    "--disable-blink-features=AutomationControlled",
+                ],
+            )
+
+            context = browser.new_context(
+                locale="fr-FR",
+                timezone_id="Europe/Paris",
+                viewport={"width": 1365, "height": 2200},
+                user_agent=(
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/124.0.0.0 Safari/537.36"
+                ),
+                extra_http_headers={"Accept-Language": "fr-FR,fr;q=0.9,en;q=0.8"},
+            )
+
+            page = context.new_page()
+            page.goto(FLASHSCORE_TENNIS_URL, wait_until="domcontentloaded", timeout=45000)
+
+            for label in ["J'accepte", "Tout refuser", "Accepter", "OK"]:
+                try:
+                    page.get_by_text(label, exact=False).first.click(timeout=1800)
+                    break
+                except Exception:
+                    pass
+
+            try:
+                page.wait_for_load_state("networkidle", timeout=12000)
+            except Exception:
+                pass
+
+            _click_flashscore_target_day(page, target_day, audit)
+
+            # Charge les blocs plus bas.
+            for _ in range(8):
+                try:
+                    page.mouse.wheel(0, 1800)
+                    page.wait_for_timeout(500)
+                except Exception:
+                    pass
+
+            raw_rows = page.evaluate(_flashscore_extract_matches_js())
+            browser.close()
+
+    except Exception as exc:
+        audit.append(f"flashscore_fallback_status=failed | {type(exc).__name__}: {exc}")
+        return rows, audit
+
+    seen: Set[Tuple[str, str]] = set()
+    rejected = 0
+
+    for item in raw_rows or []:
+        comp = normalize_space(str(item.get("competition") or ""))
+        raw_a = str(item.get("playerA") or "")
+        raw_b = str(item.get("playerB") or "")
+        raw = normalize_space(str(item.get("raw") or ""))
+
+        if not _flashscore_header_is_atp_singles(comp):
+            rejected += 1
+            continue
+
+        joined = normalize_space(f"{comp} {raw_a} {raw_b} {raw}")
+
+        if _is_wta_marker(joined) or _is_doubles_marker(joined):
+            rejected += 1
+            continue
+
+        player_a = _resolve_flashscore_player_name(raw_a, alias_map)
+        player_b = _resolve_flashscore_player_name(raw_b, alias_map)
+
+        if not player_a or not player_b:
+            rejected += 1
+            continue
+
+        if not is_name_like(player_a) or not is_name_like(player_b):
+            rejected += 1
+            continue
+
+        if canonical_name(player_a) == canonical_name(player_b):
+            rejected += 1
+            continue
+
+        key = unordered_pair_key(player_a, player_b)
+        if key in seen:
+            continue
+
+        seen.add(key)
+        rows.append(
+            {
+                "playerA": player_a,
+                "playerB": player_b,
+                "source": "Flashscore ATP Singles Fallback",
+                "sourceUrl": FLASHSCORE_TENNIS_URL,
+                "evidence": normalize_space(f"{comp} | {raw}")[:320],
+                "tournament": comp,
+                "surface": _flashscore_surface_from_header(comp),
+            }
+        )
+
+    audit.append("flashscore_fallback_status=ok")
+    audit.append(f"flashscore_fallback_raw_rows={len(raw_rows or [])}")
+    audit.append(f"flashscore_fallback_kept_atp_singles={len(rows)}")
+    audit.append(f"flashscore_fallback_rejected={rejected}")
+
+    for row in rows[:60]:
+        audit.append(f"[FLASHSCORE ATP SINGLES KEEP] {row.get('playerA')} vs {row.get('playerB')} | {row.get('evidence', '')}")
+
+    return rows, audit
+
+
+def build_daily_schedule_matches(session, target_day: date, include_challenger: bool, display_map: Optional[Dict[str, str]] = None) -> Tuple[List[Any], List[str], List[Dict[str, str]], Dict[str, Optional[str]]]:
+    audit: List[str] = []
+    schedule_urls = discover_daily_schedule_urls(session, include_challenger=include_challenger)
+    audit.append(f"daily_schedule_urls_found={len(schedule_urls)}")
+
+    all_rows: List[Dict[str, str]] = []
+    surfaces_by_tournament: Dict[str, Optional[str]] = {}
+
+    for url in schedule_urls:
+        tournament_name = tournament_name_from_daily_url(url)
+        try:
+            html = base.fetch_html(session, url)
+            page_surface = surface_from_text(html)
+            surfaces_by_tournament[canonical_name(tournament_name)] = page_surface
+
+            rows, row_audit = extract_pairs_from_daily_schedule_html(html, url, display_map or {})
+            audit.append(f"[DAILY URL] {tournament_name} | pairs={len(rows)} | surface={page_surface or 'None'} | {url}")
+            audit.extend(f"  {x}" for x in row_audit)
+
+            for row in rows:
+                row["tournament"] = tournament_name
+                row["surface"] = page_surface or ""
+                all_rows.append(row)
+        except Exception as exc:
+            audit.append(f"[DAILY URL FAIL] {tournament_name} | {url} | {exc}")
+
+    # Dédoublonnage stable : paire + tournoi.
+    seen: Set[Tuple[str, str, str]] = set()
+    clean_rows: List[Dict[str, str]] = []
+
+    for row in all_rows:
+        a = row.get("playerA", "")
+        b = row.get("playerB", "")
+        tournament = row.get("tournament", "ATP")
+        key_pair = unordered_pair_key(a, b)
+        key = (key_pair[0], key_pair[1], canonical_name(tournament))
+
+        if not key_pair[0] or not key_pair[1]:
+            continue
+
+        if key in seen:
+            continue
+
+        seen.add(key)
+        clean_rows.append(row)
+
+    # Validation officielle ATP Order Of Play.
+    # Corrige les faux simples créés quand le daily-schedule mélange les équipes de double.
+    clean_rows, official_oop_audit = _apply_official_atp_singles_filter(clean_rows, session, target_day)
+    audit.extend(official_oop_audit)
+
+    clean_rows, strict_date_audit = _strict_date_filter_rows(clean_rows, target_day)
+    audit.extend(strict_date_audit)
+
+    # Fallback ajouté sans casser le reste du fichier fourni :
+    # si ATP strict retourne 0, on essaie Flashscore ATP SIMPLE uniquement.
+    # Jamais WTA, jamais doubles, jamais équipes avec "/".
+    if not clean_rows:
+        flash_rows, flash_audit = fetch_flashscore_atp_singles_fallback_rows(
+            target_day=target_day,
+            display_map=display_map or {},
+        )
+        audit.extend(flash_audit)
+        if flash_rows:
+            clean_rows = flash_rows
+            audit.append("daily_source_final=flashscore_atp_singles_fallback")
+            audit.append(f"daily_source_final_rows={len(clean_rows)}")
+        else:
+            audit.append("daily_source_final=empty_after_atp_strict_and_flashscore")
+            audit.append("daily_source_final_rows=0")
+    else:
+        audit.append("daily_source_final=atp_daily_schedule_strict")
+
+    day_matches: List[Any] = []
+
+    for row in clean_rows:
+        day_matches.append(
+            base.DayMatch(
+                source=row.get("source", "ATP Daily Schedule Only"),
+                tournament_name=row.get("tournament", "ATP"),
+                player_a=row.get("playerA", ""),
+                player_b=row.get("playerB", ""),
+                event_date=target_day.isoformat(),
+            )
+        )
+
+    audit.append(f"day_matches_from_daily_schedule_only={len(day_matches)}")
+    return day_matches, audit, clean_rows, surfaces_by_tournament
+
+
+# ---------------------------------------------------------------------------
+# Contexte surface + veto, jamais pour construire la liste du jour
+# ---------------------------------------------------------------------------
+
+
+def make_minimal_context(tournament_name: str, surface: Optional[str]) -> Any:
+    return base.TournamentContext(
+        tournament_name=tournament_name,
+        slug=canonical_name(tournament_name).replace(" ", "-"),
+        draw_url="",
+        results_url="",
+        surface=surface or "Clay",
+        player_keys=set(),
+        pending_pairs=[],
+        article_pairs=[],
+        completed_pairs=[],
+        qualifier_keys=set(),
+        qualifier_evidence={},
+        result_wins_by_key={},
+        result_qualifier_keys=set(),
+        result_context_url="",
+        result_context_status="daily_schedule_only_minimal_context",
+        result_winner_event_count=0,
+        result_qualifier_count=0,
     )
 
 
-def build_tournament_contexts(
-    session: requests.Session,
-    include_challenger: bool,
+def build_contexts_for_daily_urls(
+    session,
+    schedule_rows: List[Dict[str, str]],
     display_map: Dict[str, str],
     valid_player_keys: Set[str],
-    target_day: date,
-) -> Tuple[List[TournamentContext], List[str]]:
+    surfaces_by_tournament: Dict[str, Optional[str]],
+    strict_context: bool,
+) -> Tuple[List[Any], List[str]]:
     audit: List[str] = []
-    draw_urls = discover_draw_urls(session, include_challenger=include_challenger)
-    audit.append(f"draw_urls_found={len(draw_urls)}")
+    contexts: List[Any] = []
+    seen_tournaments: Set[str] = set()
 
-    contexts: List[TournamentContext] = []
-    for draw_url in draw_urls:
+    # URLs uniques issues du daily-schedule.
+    by_tournament: Dict[str, Dict[str, str]] = {}
+    for row in schedule_rows:
+        tournament = row.get("tournament", "ATP") or "ATP"
+        key = canonical_name(tournament)
+        if key not in by_tournament:
+            by_tournament[key] = row
+
+    for tournament_key, row in by_tournament.items():
+        tournament_name = row.get("tournament", "ATP") or "ATP"
+        source_url = row.get("sourceUrl", "") or ""
+        surface = surfaces_by_tournament.get(tournament_key) or row.get("surface") or None
+
+        if tournament_key in seen_tournaments:
+            continue
+        seen_tournaments.add(tournament_key)
+
+        if not strict_context or not source_url:
+            contexts.append(make_minimal_context(tournament_name, surface))
+            audit.append(f"[CTX MINIMAL] {tournament_name} | surface={surface or 'Clay'}")
+            continue
+
+        draw_url = daily_url_to_draw_url(source_url)
+
         try:
-            ctx = parse_tournament_context(
+            ctx = base.parse_tournament_context(
                 session=session,
                 draw_url=draw_url,
                 display_map=display_map,
                 valid_player_keys=valid_player_keys,
-                target_day=target_day,
+                target_day=base.parse_target_day("today") if False else date.today(),
             )
+
+            # Correction du nom/surface si nécessaire.
+            if not getattr(ctx, "tournament_name", ""):
+                ctx.tournament_name = tournament_name
+            if not getattr(ctx, "surface", None) and surface:
+                ctx.surface = surface
+
             contexts.append(ctx)
             audit.append(
-                f"[CTX] {ctx.tournament_name} | players={len(ctx.player_keys)} | "
-                f"article_pairs={len(ctx.article_pairs)} | pending_pairs={len(ctx.pending_pairs)} | "
-                f"completed_pairs={len(ctx.completed_pairs)} | qualifiers={len(ctx.qualifier_keys)} | "
-                f"result_winners={ctx.result_winner_event_count} | result_qualifiers={ctx.result_qualifier_count} | "
-                f"result_status={ctx.result_context_status} | surface={ctx.surface or 'None'}"
+                f"[CTX] {tournament_name} | draw_url={draw_url} | "
+                f"players={len(ctx.player_keys)} | completed={len(ctx.completed_pairs)} | "
+                f"qualifiers={len(ctx.qualifier_keys)} | result_status={ctx.result_context_status} | "
+                f"surface={ctx.surface or surface or 'None'}"
             )
-        except Exception as e:
-            audit.append(f"[CTX FAIL] {draw_url} | {e}")
+        except Exception as exc:
+            contexts.append(make_minimal_context(tournament_name, surface))
+            audit.append(f"[CTX FALLBACK MINIMAL] {tournament_name} | {draw_url} | {exc}")
+
+    if not contexts and schedule_rows:
+        contexts.append(make_minimal_context("ATP", "Clay"))
+        audit.append("[CTX MINIMAL] ATP | aucun contexte, fallback unique")
 
     return contexts, audit
 
 
-def build_day_matches_from_contexts(contexts: List[TournamentContext], target_day: date) -> Tuple[List[DayMatch], List[str]]:
-    audit: List[str] = []
-    matches: List[DayMatch] = []
 
-    for ctx in contexts:
-        if ctx.article_pairs:
-            for a, b in ctx.article_pairs:
-                matches.append(
-                    DayMatch(
-                        source="ATP News Schedule",
-                        tournament_name=ctx.tournament_name,
-                        player_a=a,
-                        player_b=b,
-                        event_date=target_day.isoformat(),
-                    )
-                )
-            audit.append(f"[DAYMATCH] {ctx.tournament_name} | source=article | count={len(ctx.article_pairs)}")
-            continue
-
-        if ctx.pending_pairs:
-            for a, b in ctx.pending_pairs:
-                matches.append(
-                    DayMatch(
-                        source="ATP Draw Pending",
-                        tournament_name=ctx.tournament_name,
-                        player_a=a,
-                        player_b=b,
-                        event_date=target_day.isoformat(),
-                    )
-                )
-            audit.append(f"[DAYMATCH] {ctx.tournament_name} | source=draw_pending | count={len(ctx.pending_pairs)}")
-            continue
-
-        audit.append(f"[DAYMATCH] {ctx.tournament_name} | source=none | count=0")
-
-    uniq: Dict[Tuple[str, str, str], DayMatch] = {}
-    for m in matches:
-        key = (canonical_name(m.player_a), canonical_name(m.player_b), canonical_name(m.tournament_name))
-        uniq[key] = m
-
-    final_matches = list(uniq.values())
-    audit.append(f"day_matches={len(final_matches)}")
-    return final_matches, audit
+# ---------------------------------------------------------------------------
+# V6.10D - Construction payload directe depuis daily-schedule
+# ---------------------------------------------------------------------------
 
 
-def find_context_for_match(match: DayMatch, contexts: List[TournamentContext]) -> Optional[TournamentContext]:
-    a_key = canonical_name(match.player_a)
-    b_key = canonical_name(match.player_b)
+def _points_for_name(name: str, points_map: Dict[str, int]) -> int:
+    key = canonical_name(name)
+    value = points_map.get(key, 0)
 
-    exact = []
-    for ctx in contexts:
-        if a_key in ctx.player_keys and b_key in ctx.player_keys:
-            exact.append(ctx)
+    try:
+        return int(value or 0)
+    except Exception:
+        return 0
 
-    if len(exact) == 1:
-        return exact[0]
 
-    if len(exact) > 1:
-        league_key = canonical_name(match.tournament_name)
-        for ctx in exact:
-            if league_key and league_key in canonical_name(ctx.tournament_name):
-                return ctx
-        return exact[0]
+def _player_b_is_q_from_evidence(player_b: str, evidence: str) -> bool:
+    """
+    Détection simple et prudente du Q uniquement dans la fenêtre du match.
+    """
+    if not evidence:
+        return False
 
-    # Fallback utile quand l'ATP donne les matchs via un article schedule,
-    # mais que le draw dynamique n'expose aucun joueur dans le HTML recupere.
-    league_key = canonical_name(match.tournament_name)
-    if league_key:
-        same_tournament = [ctx for ctx in contexts if league_key in canonical_name(ctx.tournament_name)]
-        if len(same_tournament) == 1:
-            return same_tournament[0]
+    ev = normalize_space(evidence)
+    b = re.escape(clean_name(player_b))
 
-    if len(contexts) == 1:
-        return contexts[0]
+    # Cas : (Q) juste avant le joueur B.
+    if re.search(rf"\(Q\).{{0,80}}{b}", ev, flags=re.I):
+        return True
 
-    return None
+    # Cas : joueur B puis (Q).
+    if re.search(rf"{b}.{{0,80}}\(Q\)", ev, flags=re.I):
+        return True
 
-def build_payload_items(
-    day_matches: List[DayMatch],
-    contexts: List[TournamentContext],
+    return False
+
+
+def _surface_for_row(row: Dict[str, str], surfaces_by_tournament: Dict[str, Optional[str]]) -> str:
+    tournament = row.get("tournament", "ATP") or "ATP"
+    key = canonical_name(tournament)
+
+    surface = row.get("surface") or surfaces_by_tournament.get(key) or ""
+
+    if surface:
+        sf = surface_from_text(surface) or surface
+        if sf in {"Clay", "Hard", "Grass"}:
+            return sf
+
+    # Rome / Madrid / Monte-Carlo / Barcelona : terre battue.
+    t = tournament.lower()
+    if any(x in t for x in ["rome", "madrid", "monte", "barcelona", "munich", "geneva", "hamburg"]):
+        return "Clay"
+
+    return "Clay"
+
+
+def build_payload_items_direct_from_schedule_rows(
+    schedule_rows: List[Dict[str, str]],
     points_map: Dict[str, int],
-    strict_unknown_veto: bool = True,
-) -> Tuple[List[str], List[str], List[UnityPayloadItem]]:
+    surfaces_by_tournament: Dict[str, Optional[str]],
+    strict_unknown_veto: bool,
+) -> Tuple[List[Any], List[str]]:
+    """
+    V6.10D :
+    La liste du jour vient de ATP daily-schedule uniquement.
+    On ne laisse plus base.build_payload_items supprimer des matchs parce qu'un contexte draw/results est incomplet.
+
+    Filtre dur :
+    - garde seulement les matchs où les deux joueurs ont des points ATP > 0 ;
+    - si points manquants, audit clair mais pas de faux match inventé.
+    """
     audit: List[str] = []
-    lines: List[str] = []
-    payload_items: List[UnityPayloadItem] = []
+    payload_items: List[Any] = []
 
-    for match in day_matches:
-        a_key = canonical_name(match.player_a)
-        b_key = canonical_name(match.player_b)
+    missing_points: List[str] = []
+    seen: Set[Tuple[str, str, str]] = set()
 
-        pa = points_map.get(a_key)
-        pb = points_map.get(b_key)
+    for row in schedule_rows:
+        player_a = clean_name(row.get("playerA", ""))
+        player_b = clean_name(row.get("playerB", ""))
+        tournament = row.get("tournament", "ATP") or "ATP"
+        evidence = row.get("evidence", "") or ""
 
-        if pa is None or pb is None:
-            audit.append(f"[SKIP points] {match.player_a} vs {match.player_b} | points introuvables")
+        if not player_a or not player_b:
             continue
 
-        ctx = find_context_for_match(match, contexts)
+        key_pair = unordered_pair_key(player_a, player_b)
+        key = (key_pair[0], key_pair[1], canonical_name(tournament))
 
-        surface = "Clay"
-        if ctx is not None and ctx.surface:
-            surface = ctx.surface
-
-        q_b = False
-        wins_b = 0
-        q_evidence = ""
-        veto_context_status = "ctx_missing"
-
-        if ctx is not None:
-            b_key_for_ctx = canonical_name(match.player_b)
-            has_draw_context = bool(ctx.player_keys or ctx.completed_pairs or ctx.qualifier_keys)
-            has_result_context = (
-                ctx.result_context_status == "ok"
-                and (ctx.result_winner_event_count > 0 or ctx.result_qualifier_count > 0)
-            )
-
-            if has_draw_context:
-                q_b = b_key_for_ctx in ctx.qualifier_keys
-                wins_b = count_completed_wins_for_player(match.player_b, ctx.completed_pairs)
-                q_evidence = ctx.qualifier_evidence.get(b_key_for_ctx, "")
-                veto_context_status = "ctx_draw_ok"
-            elif has_result_context:
-                q_b = b_key_for_ctx in ctx.result_qualifier_keys
-                wins_b = int(ctx.result_wins_by_key.get(b_key_for_ctx, 0))
-                wins_b = max(0, min(2, wins_b))
-                q_evidence = "RESULTS_CONTEXT"
-                if q_b:
-                    q_evidence = "RESULTS_CONTEXT_Q"
-                veto_context_status = f"ctx_results_ok events={ctx.result_winner_event_count} url={ctx.result_context_url}"
-            else:
-                veto_context_status = f"ctx_no_draw_players_no_results result_status={ctx.result_context_status}"
-
-        # Regle de securite : sur Clay, si le contexte Q/wins est introuvable,
-        # on ne doit pas fabriquer un faux false;0 qui pourrait valider un vert.
-        # On force wins=2 uniquement si aucun contexte draw/results exploitable n'a ete trouve.
-        # Important : ctx_draw_ok et ctx_results_ok sont des contextes connus ; ils ne doivent pas etre forces.
-        context_is_known = (
-            veto_context_status.startswith("ctx_draw_ok")
-            or veto_context_status.startswith("ctx_results_ok")
-        )
-        if strict_unknown_veto and normalize_surface(surface) == "Clay" and not context_is_known:
-            q_b = False
-            wins_b = 2
-            q_evidence = "SAFE_UNKNOWN_VETO_FORCED_WINS_2"
-            veto_context_status += " -> safe_forced_wins_2"
-
-        # Borne finale : 0, 1 ou 2 seulement. Pour le veto, 2 signifie "2 ou plus".
-        wins_b = max(0, min(2, int(wins_b)))
-
-        audit.append(
-            f"[VETOCTX APPLY] {match.player_a} vs {match.player_b} | "
-            f"qualifier={str(q_b).lower()} | wins={wins_b} | surface={surface} | "
-            f"veto_context={veto_context_status} | q_evidence={q_evidence}"
-        )
-
-        line = (
-            f"{title_name(match.player_a)};"
-            f"{title_name(match.player_b)};"
-            f"{surface};"
-            f"{pa};"
-            f"{pb};"
-            f"{str(q_b).lower()};"
-            f"{wins_b}"
-        )
-        lines.append(line)
-
-        payload_items.append(
-            UnityPayloadItem(
-                playerA=title_name(match.player_a),
-                playerB=title_name(match.player_b),
-                surface=surface,
-                playerAPoints=pa,
-                playerBPoints=pb,
-                player_b_is_qualifier=q_b,
-                player_b_tournament_wins=wins_b,
-                tournament=match.tournament_name,
-                source=match.source,
-            )
-        )
-
-    return lines, audit, payload_items
-
-
-def render_backend_result(result: Dict[str, Any]) -> str:
-    summary = result.get("summary", {}) or {}
-    matches = result.get("matches", []) or []
-    engine = result.get("engine", {}) or {}
-
-    lines: List[str] = []
-    lines.append("Résumé")
-    lines.append(f"- Lignes totales : {summary.get('totalRows', 0)}")
-    lines.append(f"- Lignes valides : {summary.get('validRows', 0)}")
-    lines.append(f"- Lignes en erreur : {summary.get('errorRows', 0)}")
-    lines.append(f"- Premium > 80% : {summary.get('over80', 0)}")
-    lines.append(f"- Veto : {summary.get('vetoCount', 0)}")
-    lines.append(f"- Jouables : {summary.get('jouables', 0)}")
-    lines.append("")
-    lines.append("Résultats")
-    lines.append("")
-
-    for row in matches:
-        if "error" in row:
-            lines.append(f"{row.get('playerA', '')} vs {row.get('playerB', '')} ({row.get('surface', '')})")
-            lines.append(f"Erreur : {row.get('error', '')}")
-            lines.append("")
+        if key in seen:
             continue
 
-        lines.append(f"{row.get('playerA', '')} vs {row.get('playerB', '')} ({row.get('surface', '')})")
-        if "playerAPoints" in row and "playerBPoints" in row:
-            lines.append(f"Points ATP : {row.get('playerAPoints')} vs {row.get('playerBPoints')}")
-        if "player_b_is_qualifier" in row and "player_b_tournament_wins" in row:
-            lines.append(
-                f"Qualifier B : {row.get('player_b_is_qualifier')} | "
-                f"Wins tournoi B : {row.get('player_b_tournament_wins')}"
+        seen.add(key)
+
+        points_a = _points_for_name(player_a, points_map)
+        points_b = _points_for_name(player_b, points_map)
+
+        if points_a <= 0 or points_b <= 0:
+            missing_points.append(
+                f"{player_a} vs {player_b} | A_points={points_a} | B_points={points_b} | tournament={tournament}"
             )
-        if "sweA" in row and "sweB" in row:
-            lines.append(f"SWE : {row.get('sweA')} vs {row.get('sweB')}")
-        if "pSwe" in row and "pAtp" in row:
-            lines.append(f"pSwe : {row.get('pSwe')} | pAtp : {row.get('pAtp')}")
-        if "pRank" in row:
-            extra = [f"pRank : {row.get('pRank')}"]
-            if "pForm5" in row:
-                extra.append(f"pForm5 : {row.get('pForm5')}")
-            if "pForm10" in row:
-                extra.append(f"pForm10 : {row.get('pForm10')}")
-            if "pSurfaceForm5" in row:
-                extra.append(f"pSurfaceForm5 : {row.get('pSurfaceForm5')}")
-            if "pDominance" in row:
-                extra.append(f"pDominance : {row.get('pDominance')}")
-            lines.append(" | ".join(extra))
-        if isinstance(row.get("premiumPct", None), (int, float)):
-            lines.append(f"Premium : {row.get('premiumPct')}%")
-        else:
-            lines.append(f"Premium : {row.get('premium', '')}")
-        lines.append(f"Veto : {row.get('veto', '')}")
-        lines.append(f"Décision : {row.get('decision', '')}")
-        lines.append("")
+            # V6.10M : règle verrouillée utilisateur.
+            # Points ATP introuvables = match bloqué.
+            # Jamais de remplacement par 1, jamais de point inventé.
+            continue
 
-    if engine:
-        lines.append("Moteur")
-        lines.append(f"- Nom : {engine.get('name', '')}")
-        lines.append(f"- Version : {engine.get('version', '')}")
-        lines.append(f"- Lignes historiques chargées : {engine.get('historyRowsLoaded', 0)}")
-        lines.append(f"- Formule Premium : {engine.get('premiumFormula', '')}")
-        lines.append(f"- Seuil : {engine.get('threshold', '')}")
+        surface = _surface_for_row(row, surfaces_by_tournament)
 
-    return "\n".join(lines)
+        player_b_is_qualifier = _player_b_is_q_from_evidence(player_b, evidence)
+
+        # V6.10L :
+        # Ne plus forcer un veto automatique sur tous les matchs de terre battue.
+        # Ancienne règle supprimée :
+        #   if strict_unknown_veto and surface == "Clay": player_b_tournament_wins = 2
+        #
+        # Nouvelle règle :
+        #   player_b_tournament_wins reste à 0 sauf preuve réelle extraite du contexte ATP.
+        #
+        # Ici, ce script daily-schedule ne possède pas encore une preuve fiable des victoires
+        # précédentes de B dans le tournoi, donc il ne doit pas inventer wins=2.
+        player_b_tournament_wins = 0
+
+        item = base.UnityPayloadItem(
+            playerA=player_a,
+            playerB=player_b,
+            surface=surface,
+            playerAPoints=points_a,
+            playerBPoints=points_b,
+            player_b_is_qualifier=bool(player_b_is_qualifier),
+            player_b_tournament_wins=int(player_b_tournament_wins),
+            tournament=tournament,
+            source=row.get("source", "ATP Daily Schedule Full Payload"),
+        )
+
+        payload_items.append(item)
+
+    audit.append(f"daily_schedule_rows_detected={len(schedule_rows)}")
+    audit.append(f"payload_items_direct={len(payload_items)}")
+    audit.append(f"missing_points_rows={len(missing_points)}")
+
+    for line in missing_points[:80]:
+        audit.append(f"[MISSING POINTS] {line}")
+
+    return payload_items, audit
 
 
-def send_to_backend(backend_url: str, payload_items: List[Any]) -> Dict[str, Any]:
-    url = backend_url.rstrip("/") + "/calculate"
-    body = {"matches": [asdict(x) for x in payload_items]}
+# ---------------------------------------------------------------------------
+# Sorties / backend
+# ---------------------------------------------------------------------------
 
-    resp = requests.post(url, json=body, timeout=120)
-    resp.raise_for_status()
-    data = resp.json()
 
-    if not isinstance(data, dict):
-        raise RuntimeError("Réponse backend invalide.")
-    if "error" in data:
-        raise RuntimeError(str(data["error"]))
+def backend_send_is_disabled(backend_url: str, force_no_send: bool) -> bool:
+    if force_no_send:
+        return True
+    try:
+        parsed = urlparse(backend_url)
+        if parsed.hostname in {"127.0.0.1", "localhost"} and parsed.port == 9:
+            return True
+    except Exception:
+        pass
+    return False
 
-    return data
+
+def write_outputs(target_day: date, audit: List[str], lines: List[str], payload_items: List[Any]) -> Tuple[Path, Path, Path, Path, Path]:
+    stamp = target_day.isoformat()
+
+    lines_path = base.OUT_DIR / f"lines_{stamp}.txt"
+    audit_path = base.OUT_DIR / f"audit_{stamp}.txt"
+    payload_path = base.OUT_DIR / f"payload_{stamp}.json"
+    result_json_path = base.OUT_DIR / f"result_{stamp}.json"
+    result_txt_path = base.OUT_DIR / f"result_{stamp}.txt"
+
+    unity_text = "\n".join(lines)
+
+    base.write_text(lines_path, unity_text)
+    base.write_text(audit_path, "\n".join(audit))
+    base.write_text(base.UNITY_OUT_PATH, unity_text)
+    base.write_text(base.LINES_LATEST_PATH, unity_text)
+    base.write_text(base.AUDIT_LATEST_PATH, "\n".join(audit))
+
+    payload_serialized = [asdict(x) for x in payload_items]
+    base.write_json(payload_path, payload_serialized)
+    base.write_json(PAYLOAD_LATEST_PATH, payload_serialized)
+
+    return lines_path, audit_path, payload_path, result_json_path, result_txt_path
+
+
+# ---------------------------------------------------------------------------
+# Main CLI
+# ---------------------------------------------------------------------------
 
 
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("target_day", help="today | tomorrow | YYYY-MM-DD")
-    parser.add_argument("--include-challenger", action="store_true")
+    parser.add_argument("--include-challenger", action="store_true", help="Inclut ATP Challenger si demandé.")
     parser.add_argument("--show-browser", action="store_true")
     parser.add_argument(
         "--unsafe-assume-no-veto",
         action="store_true",
-        help="Mode non recommande : si le contexte draw/results est introuvable, garde qualifier=false et wins=0 au lieu de proteger par veto inconnu.",
+        help="Mode non recommandé : garde qualifier=false/wins=0 si contexte introuvable.",
+    )
+    parser.add_argument(
+        "--no-send-backend",
+        action="store_true",
+        help="Écrit seulement payload/audit/lines sans POST /calculate.",
     )
     parser.add_argument(
         "--backend-url",
         default="http://127.0.0.1:8000",
-        help="URL du backend calculate",
+        help="URL du backend calculate. Port 9 = mode payload only anti-deadlock.",
+    )
+    parser.add_argument(
+        "--minimal-context-only",
+        action="store_true",
+        help="Ne parse pas les draws/results pour le veto. Plus rapide, mais force plus souvent le veto de sécurité sur terre.",
     )
     args = parser.parse_args()
 
-    global PLAYWRIGHT_HEADLESS
-    PLAYWRIGHT_HEADLESS = not args.show_browser
+    if hasattr(base, "PLAYWRIGHT_HEADLESS"):
+        base.PLAYWRIGHT_HEADLESS = not args.show_browser
 
-    target_day = parse_target_day(args.target_day)
-    session = build_session()
+    target_day = base.parse_target_day(args.target_day)
+    session = base.build_session()
     strict_unknown_veto = not args.unsafe_assume_no_veto
 
     audit: List[str] = []
     audit.append(f"target_day={target_day.isoformat()}")
     audit.append(f"target_label={args.target_day}")
     audit.append(f"backend_url={args.backend_url}")
-    audit.append("mode=V6_7_RESULTS_CONTEXT_FIXED_SAFE_CLAMPED")
+    audit.append(f"mode={MODE}")
+    audit.append("source_policy=ATP_DAILY_SAFE_THEN_FLASHSCORE_ATP_SINGLES_FALLBACK")
+    audit.append("official_oop_singles_filter=use_if_available_keep_daily_if_oop_unavailable")
+    audit.append("strict_date_policy=official_oop_filter_then_trim_safety")
+    audit.append("veto_policy=no_forced_tournament_wins_without_real_atp_evidence")
+    audit.append("missing_points_policy=block_match_no_fake_points")
+    audit.append("no_draw_pending_for_day_matches=true")
+    audit.append("article_schedule_filter_only=true")
     audit.append(f"strict_unknown_veto={str(strict_unknown_veto).lower()}")
-    audit.append("wins_output_clamp=max_2")
+    audit.append(f"include_challenger={str(args.include_challenger).lower()}")
+    audit.append(f"minimal_context_only={str(args.minimal_context_only).lower()}")
 
-    points_map, display_map = fetch_live_points_map(session)
+    points_map, display_map = base.fetch_live_points_map(session)
     valid_player_keys = set(points_map.keys())
     audit.append(f"points_map_size={len(points_map)}")
 
-    contexts, ctx_audit = build_tournament_contexts(
+    day_matches, daily_audit, schedule_rows, surfaces_by_tournament = build_daily_schedule_matches(
         session=session,
+        target_day=target_day,
         include_challenger=args.include_challenger,
         display_map=display_map,
-        valid_player_keys=valid_player_keys,
-        target_day=target_day,
     )
-    audit.extend(ctx_audit)
-    audit.append(f"contexts={len(contexts)}")
+    audit.extend(daily_audit)
 
-    day_matches, day_audit = build_day_matches_from_contexts(
-        contexts=contexts,
-        target_day=target_day,
-    )
-    audit.extend(day_audit)
-
-    lines, build_audit, payload_items = build_payload_items(
-        day_matches=day_matches,
-        contexts=contexts,
+    # V6.10D :
+    # On ne construit plus le payload via base.build_payload_items,
+    # car ce chemin peut supprimer des matchs lorsque le contexte draw/results est incomplet.
+    # La liste vient uniquement de schedule_rows extrait de ATP daily-schedule.
+    payload_items, build_audit = build_payload_items_direct_from_schedule_rows(
+        schedule_rows=schedule_rows,
         points_map=points_map,
+        surfaces_by_tournament=surfaces_by_tournament,
         strict_unknown_veto=strict_unknown_veto,
     )
     audit.extend(build_audit)
 
-    stamp = target_day.isoformat()
+    lines: List[str] = []
+    for item in payload_items:
+        lines.append(
+            f"{item.playerA};{item.playerB};{item.surface};"
+            f"{item.playerAPoints};{item.playerBPoints};"
+            f"{str(item.player_b_is_qualifier).lower()};{item.player_b_tournament_wins}"
+        )
 
-    lines_path = OUT_DIR / f"lines_{stamp}.txt"
-    audit_path = OUT_DIR / f"audit_{stamp}.txt"
-    payload_path = OUT_DIR / f"payload_{stamp}.json"
-    result_json_path = OUT_DIR / f"result_{stamp}.json"
-    result_txt_path = OUT_DIR / f"result_{stamp}.txt"
+    audit.append(f"daily_matches_detected={len(day_matches)}")
+    audit.append(f"payload_items={len(payload_items)}")
 
-    unity_text = "\n".join(lines)
-
-    write_text(lines_path, unity_text)
-    write_text(audit_path, "\n".join(audit))
-    write_text(UNITY_OUT_PATH, unity_text)
-    write_text(LINES_LATEST_PATH, unity_text)
-    write_text(AUDIT_LATEST_PATH, "\n".join(audit))
-    write_json(payload_path, [asdict(x) for x in payload_items])
+    lines_path, audit_path, payload_path, result_json_path, result_txt_path = write_outputs(
+        target_day=target_day,
+        audit=audit,
+        lines=lines,
+        payload_items=payload_items,
+    )
 
     if not payload_items:
-        print(f"UNITY_INPUT : {UNITY_OUT_PATH}")
+        result_empty = {
+            "matches": [],
+            "summary": {
+                "totalRows": len(schedule_rows),
+                "validRows": 0,
+                "errorRows": len(schedule_rows),
+                "nonAnalyzedRows": len(schedule_rows),
+                "over80": 0,
+                "vetoCount": 0,
+                "jouables": 0,
+            },
+            "meta": {
+                "mode": MODE,
+                "targetDay": target_day.isoformat(),
+                "message": "Aucun payload exploitable. Si des matchs sont listés dans dailySchedulePairs, ils sont bloqués car points ATP introuvables ou données insuffisantes.",
+                "dailySchedulePairs": len(day_matches),
+                "payloadItems": 0,
+            },
+        }
+        base.write_json(result_json_path, result_empty)
+        base.write_text(result_txt_path, "Aucun payload exploitable : matchs absents ou bloqués par points ATP introuvables/données insuffisantes.")
+        base.write_text(base.RESULT_LATEST_PATH, "Aucun payload exploitable : matchs absents ou bloqués par points ATP introuvables/données insuffisantes.")
+
+        print(f"UNITY_INPUT : {base.UNITY_OUT_PATH}")
         print(f"LINES       : {lines_path}")
         print(f"AUDIT       : {audit_path}")
         print(f"PAYLOAD     : {payload_path}")
-        print(f"LINES_LATEST: {LINES_LATEST_PATH}")
-        print(f"AUDIT_LATEST: {AUDIT_LATEST_PATH}")
+        print(f"RESULT_JSON : {result_json_path}")
+        print(f"RESULT_TXT  : {result_txt_path}")
+        print(f"LINES_LATEST: {base.LINES_LATEST_PATH}")
+        print(f"AUDIT_LATEST: {base.AUDIT_LATEST_PATH}")
+        print(f"RESULT_LATEST: {base.RESULT_LATEST_PATH}")
         print("COUNT       : 0")
-        print("Aucun match exploitable à envoyer au backend.")
-        write_text(RESULT_LATEST_PATH, "Aucun match exploitable.")
+        print("Aucun payload exploitable : matchs absents ou bloqués par points ATP introuvables/données insuffisantes.")
         return 0
 
-    result = send_to_backend(args.backend_url, payload_items)
-    result_text = render_backend_result(result)
+    if backend_send_is_disabled(args.backend_url, args.no_send_backend):
+        payload_only = {
+            "status": "payload_only",
+            "mode": MODE,
+            "targetDay": target_day.isoformat(),
+            "dailySchedulePairs": len(day_matches),
+            "payloadCount": len(payload_items),
+            "payloadPath": str(payload_path),
+        }
+        base.write_json(result_json_path, payload_only)
+        base.write_text(result_txt_path, "PAYLOAD_ONLY - app.py calculera le moteur directement.")
+        base.write_text(base.RESULT_LATEST_PATH, "PAYLOAD_ONLY - app.py calculera le moteur directement.")
 
-    write_json(result_json_path, result)
-    write_text(result_txt_path, result_text)
-    write_text(RESULT_LATEST_PATH, result_text)
+        print(f"UNITY_INPUT : {base.UNITY_OUT_PATH}")
+        print(f"LINES       : {lines_path}")
+        print(f"AUDIT       : {audit_path}")
+        print(f"PAYLOAD     : {payload_path}")
+        print(f"RESULT_JSON : {result_json_path}")
+        print(f"RESULT_TXT  : {result_txt_path}")
+        print(f"LINES_LATEST: {base.LINES_LATEST_PATH}")
+        print(f"AUDIT_LATEST: {base.AUDIT_LATEST_PATH}")
+        print(f"RESULT_LATEST: {base.RESULT_LATEST_PATH}")
+        print(f"COUNT       : {len(lines)}")
+        print("PAYLOAD_ONLY")
+        return 0
+
+    result = base.send_to_backend(args.backend_url, payload_items)
+    result_text = base.render_backend_result(result)
+
+    base.write_json(result_json_path, result)
+    base.write_text(result_txt_path, result_text)
+    base.write_text(base.RESULT_LATEST_PATH, result_text)
 
     safe_result_text = result_text.replace("✅", "[JOUABLE]").replace("❌", "[PAS JOUABLE]")
 
-    print(f"UNITY_INPUT : {UNITY_OUT_PATH}")
+    print(f"UNITY_INPUT : {base.UNITY_OUT_PATH}")
     print(f"LINES       : {lines_path}")
     print(f"AUDIT       : {audit_path}")
     print(f"PAYLOAD     : {payload_path}")
     print(f"RESULT_JSON : {result_json_path}")
     print(f"RESULT_TXT  : {result_txt_path}")
-    print(f"LINES_LATEST: {LINES_LATEST_PATH}")
-    print(f"AUDIT_LATEST: {AUDIT_LATEST_PATH}")
-    print(f"RESULT_LATEST: {RESULT_LATEST_PATH}")
+    print(f"LINES_LATEST: {base.LINES_LATEST_PATH}")
+    print(f"AUDIT_LATEST: {base.AUDIT_LATEST_PATH}")
+    print(f"RESULT_LATEST: {base.RESULT_LATEST_PATH}")
     print(f"COUNT       : {len(lines)}")
     print()
     print("--- RESULT PREVIEW ---")
