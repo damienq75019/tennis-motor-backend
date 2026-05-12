@@ -1907,6 +1907,8 @@ async def root() -> Dict[str, Any]:
             "/predictions?day=today",
             "/audit?day=today",
             "/debug-audit?day=today",
+            "/history",
+            "/history-refresh",
         ],
     }
 
@@ -2036,6 +2038,47 @@ async def debug_audit(day: str = Query("today")) -> Dict[str, Any]:
     - ne pas toucher au moteur.
     """
     return await audit(day=day)
+
+
+@app.get("/history")
+async def history() -> Dict[str, Any]:
+    """
+    Historique Premium Tennis Motor.
+
+    Ne relance pas /daily.
+    Ne touche pas au moteur.
+    Lit premium_history.py et renvoie le résumé, le graphique et les lignes historiques.
+    """
+    try:
+        import premium_history
+        return await asyncio.to_thread(premium_history.build_summary)
+    except Exception as exc:
+        return {
+            "status": "error",
+            "error": f"{type(exc).__name__}: {exc}",
+            "traceback": traceback.format_exc()[-4000:],
+        }
+
+
+@app.get("/history-refresh")
+async def history_refresh() -> Dict[str, Any]:
+    """
+    Alias de sécurité pour reconstruire/lire le résumé historique.
+
+    Même comportement que /history :
+    - pas de relance daily ;
+    - pas de modification moteur ;
+    - lecture via premium_history.build_summary().
+    """
+    try:
+        import premium_history
+        return await asyncio.to_thread(premium_history.build_summary)
+    except Exception as exc:
+        return {
+            "status": "error",
+            "error": f"{type(exc).__name__}: {exc}",
+            "traceback": traceback.format_exc()[-4000:],
+        }
 
 
 if __name__ == "__main__":
