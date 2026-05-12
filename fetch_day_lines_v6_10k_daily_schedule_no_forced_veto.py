@@ -57,13 +57,14 @@ import requests
 from bs4 import BeautifulSoup
 
 
-MODE = "V6_11C_FINAL_CLEAN_FLASHSCORE_STRICT_TOUR_HEADER"
+MODE = "V6_11D_FINAL_CLEAN_FULL_NAMES_POINTS_TENNISTEMPLE"
 OUT_DIR = Path("output")
 
 ATP_BASE = "https://www.atptour.com"
 ATP_CURRENT_URL = "https://www.atptour.com/en/scores/current"
 ATP_RANKINGS_LIVE_URL = "https://www.atptour.com/en/rankings/singles/live"
 ATP_RANKINGS_URL = "https://www.atptour.com/en/rankings/singles"
+TENNIS_TEMPLE_ATP_LIVE_URL = "https://fr.tennistemple.com/classement-atp-live"
 FLASHSCORE_URL_FR = "https://www.flashscore.fr/tennis/"
 FLASHSCORE_URL_EN_ATP = "https://www.flashscore.com/tennis/atp-singles/"
 
@@ -505,20 +506,32 @@ def flash_header_is_atp_singles(header: str) -> bool:
 
 
 def build_alias_map(points_map: Dict[str, int]) -> Dict[str, str]:
+    """
+    Construit les alias Flashscore depuis points_map.
+
+    points_map doit maintenant contenir les noms en ordre normal :
+      jannik sinner
+      daniil medvedev
+
+    Alias générés :
+      sinner j. -> Jannik Sinner
+      sinner j  -> Jannik Sinner
+      j. sinner -> Jannik Sinner
+    """
     aliases: Dict[str, str] = {}
 
-    # points_map keys are canonical. Put title fallback.
     for key in points_map.keys():
         parts = key.split()
         if len(parts) < 2:
             continue
+
         first = parts[0]
-        surname = " ".join(parts[1:])
         last = parts[-1]
+        surname = " ".join(parts[1:])
         initial = first[:1]
         full_title = " ".join(p.capitalize() for p in parts)
 
-        for a in {
+        keys = {
             key,
             f"{surname} {initial}",
             f"{surname} {initial}.",
@@ -528,7 +541,10 @@ def build_alias_map(points_map: Dict[str, int]) -> Dict[str, str]:
             f"{initial}. {surname}",
             f"{initial} {last}",
             f"{initial}. {last}",
-        }:
+        }
+
+        for a in keys:
+            aliases[canonical_name(a)] = full_title
             aliases[a] = full_title
 
     return aliases
@@ -537,10 +553,13 @@ def build_alias_map(points_map: Dict[str, int]) -> Dict[str, str]:
 def resolve_flash_name(raw: str, aliases: Dict[str, str]) -> str:
     name = clean_name(raw)
     key = canonical_name(name)
+
     if key in aliases:
         return aliases[key]
+    if name in aliases:
+        return aliases[name]
 
-    # "Sinner J."
+    # Flashscore fréquent : "Sinner J."
     m = re.match(r"^(.+?)\s+([A-Za-zÀ-ÿ])\.?$", name)
     if m:
         surname = canonical_name(m.group(1))
@@ -548,8 +567,11 @@ def resolve_flash_name(raw: str, aliases: Dict[str, str]) -> str:
         for k in (f"{surname} {initial}", f"{surname} {initial}."):
             if k in aliases:
                 return aliases[k]
+            ck = canonical_name(k)
+            if ck in aliases:
+                return aliases[ck]
 
-    # "J. Sinner"
+    # Autre forme : "J. Sinner"
     m = re.match(r"^([A-Za-zÀ-ÿ])\.?\s+(.+)$", name)
     if m:
         initial = canonical_name(m.group(1))[:1]
@@ -557,6 +579,9 @@ def resolve_flash_name(raw: str, aliases: Dict[str, str]) -> str:
         for k in (f"{initial} {surname}", f"{initial}. {surname}"):
             if k in aliases:
                 return aliases[k]
+            ck = canonical_name(k)
+            if ck in aliases:
+                return aliases[ck]
 
     return name
 
@@ -805,8 +830,93 @@ def parse_points_from_text(text: str, audit: List[str]) -> Dict[str, int]:
     return points
 
 
+def parse_tennis_temple_points(text: str, audit: List[str]) -> Dict[str, int]:
+    """
+    Parse TennisTemple live ATP ranking.
+
+    Format observé :
+      Sinner, Jannik
+      24
+      13900 -450
+
+    On stocke toujours en forme normale :
+      Jannik Sinner -> 13900
+
+    Ça permet :
+      - points_for("Jannik Sinner")
+      - alias Flashscore "Sinner J." -> "Jannik Sinner"
+    """
+    points: Dict[str, int] = {}
+    lines = [normalize_space(x) for x in (text or "").splitlines() if normalize_space(x)]
+
+    name_re = re.compile(r"^([A-Za-zÀ-ÿ][A-Za-zÀ-ÿ'’ .-]{1,40}),\s*([A-Za-zÀ-ÿ][A-Za-zÀ-ÿ'’ .-]{1,40})$")
+
+    for i, line in enumerate(lines):
+        m = name_re.match(line)
+        if not m:
+            continue
+
+        last = clean_name(m.group(1).replace("’", "'"))
+        first = clean_name(m.group(2).replace("’", "'"))
+
+        if not first or not last:
+            continue
+
+        full = clean_name(f"{first} {last}")
+
+        if not is_name_like(full):
+            continue
+
+        found_points = 0
+
+        # Cherche la valeur "Points" dans les lignes juste après le nom.
+        # On évite l'âge/rang en privilégiant un nombre >= 30 quand disponible,
+        # mais on garde aussi les petits scores si c'est le seul point trouvé.
+        nearby_numbers: List[int] = []
+        for j in range(i + 1, min(len(lines), i + 8)):
+            candidate_line = lines[j]
+
+            # ignore lignes trop textuelles
+            if "," in candidate_line and re.search(r"[A-Za-zÀ-ÿ]", candidate_line):
+                break
+
+            for raw_num in re.findall(r"\b\d{1,3}(?:[ .]\d{3})+\b|\b\d{1,5}\b", candidate_line):
+                try:
+                    n = int(raw_num.replace(" ", "").replace(".", ""))
+                except Exception:
+                    continue
+                if 1 <= n <= 20000:
+                    nearby_numbers.append(n)
+
+        # Les âges sont généralement 16-45, les points ATP souvent plus hauts.
+        # Si plusieurs nombres, prendre le plus grand dans la fenêtre.
+        if nearby_numbers:
+            found_points = max(nearby_numbers)
+
+        if found_points > 0:
+            points[canonical_name(full)] = int(found_points)
+
+    audit.append(f"tennistemple_points_parse_count={len(points)}")
+    return points
+
+
+
 def fetch_points_map(session: requests.Session, audit: List[str]) -> Dict[str, int]:
-    # 1) ATP live rankings officiel.
+    """
+    Sources points ATP.
+
+    1) ATP officiel si accessible.
+    2) live-tennis.eu si accessible.
+    3) TennisTemple live ATP ranking si ATP/live-tennis sont bloqués 403.
+
+    La V6.11D ajoute TennisTemple car l'audit Railway montre :
+      ATP rankings = 403
+      live-tennis = 403
+      points_map_size=0
+
+    Sans points_map, Flashscore donne seulement "Sinner J." et le moteur reçoit ATP=1.
+    """
+    # 1) ATP officiel.
     for url in [ATP_RANKINGS_LIVE_URL, ATP_RANKINGS_URL]:
         try:
             html = fetch_html(session, url)
@@ -817,10 +927,11 @@ def fetch_points_map(session: requests.Session, audit: List[str]) -> Dict[str, i
             if len(points) >= 50:
                 audit.append(f"points_source={url}")
                 return points
+            audit.append(f"points_source_too_small={url} | count={len(points)}")
         except Exception as exc:
             audit.append(f"points_fetch_failed={url} | {type(exc).__name__}: {exc}")
 
-    # 2) Fallback live-tennis.eu si ATP est vide côté HTML.
+    # 2) live-tennis.eu.
     try:
         url = "https://live-tennis.eu/en/atp-live-ranking"
         html = fetch_html(session, url)
@@ -828,10 +939,27 @@ def fetch_points_map(session: requests.Session, audit: List[str]) -> Dict[str, i
         for tag in soup(["script", "style", "noscript"]):
             tag.decompose()
         points = parse_points_from_text(soup.get_text("\n", strip=True), audit)
-        audit.append(f"points_source={url}")
-        return points
+        if len(points) >= 50:
+            audit.append(f"points_source={url}")
+            return points
+        audit.append(f"points_source_too_small={url} | count={len(points)}")
     except Exception as exc:
         audit.append(f"points_live_tennis_failed={type(exc).__name__}: {exc}")
+
+    # 3) TennisTemple live ATP ranking.
+    try:
+        url = TENNIS_TEMPLE_ATP_LIVE_URL
+        html = fetch_html(session, url)
+        soup = BeautifulSoup(html, "html.parser")
+        for tag in soup(["script", "style", "noscript"]):
+            tag.decompose()
+        points = parse_tennis_temple_points(soup.get_text("\n", strip=True), audit)
+        if len(points) >= 50:
+            audit.append(f"points_source={url}")
+            return points
+        audit.append(f"points_source_too_small={url} | count={len(points)}")
+    except Exception as exc:
+        audit.append(f"points_tennistemple_failed={type(exc).__name__}: {exc}")
 
     return {}
 
