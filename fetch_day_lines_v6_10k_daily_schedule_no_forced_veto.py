@@ -45,7 +45,7 @@ BASE_MODULE_CANDIDATES = [
     "fetch_day_lines_v6_5_results_context_safe",
 ]
 
-MODE = "V6_10L_ATP_SINGLES_STRICT"
+MODE = "V6_10M_ATP_DAILY_SCHEDULE_MASTER"
 PAYLOAD_LATEST_PATH = Path("output") / "payload_latest.json"
 
 
@@ -356,8 +356,8 @@ def _static_official_singles_pairs_for_verified_day(target_day: date) -> Set[Tup
     Fallback de sécurité vérifié ATP Order Of Play.
 
     Important :
-    - Ne crée aucun match.
-    - Sert seulement à filtrer les lignes déjà extraites du daily-schedule.
+    - Ne crée aucun match final à lui seul.
+    - Sert seulement à valider les lignes déjà extraites du daily-schedule ATP.
     - Évite que les paires de double deviennent de faux matchs de simple.
     """
 
@@ -381,6 +381,15 @@ def _static_official_singles_pairs_for_verified_day(target_day: date) -> Set[Tup
             ("Andrey Rublev", "Alejandro Davidovich Fokina"),
             ("Brandon Nakashima", "Nikoloz Basilashvili"),
             ("Mariano Navone", "Hamad Medjedovic"),
+        ],
+        "2026-05-12": [
+            ("Lorenzo Musetti", "Casper Ruud"),
+            ("Jannik Sinner", "Andrea Pellegrino"),
+            ("Thiago Agustin Tirante", "Daniil Medvedev"),
+            ("Rafael Jodar", "Learner Tien"),
+            ("Luciano Darderi", "Alexander Zverev"),
+            ("Andrey Rublev", "Nikoloz Basilashvili"),
+            ("Karen Khachanov", "Dino Prizmic"),
         ],
     }
 
@@ -494,25 +503,60 @@ def _fetch_official_atp_article_singles_pairs(session, target_day: date) -> Tupl
 
     return pairs, audit
 
+def _row_is_safe_atp_singles_daily_schedule(row: Dict[str, str]) -> Tuple[bool, str]:
+    """
+    Validation locale quand l'Order Of Play article n'est pas lisible.
+
+    On accepte seulement une paire déjà extraite depuis ATP daily-schedule,
+    sans marqueur de double, sans WTA, et avec deux vrais noms.
+    Flashscore n'a pas le droit de créer des matchs.
+    """
+    player_a = clean_name(row.get("playerA", ""))
+    player_b = clean_name(row.get("playerB", ""))
+    source = row.get("source", "")
+    source_url = row.get("sourceUrl", "")
+    evidence = row.get("evidence", "")
+
+    joined = normalize_space(f"{player_a} {player_b} {source} {source_url} {evidence}")
+
+    if not player_a or not player_b:
+        return False, "missing_player"
+
+    if not is_name_like(player_a) or not is_name_like(player_b):
+        return False, "bad_name"
+
+    if canonical_name(player_a) == canonical_name(player_b):
+        return False, "same_player"
+
+    if _is_doubles_marker(joined):
+        return False, "doubles_marker"
+
+    if _is_wta_marker(joined):
+        return False, "wta_marker"
+
+    if "atptour.com" not in source_url.lower() and "ATP Daily Schedule" not in source:
+        return False, "not_atp_daily_schedule_source"
+
+    return True, "ok"
+
+
 def _apply_official_atp_singles_filter(
     rows: List[Dict[str, str]],
     session,
     target_day: date,
 ) -> Tuple[List[Dict[str, str]], List[str]]:
     """
-    V6.10L STRICT.
+    V6.10M durable.
 
-    Règle de sécurité :
-    - le daily-schedule peut encore mélanger simples + doubles selon le rendu HTML ;
-    - donc aucune ligne n'est acceptée sans validation ATP officielle du jour ;
-    - si la validation officielle n'est pas disponible, on retourne 0 match
-      au lieu d'inventer ou de laisser passer des doubles.
+    Source maître = ATP daily-schedule officiel.
+    L'article ATP Order Of Play sert de validation supplémentaire quand il est lisible.
 
-    Important :
-    - l'article ATP / Order Of Play ne crée pas de match ;
-    - il sert uniquement à valider les paires déjà extraites ;
-    - les lignes ATP contenant "/" sont rejetées comme doubles dans le parseur OOP ;
-    - les lignes WTA sont ignorées parce qu'on ne garde que les lignes commençant par "ATP -".
+    Règle importante :
+    - Flashscore ne crée jamais la liste des matchs.
+    - Flashscore sert seulement aux cotes/résultats.
+    - Les doubles sont refusés via marqueur "/" / doubles.
+    - Si l'article ATP n'est pas parsable, on ne renvoie pas forcément 0 :
+      on garde les lignes sûres venant du daily-schedule ATP officiel.
     """
     audit: List[str] = []
     before = len(rows)
@@ -520,49 +564,52 @@ def _apply_official_atp_singles_filter(
     official_pairs, official_audit = _fetch_official_atp_article_singles_pairs(session, target_day)
     audit.extend(official_audit)
 
-    if not official_pairs:
-        removed = [f"{row.get('playerA', '')} vs {row.get('playerB', '')}" for row in rows]
-        audit.append("official_oop_filter_applied=true")
-        audit.append("official_oop_filter_strict_mode=true")
-        audit.append("official_oop_filter_reason=no_official_atp_singles_pairs_found")
-        audit.append(f"official_oop_filter_rows_before={before}")
-        audit.append("official_oop_filter_rows_after=0")
-        audit.append(f"official_oop_filter_removed_rows={len(removed)}")
-        for item in removed[:80]:
-            audit.append(f"[STRICT ATP FILTER REMOVE - UNVERIFIED] {item}")
-        return [], audit
-
     kept: List[Dict[str, str]] = []
     removed: List[str] = []
 
-    for row in rows:
-        player_a = row.get("playerA", "")
-        player_b = row.get("playerB", "")
+    if official_pairs:
+        for row in rows:
+            player_a = row.get("playerA", "")
+            player_b = row.get("playerB", "")
 
-        # Sécurité absolue : si un champ contient "/" ou "double", on refuse.
-        joined = f"{player_a} {player_b} {row.get('evidence', '')}"
-        if _is_doubles_marker(joined):
-            removed.append(f"{player_a} vs {player_b} | reason=doubles_marker")
-            continue
+            safe, reason = _row_is_safe_atp_singles_daily_schedule(row)
+            if not safe:
+                removed.append(f"{player_a} vs {player_b} | reason={reason}")
+                continue
 
-        key = unordered_pair_key(player_a, player_b)
+            key = unordered_pair_key(player_a, player_b)
 
-        if key in official_pairs:
-            kept.append(row)
-        else:
-            removed.append(f"{player_a} vs {player_b} | reason=not_in_official_atp_singles_oop")
+            if key in official_pairs:
+                kept.append(row)
+            else:
+                removed.append(f"{player_a} vs {player_b} | reason=not_in_official_atp_oop")
 
-    audit.append("official_oop_filter_applied=true")
-    audit.append("official_oop_filter_strict_mode=true")
-    audit.append(f"official_oop_filter_rows_before={before}")
-    audit.append(f"official_oop_filter_rows_after={len(kept)}")
-    audit.append(f"official_oop_filter_removed_rows={len(removed)}")
+        audit.append("official_oop_filter_applied=true")
+        audit.append("official_oop_filter_mode=validation_available")
+    else:
+        for row in rows:
+            player_a = row.get("playerA", "")
+            player_b = row.get("playerB", "")
 
-    for row in kept[:40]:
-        audit.append(f"[OFFICIAL ATP SINGLES KEEP] {row.get('playerA')} vs {row.get('playerB')}")
+            safe, reason = _row_is_safe_atp_singles_daily_schedule(row)
+            if safe:
+                kept.append(row)
+            else:
+                removed.append(f"{player_a} vs {player_b} | reason={reason}")
+
+        audit.append("official_oop_filter_applied=false")
+        audit.append("official_oop_filter_mode=daily_schedule_master_fallback")
+        audit.append("official_oop_filter_reason=no_article_pairs_but_atp_daily_schedule_rows_available")
+
+    audit.append(f"daily_schedule_master_rows_before={before}")
+    audit.append(f"daily_schedule_master_rows_after={len(kept)}")
+    audit.append(f"daily_schedule_master_removed_rows={len(removed)}")
+
+    for row in kept[:60]:
+        audit.append(f"[ATP DAILY SINGLES KEEP] {row.get('playerA')} vs {row.get('playerB')}")
 
     for item in removed[:120]:
-        audit.append(f"[OFFICIAL ATP FILTER REMOVE] {item}")
+        audit.append(f"[ATP DAILY FILTER REMOVE] {item}")
 
     return kept, audit
 
@@ -1680,8 +1727,8 @@ def main() -> int:
     audit.append(f"target_label={args.target_day}")
     audit.append(f"backend_url={args.backend_url}")
     audit.append(f"mode={MODE}")
-    audit.append("source_policy=ATP_DAILY_SCHEDULE_PLUS_OFFICIAL_ATP_SINGLES_VALIDATION_STRICT")
-    audit.append("official_oop_singles_filter=strict_required_when_available_else_empty")
+    audit.append("source_policy=ATP_DAILY_SCHEDULE_MASTER_FLASHSC0RE_ODDS_ONLY")
+    audit.append("official_oop_singles_filter=validation_when_available_but_daily_schedule_is_master")
     audit.append("strict_date_policy=official_oop_filter_then_trim_safety")
     audit.append("veto_policy=no_forced_tournament_wins_without_real_atp_evidence")
     audit.append("missing_points_policy=keep_match_replace_missing_points_with_1")
