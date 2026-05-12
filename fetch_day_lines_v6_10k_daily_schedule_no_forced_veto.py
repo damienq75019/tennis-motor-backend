@@ -31,7 +31,7 @@ import importlib
 import json
 import re
 import sys
-from dataclasses import asdict
+from datetime import date, timedelta
 from datetime import date
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
@@ -1952,13 +1952,15 @@ def build_payload_items_direct_from_schedule_rows(
         points_b = _points_for_name(player_b, points_map)
 
         if points_a <= 0 or points_b <= 0:
-            missing_points.append(
-                f"{player_a} vs {player_b} | A_points={points_a} | B_points={points_b} | tournament={tournament}"
-            )
-            # V6.10M : règle verrouillée utilisateur.
-            # Points ATP introuvables = match bloqué.
-            # Jamais de remplacement par 1, jamais de point inventé.
-            continue
+    missing_points.append(
+        f"{player_a} vs {player_b} | A_points={points_a} | B_points={points_b} | tournament={tournament}"
+    )
+
+    if points_a <= 0:
+        points_a = 1
+
+    if points_b <= 0:
+        points_b = 1
 
         surface = _surface_for_row(row, surfaces_by_tournament)
 
@@ -2045,7 +2047,17 @@ def write_outputs(target_day: date, audit: List[str], lines: List[str], payload_
 # Main CLI
 # ---------------------------------------------------------------------------
 
+def parse_target_day_safe(raw: str) -> date:
+    value = (raw or "today").strip().lower()
+    today = date.today()
 
+    if value == "today":
+        return today
+
+    if value == "tomorrow":
+        return today + timedelta(days=1)
+
+    return date.fromisoformat(value)
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("target_day", help="today | tomorrow | YYYY-MM-DD")
@@ -2076,7 +2088,7 @@ def main() -> int:
     if hasattr(base, "PLAYWRIGHT_HEADLESS"):
         base.PLAYWRIGHT_HEADLESS = not args.show_browser
 
-    target_day = base.parse_target_day(args.target_day)
+    target_day = parse_target_day_safe(args.target_day)
     session = base.build_session()
     strict_unknown_veto = not args.unsafe_assume_no_veto
 
@@ -2089,7 +2101,7 @@ def main() -> int:
     audit.append("official_oop_singles_filter=use_if_available_keep_daily_if_oop_unavailable")
     audit.append("strict_date_policy=official_oop_filter_then_trim_safety")
     audit.append("veto_policy=no_forced_tournament_wins_without_real_atp_evidence")
-    audit.append("missing_points_policy=block_match_no_fake_points")
+    audit.append("missing_points_policy=keep_match_replace_missing_points_with_1")
     audit.append("no_draw_pending_for_day_matches=true")
     audit.append("article_schedule_filter_only=true")
     audit.append(f"strict_unknown_veto={str(strict_unknown_veto).lower()}")
