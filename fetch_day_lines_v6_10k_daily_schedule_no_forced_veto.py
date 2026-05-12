@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Tennis Motor - Fetch daily lines V6.10L DAILY SCHEDULE ATP SINGLES STRICT
+Tennis Motor - Fetch daily lines V6.10N DAILY SCHEDULE ATP SINGLES STRICT
 
-Objectif V6.10L :
+Objectif V6.10N :
 - Source officielle UNIQUE des matchs du jour = pages ATP daily-schedule.
 - Ne plus fabriquer la liste du jour depuis les draws pending ou les articles ATP.
 - Exclure doubles / blocs parasites / anciennes paires.
@@ -45,7 +45,7 @@ BASE_MODULE_CANDIDATES = [
     "fetch_day_lines_v6_5_results_context_safe",
 ]
 
-MODE = "V6_10M_ATP_DAILY_SCHEDULE_MASTER"
+MODE = "V6_10N_ATP_DAILY_MASTER_LOCKED"
 PAYLOAD_LATEST_PATH = Path("output") / "payload_latest.json"
 
 
@@ -540,76 +540,101 @@ def _row_is_safe_atp_singles_daily_schedule(row: Dict[str, str]) -> Tuple[bool, 
     return True, "ok"
 
 
+def _row_is_safe_atp_singles_daily_schedule(row: Dict[str, str]) -> Tuple[bool, str]:
+    """
+    V6.10N LOCKED.
+
+    Règle simple et durable :
+    - ATP daily-schedule crée la liste.
+    - Flashscore ne crée jamais la liste.
+    - Article ATP Order Of Play ne bloque jamais la liste.
+    - On refuse seulement les doubles/WTA/bruit évident.
+    """
+    player_a = clean_name(row.get("playerA", ""))
+    player_b = clean_name(row.get("playerB", ""))
+    source = row.get("source", "")
+    source_url = row.get("sourceUrl", "")
+    evidence = row.get("evidence", "")
+
+    joined = normalize_space(f"{player_a} {player_b} {source} {source_url} {evidence}")
+
+    if not player_a or not player_b:
+        return False, "missing_player"
+
+    if not is_name_like(player_a) or not is_name_like(player_b):
+        return False, "bad_name"
+
+    if canonical_name(player_a) == canonical_name(player_b):
+        return False, "same_player"
+
+    # Doubles : équipe ou section contenant "/".
+    if _is_doubles_marker(joined):
+        return False, "doubles_marker"
+
+    # WTA ou femmes.
+    if _is_wta_marker(joined):
+        return False, "wta_marker"
+
+    # Bruit non match.
+    if block_has_bad_noise(joined):
+        return False, "noise"
+
+    # Sécurité source : la ligne doit venir du daily-schedule ATP, pas de Flashscore.
+    src = f"{source} {source_url}".lower()
+    if "atp daily schedule" not in src and "atptour.com" not in src:
+        return False, "not_atp_daily_schedule_source"
+
+    return True, "ok"
+
+
 def _apply_official_atp_singles_filter(
     rows: List[Dict[str, str]],
     session,
     target_day: date,
 ) -> Tuple[List[Dict[str, str]], List[str]]:
     """
-    V6.10M durable.
+    V6.10N LOCKED - plus de blocage par article ATP.
 
-    Source maître = ATP daily-schedule officiel.
-    L'article ATP Order Of Play sert de validation supplémentaire quand il est lisible.
+    Le bug venait du fait qu'un filtre auxiliaire pouvait bloquer tous les vrais matchs
+    si l'article ATP Order Of Play n'était pas parsé.
 
-    Règle importante :
-    - Flashscore ne crée jamais la liste des matchs.
-    - Flashscore sert seulement aux cotes/résultats.
-    - Les doubles sont refusés via marqueur "/" / doubles.
-    - Si l'article ATP n'est pas parsable, on ne renvoie pas forcément 0 :
-      on garde les lignes sûres venant du daily-schedule ATP officiel.
+    Nouvelle règle figée :
+    - ATP daily-schedule est la source maître.
+    - L'article ATP n'est plus obligatoire pour garder un match.
+    - Les doubles sont rejetés par marqueurs explicites.
+    - Si ATP daily-schedule ne donne rien, on renvoie 0 avec audit clair.
     """
     audit: List[str] = []
     before = len(rows)
-
-    official_pairs, official_audit = _fetch_official_atp_article_singles_pairs(session, target_day)
-    audit.extend(official_audit)
-
     kept: List[Dict[str, str]] = []
     removed: List[str] = []
 
-    if official_pairs:
-        for row in rows:
-            player_a = row.get("playerA", "")
-            player_b = row.get("playerB", "")
+    for row in rows:
+        player_a = row.get("playerA", "")
+        player_b = row.get("playerB", "")
 
-            safe, reason = _row_is_safe_atp_singles_daily_schedule(row)
-            if not safe:
-                removed.append(f"{player_a} vs {player_b} | reason={reason}")
-                continue
+        safe, reason = _row_is_safe_atp_singles_daily_schedule(row)
 
-            key = unordered_pair_key(player_a, player_b)
+        if safe:
+            kept.append(row)
+        else:
+            removed.append(f"{player_a} vs {player_b} | reason={reason}")
 
-            if key in official_pairs:
-                kept.append(row)
-            else:
-                removed.append(f"{player_a} vs {player_b} | reason=not_in_official_atp_oop")
+    audit.append("atp_daily_master_locked=true")
+    audit.append("official_oop_filter_disabled=true")
+    audit.append("flashscore_match_creation=false")
+    audit.append(f"atp_daily_rows_before={before}")
+    audit.append(f"atp_daily_rows_after={len(kept)}")
+    audit.append(f"atp_daily_removed_rows={len(removed)}")
 
-        audit.append("official_oop_filter_applied=true")
-        audit.append("official_oop_filter_mode=validation_available")
-    else:
-        for row in rows:
-            player_a = row.get("playerA", "")
-            player_b = row.get("playerB", "")
-
-            safe, reason = _row_is_safe_atp_singles_daily_schedule(row)
-            if safe:
-                kept.append(row)
-            else:
-                removed.append(f"{player_a} vs {player_b} | reason={reason}")
-
-        audit.append("official_oop_filter_applied=false")
-        audit.append("official_oop_filter_mode=daily_schedule_master_fallback")
-        audit.append("official_oop_filter_reason=no_article_pairs_but_atp_daily_schedule_rows_available")
-
-    audit.append(f"daily_schedule_master_rows_before={before}")
-    audit.append(f"daily_schedule_master_rows_after={len(kept)}")
-    audit.append(f"daily_schedule_master_removed_rows={len(removed)}")
-
-    for row in kept[:60]:
-        audit.append(f"[ATP DAILY SINGLES KEEP] {row.get('playerA')} vs {row.get('playerB')}")
+    for row in kept[:80]:
+        audit.append(
+            f"[ATP DAILY MASTER KEEP] {row.get('playerA')} vs {row.get('playerB')} "
+            f"| source={row.get('source', '')} | evidence={row.get('evidence', '')}"
+        )
 
     for item in removed[:120]:
-        audit.append(f"[ATP DAILY FILTER REMOVE] {item}")
+        audit.append(f"[ATP DAILY MASTER REMOVE] {item}")
 
     return kept, audit
 
@@ -1606,7 +1631,7 @@ def build_payload_items_direct_from_schedule_rows(
 
         player_b_is_qualifier = _player_b_is_q_from_evidence(player_b, evidence)
 
-        # V6.10L :
+        # V6.10N :
         # Ne plus forcer un veto automatique sur tous les matchs de terre battue.
         # Ancienne règle supprimée :
         #   if strict_unknown_veto and surface == "Clay": player_b_tournament_wins = 2
@@ -1728,7 +1753,7 @@ def main() -> int:
     audit.append(f"backend_url={args.backend_url}")
     audit.append(f"mode={MODE}")
     audit.append("source_policy=ATP_DAILY_SCHEDULE_MASTER_FLASHSC0RE_ODDS_ONLY")
-    audit.append("official_oop_singles_filter=validation_when_available_but_daily_schedule_is_master")
+    audit.append("official_oop_singles_filter=disabled_not_required")
     audit.append("strict_date_policy=official_oop_filter_then_trim_safety")
     audit.append("veto_policy=no_forced_tournament_wins_without_real_atp_evidence")
     audit.append("missing_points_policy=keep_match_replace_missing_points_with_1")
