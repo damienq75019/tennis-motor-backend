@@ -17,14 +17,6 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from motor import calculate_predictions, calculate_match_prediction, get_state
 
-# Historique séparé.
-# Toute la logique historique reste dans premium_history.py.
-# app.py sert seulement de pont API pour Unity.
-try:
-    import premium_history
-except Exception:
-    premium_history = None
-
 
 BASE_DIR = Path(__file__).resolve().parent
 OUTPUT_DIR = BASE_DIR / "output"
@@ -1887,28 +1879,6 @@ def run_daily_fetch_sync(target_day: str) -> Dict[str, Any]:
         result["daily"]["oddsStatus"] = "failed"
         result["daily"]["oddsAudit"] = traceback.format_exc()[-1200:]
 
-    # Historique Premium séparé :
-    # - premium_history.py reste le seul fichier qui gère l'historique ;
-    # - app.py appelle seulement record_result_json() après analyse ;
-    # - les anciens jours ne sont jamais effacés.
-    try:
-        if premium_history is not None:
-            history_record = premium_history.record_result_json(result, target_day)
-            result.setdefault("daily", {})
-            result["daily"]["historyRecord"] = history_record
-        else:
-            result.setdefault("daily", {})
-            result["daily"]["historyRecord"] = {
-                "status": "disabled",
-                "message": "premium_history.py non importé.",
-            }
-    except Exception:
-        result.setdefault("daily", {})
-        result["daily"]["historyRecord"] = {
-            "status": "error",
-            "error": traceback.format_exc()[-1200:],
-        }
-
     result.setdefault("daily", {})
     result["daily"].update(
         {
@@ -2013,74 +1983,6 @@ async def predictions_get(day: str = Query("today")) -> Dict[str, Any]:
         )
 
     return await asyncio.to_thread(run_daily_fetch_sync, target_day)
-
-
-
-@app.get("/history")
-async def history() -> Dict[str, Any]:
-    """
-    Données pour Unity :
-    - stats jour / semaine / mois / année / total
-    - courbe jour par jour
-    - lignes Premium suivies
-    """
-    if premium_history is None:
-        return {
-            "status": "error",
-            "message": "premium_history.py non disponible sur le serveur.",
-        }
-
-    try:
-        return await asyncio.to_thread(premium_history.build_summary)
-    except Exception:
-        return {
-            "status": "error",
-            "error": traceback.format_exc()[-1200:],
-        }
-
-
-@app.get("/history/settle")
-async def history_settle() -> Dict[str, Any]:
-    """
-    Tente de passer les Premium pending en win/loss via Flashscore.
-    """
-    if premium_history is None:
-        return {
-            "status": "error",
-            "message": "premium_history.py non disponible sur le serveur.",
-        }
-
-    try:
-        settle = await asyncio.to_thread(premium_history.settle_flashscore)
-        summary = await asyncio.to_thread(premium_history.build_summary)
-        summary["settle"] = settle
-        return summary
-    except Exception:
-        return {
-            "status": "error",
-            "error": traceback.format_exc()[-1200:],
-        }
-
-
-@app.get("/history/reset")
-async def history_reset(confirm: str = Query("")) -> Dict[str, Any]:
-    """
-    Efface l'historique seulement avec confirmation explicite :
-    /history/reset?confirm=YES
-    """
-    if premium_history is None:
-        return {
-            "status": "error",
-            "message": "premium_history.py non disponible sur le serveur.",
-        }
-
-    try:
-        return await asyncio.to_thread(premium_history.reset_history, confirm)
-    except Exception:
-        return {
-            "status": "error",
-            "error": traceback.format_exc()[-1200:],
-        }
 
 
 @app.get("/state")
