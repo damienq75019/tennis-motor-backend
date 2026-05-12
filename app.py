@@ -1909,6 +1909,7 @@ async def root() -> Dict[str, Any]:
             "/debug-audit?day=today",
             "/history",
             "/history-refresh",
+            "/history-reset?confirm=RESET",
         ],
     }
 
@@ -2079,6 +2080,91 @@ async def history_refresh() -> Dict[str, Any]:
             "error": f"{type(exc).__name__}: {exc}",
             "traceback": traceback.format_exc()[-4000:],
         }
+
+
+@app.get("/history-reset")
+async def history_reset(confirm: str = Query("")) -> Dict[str, Any]:
+    """
+    Remise à zéro de l'historique Premium.
+
+    Sécurité :
+    - ne relance pas /daily ;
+    - ne touche pas au moteur ;
+    - ne touche pas aux fichiers payload/audit/résultats du jour ;
+    - supprime seulement premium_history.json et premium_history_summary.json ;
+    - nécessite confirm=RESET.
+    """
+    if confirm != "RESET":
+        return {
+            "status": "refused",
+            "message": "Pour remettre l'historique à zéro, appelle /history-reset?confirm=RESET",
+        }
+
+    deleted: List[str] = []
+    missing: List[str] = []
+    errors: List[str] = []
+
+    candidate_dirs: List[Path] = []
+
+    try:
+        candidate_dirs.append(OUTPUT_DIR)
+    except Exception:
+        pass
+
+    try:
+        volume_dir = os.environ.get("RAILWAY_VOLUME_MOUNT_PATH", "").strip()
+        if volume_dir:
+            candidate_dirs.append(Path(volume_dir))
+            candidate_dirs.append(Path(volume_dir) / "output")
+    except Exception:
+        pass
+
+    # Dédoublonnage des dossiers.
+    unique_dirs: List[Path] = []
+    for d in candidate_dirs:
+        try:
+            resolved = d.resolve()
+        except Exception:
+            resolved = d
+        if resolved not in unique_dirs:
+            unique_dirs.append(resolved)
+
+    filenames = [
+        "premium_history.json",
+        "premium_history_summary.json",
+    ]
+
+    for directory in unique_dirs:
+        for filename in filenames:
+            path = directory / filename
+            try:
+                if path.exists():
+                    path.unlink()
+                    deleted.append(str(path))
+                else:
+                    missing.append(str(path))
+            except Exception as exc:
+                errors.append(f"{path}: {type(exc).__name__}: {exc}")
+
+    # Reconstruire un résumé vide si premium_history.py le permet.
+    rebuilt: Dict[str, Any] = {}
+    try:
+        import premium_history
+        rebuilt = await asyncio.to_thread(premium_history.build_summary)
+    except Exception as exc:
+        rebuilt = {
+            "status": "warning",
+            "message": f"Historique supprimé, mais résumé non reconstruit automatiquement : {type(exc).__name__}: {exc}",
+        }
+
+    return {
+        "status": "ok" if not errors else "partial",
+        "message": "Historique Premium remis à zéro.",
+        "deleted": deleted,
+        "missing": missing,
+        "errors": errors,
+        "history": rebuilt,
+    }
 
 
 if __name__ == "__main__":
