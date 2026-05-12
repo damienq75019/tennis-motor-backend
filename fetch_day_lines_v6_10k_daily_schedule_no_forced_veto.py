@@ -1,14 +1,15 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Tennis Motor - Fetch daily lines V6.10L DAILY SCHEDULE ATP SINGLES STRICT
+Tennis Motor - Fetch daily lines V6.10M DAILY SCHEDULE ATP SINGLES SAFE
 
-Objectif V6.10L :
+Objectif V6.10M :
 - Source officielle UNIQUE des matchs du jour = pages ATP daily-schedule.
 - Ne plus fabriquer la liste du jour depuis les draws pending ou les articles ATP.
 - Exclure doubles / blocs parasites / anciennes paires.
 - Garder le moteur existant inchangé.
 - Garder la récupération points ATP existante de la V6.7.
+- Points ATP introuvables = match bloqué, jamais remplacé par 1.
 - Garder le contexte draw/results seulement pour surface + veto Q/wins, jamais pour créer les matchs.
 
 Utilisation :
@@ -45,7 +46,7 @@ BASE_MODULE_CANDIDATES = [
     "fetch_day_lines_v6_5_results_context_safe",
 ]
 
-MODE = "V6_10L_ATP_SINGLES_STRICT_PLUS_FLASH_FALLBACK"
+MODE = "V6_10M_ATP_DAILY_SAFE_NO_FAKE_POINTS"
 PAYLOAD_LATEST_PATH = Path("output") / "payload_latest.json"
 
 
@@ -521,16 +522,46 @@ def _apply_official_atp_singles_filter(
     audit.extend(official_audit)
 
     if not official_pairs:
-        removed = [f"{row.get('playerA', '')} vs {row.get('playerB', '')}" for row in rows]
-        audit.append("official_oop_filter_applied=true")
-        audit.append("official_oop_filter_strict_mode=true")
-        audit.append("official_oop_filter_reason=no_official_atp_singles_pairs_found")
+        # V6.10M : ne plus vider toute la journée si l'article ATP Order Of Play
+        # n'est pas trouvable / pas encore mis à jour / change de format.
+        # Le daily-schedule reste la source des matchs. On applique seulement
+        # une sécurité locale anti-WTA / anti-doubles au lieu de retourner 0.
+        kept_without_oop: List[Dict[str, str]] = []
+        removed_without_oop: List[str] = []
+
+        for row in rows:
+            player_a = row.get("playerA", "")
+            player_b = row.get("playerB", "")
+            joined = f"{player_a} {player_b} {row.get('evidence', '')}"
+
+            if _is_wta_marker(joined):
+                removed_without_oop.append(f"{player_a} vs {player_b} | reason=wta_marker_without_oop")
+                continue
+
+            if _is_doubles_marker(joined):
+                removed_without_oop.append(f"{player_a} vs {player_b} | reason=doubles_marker_without_oop")
+                continue
+
+            if not is_name_like(player_a) or not is_name_like(player_b):
+                removed_without_oop.append(f"{player_a} vs {player_b} | reason=bad_name_without_oop")
+                continue
+
+            kept_without_oop.append(row)
+
+        audit.append("official_oop_filter_applied=false")
+        audit.append("official_oop_filter_strict_mode=false")
+        audit.append("official_oop_filter_reason=no_official_atp_singles_pairs_found_keep_daily_schedule_after_local_safety")
         audit.append(f"official_oop_filter_rows_before={before}")
-        audit.append("official_oop_filter_rows_after=0")
-        audit.append(f"official_oop_filter_removed_rows={len(removed)}")
-        for item in removed[:80]:
-            audit.append(f"[STRICT ATP FILTER REMOVE - UNVERIFIED] {item}")
-        return [], audit
+        audit.append(f"official_oop_filter_rows_after={len(kept_without_oop)}")
+        audit.append(f"official_oop_filter_removed_rows={len(removed_without_oop)}")
+
+        for row in kept_without_oop[:80]:
+            audit.append(f"[DAILY KEEP WITHOUT OOP] {row.get('playerA')} vs {row.get('playerB')}")
+
+        for item in removed_without_oop[:120]:
+            audit.append(f"[DAILY REMOVE WITHOUT OOP] {item}")
+
+        return kept_without_oop, audit
 
     kept: List[Dict[str, str]] = []
     removed: List[str] = []
@@ -1924,15 +1955,10 @@ def build_payload_items_direct_from_schedule_rows(
             missing_points.append(
                 f"{player_a} vs {player_b} | A_points={points_a} | B_points={points_b} | tournament={tournament}"
             )
-            # V6.10I :
-            # NE PLUS SUPPRIMER le match si un point ATP manque.
-            # On garde les 16 matchs ATP daily-schedule.
-            # Sécurité : un point manquant est remplacé par 1 pour éviter une division/logit impossible.
-            # L'audit garde la ligne [MISSING POINTS] pour correction ultérieure des alias.
-            if points_a <= 0:
-                points_a = 1
-            if points_b <= 0:
-                points_b = 1
+            # V6.10M : règle verrouillée utilisateur.
+            # Points ATP introuvables = match bloqué.
+            # Jamais de remplacement par 1, jamais de point inventé.
+            continue
 
         surface = _surface_for_row(row, surfaces_by_tournament)
 
@@ -2059,11 +2085,11 @@ def main() -> int:
     audit.append(f"target_label={args.target_day}")
     audit.append(f"backend_url={args.backend_url}")
     audit.append(f"mode={MODE}")
-    audit.append("source_policy=ATP_STRICT_THEN_FLASHSCORE_ATP_SINGLES_FALLBACK")
-    audit.append("official_oop_singles_filter=strict_then_flashscore_fallback_if_zero")
+    audit.append("source_policy=ATP_DAILY_SAFE_THEN_FLASHSCORE_ATP_SINGLES_FALLBACK")
+    audit.append("official_oop_singles_filter=use_if_available_keep_daily_if_oop_unavailable")
     audit.append("strict_date_policy=official_oop_filter_then_trim_safety")
     audit.append("veto_policy=no_forced_tournament_wins_without_real_atp_evidence")
-    audit.append("missing_points_policy=keep_match_replace_missing_points_with_1")
+    audit.append("missing_points_policy=block_match_no_fake_points")
     audit.append("no_draw_pending_for_day_matches=true")
     audit.append("article_schedule_filter_only=true")
     audit.append(f"strict_unknown_veto={str(strict_unknown_veto).lower()}")
@@ -2116,10 +2142,10 @@ def main() -> int:
         result_empty = {
             "matches": [],
             "summary": {
-                "totalRows": 0,
+                "totalRows": len(schedule_rows),
                 "validRows": 0,
-                "errorRows": 0,
-                "nonAnalyzedRows": 0,
+                "errorRows": len(schedule_rows),
+                "nonAnalyzedRows": len(schedule_rows),
                 "over80": 0,
                 "vetoCount": 0,
                 "jouables": 0,
@@ -2127,14 +2153,14 @@ def main() -> int:
             "meta": {
                 "mode": MODE,
                 "targetDay": target_day.isoformat(),
-                "message": "Aucun match ATP simple exploitable trouvé via ATP daily-schedule.",
+                "message": "Aucun payload exploitable. Si des matchs sont listés dans dailySchedulePairs, ils sont bloqués car points ATP introuvables ou données insuffisantes.",
                 "dailySchedulePairs": len(day_matches),
                 "payloadItems": 0,
             },
         }
         base.write_json(result_json_path, result_empty)
-        base.write_text(result_txt_path, "Aucun match ATP simple exploitable trouvé via ATP daily-schedule.")
-        base.write_text(base.RESULT_LATEST_PATH, "Aucun match ATP simple exploitable trouvé via ATP daily-schedule.")
+        base.write_text(result_txt_path, "Aucun payload exploitable : matchs absents ou bloqués par points ATP introuvables/données insuffisantes.")
+        base.write_text(base.RESULT_LATEST_PATH, "Aucun payload exploitable : matchs absents ou bloqués par points ATP introuvables/données insuffisantes.")
 
         print(f"UNITY_INPUT : {base.UNITY_OUT_PATH}")
         print(f"LINES       : {lines_path}")
@@ -2146,7 +2172,7 @@ def main() -> int:
         print(f"AUDIT_LATEST: {base.AUDIT_LATEST_PATH}")
         print(f"RESULT_LATEST: {base.RESULT_LATEST_PATH}")
         print("COUNT       : 0")
-        print("Aucun match ATP simple exploitable trouvé via ATP daily-schedule.")
+        print("Aucun payload exploitable : matchs absents ou bloqués par points ATP introuvables/données insuffisantes.")
         return 0
 
     if backend_send_is_disabled(args.backend_url, args.no_send_backend):
