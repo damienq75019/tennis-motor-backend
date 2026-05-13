@@ -57,7 +57,7 @@ import requests
 from bs4 import BeautifulSoup
 
 
-MODE = "V6_11E_FINAL_CLEAN_POINTS_STRICT_FIRST_TOTAL"
+MODE = "V6_11F_FINAL_CLEAN_B_TOURNAMENT_WINS"
 OUT_DIR = Path("output")
 
 ATP_BASE = "https://www.atptour.com"
@@ -1115,10 +1115,284 @@ def points_for(name: str, points_map: Dict[str, int]) -> int:
     return 1
 
 
-def build_payload(rows: List[Dict[str, str]], points_map: Dict[str, int], audit: List[str]) -> List[PayloadItem]:
+def tournament_key_from_text(txt: str) -> str:
+    """
+    Clef courte et stable du tournoi.
+    Exemples :
+      "Rome (Italie), terre battue ATP - SINGLES: Tableau" -> "rome"
+      "ATP - SIMPLE: Rome (Italie), terre battue" -> "rome"
+    """
+    s = normalize_space(txt)
+    if not s:
+        return ""
+
+    s_low = strip_accents_light(s).lower()
+
+    # Format "ATP - SIMPLE: Rome ..."
+    if ":" in s_low and ("atp" in s_low.split(":", 1)[0]):
+        right = s_low.split(":", 1)[1].strip()
+        right = re.sub(r"\b(tableau|draw|qualification|qualifications)\b", " ", right)
+        right = normalize_space(right)
+        if right:
+            s_low = right
+
+    # Format Flashscore FR : "Rome (Italie), terre battue ATP - SINGLES: Tableau"
+    s_low = re.sub(r"\batp\s*-\s*(simple|simples|singles|doubles)\b.*$", " ", s_low)
+    s_low = re.sub(r"\bwta\s*-\s*(simple|simples|singles|doubles)\b.*$", " ", s_low)
+    s_low = re.sub(r"\b(challenger|itf)\b.*$", " ", s_low)
+    s_low = re.sub(r"\([^)]*\)", " ", s_low)
+    s_low = s_low.split(",", 1)[0]
+    s_low = normalize_space(s_low)
+
+    # Garde seulement les mots utiles du nom du tournoi.
+    parts = [p for p in s_low.split() if len(p) >= 2]
+    return canonical_name(" ".join(parts[:3]))
+
+
+def fetch_flashscore_prior_wins(
+    target_day: date,
+    rows: List[Dict[str, str]],
+    points_map: Dict[str, int],
+    audit: List[str],
+    days_back: int = 10,
+) -> Dict[Tuple[str, str], int]:
+    """
+    Compte les victoires déjà obtenues dans le tournoi avant le jour demandé.
+
+    Important :
+    - ne change pas la liste des matchs ;
+    - ne change pas les points ATP ;
+    - ne touche pas aux cotes ;
+    - sert seulement à remplir player_b_tournament_wins.
+
+    Méthode :
+    - ouvre Flashscore tennis ;
+    - se place sur le jour demandé ;
+    - remonte les jours précédents ;
+    - garde seulement les matchs terminés avec vrai header ATP SIMPLE/SINGLES ;
+    - compte les gagnants par tournoi.
+    """
+    out: Dict[Tuple[str, str], int] = {}
+
+    tournament_keys_needed = {
+        tournament_key_from_text(r.get("tournament", ""))
+        for r in rows
+        if tournament_key_from_text(r.get("tournament", ""))
+    }
+
+    if not tournament_keys_needed:
+        audit.append("prior_wins_status=skipped_no_tournament_key")
+        return out
+
+    try:
+        from playwright.sync_api import sync_playwright
+    except Exception as exc:
+        audit.append(f"prior_wins_status=playwright_missing | {type(exc).__name__}: {exc}")
+        return out
+
+    aliases = build_alias_map(points_map)
+
+    js = r"""
+() => {
+  const clean = (s) => (s || '').replace(/\s+/g, ' ').trim();
+
+  function getHeaderForMatch(match) {
+    let node = match;
+    for (let depth = 0; depth < 6 && node; depth++, node = node.parentElement) {
+      let p = node.previousElementSibling;
+      while (p) {
+        const txt = clean(p.innerText || p.textContent || '');
+        const cls = p.className ? String(p.className) : '';
+        if (cls.includes('event__header') || txt.includes('ATP -') || txt.includes('WTA -')) return txt;
+        p = p.previousElementSibling;
+      }
+    }
+
+    const all = Array.from(document.querySelectorAll('.event__header, [class*="event__header"], .event__match, [id^="g_2_"], [id^="g_1_"]'));
+    let lastHeader = '';
+    for (const el of all) {
+      if (el === match) return lastHeader;
+      const cls = el.className ? String(el.className) : '';
+      const txt = clean(el.innerText || el.textContent || '');
+      if (cls.includes('event__header') || txt.includes('ATP -') || txt.includes('WTA -')) lastHeader = txt;
+    }
+    return '';
+  }
+
+  const out = [];
+  const matches = Array.from(document.querySelectorAll('.event__match, [id^="g_2_"], [id^="g_1_"]'));
+
+  for (const node of matches) {
+    const cls = node.className ? String(node.className) : '';
+    const id = node.id || '';
+    const isMatch = cls.includes('event__match') || id.startsWith('g_2_') || id.startsWith('g_1_');
+    if (!isMatch) continue;
+
+    const homeEl = node.querySelector('[class*="event__participant--home"]');
+    const awayEl = node.querySelector('[class*="event__participant--away"]');
+    const home = clean(homeEl ? homeEl.textContent : '');
+    const away = clean(awayEl ? awayEl.textContent : '');
+    if (!home || !away) continue;
+
+    const homeCls = homeEl && homeEl.className ? String(homeEl.className) : '';
+    const awayCls = awayEl && awayEl.className ? String(awayEl.className) : '';
+
+    const homeWinner = homeCls.includes('winner');
+    const awayWinner = awayCls.includes('winner');
+
+    // Match terminé : Flashscore marque le gagnant avec participant--winner.
+    if (!homeWinner && !awayWinner) continue;
+
+    const competition = getHeaderForMatch(node);
+    const raw = clean(node.innerText || node.textContent || '');
+    const winner = homeWinner ? home : away;
+
+    out.push({competition, playerA: home, playerB: away, winner, raw});
+  }
+
+  return out;
+}
+"""
+
+    raw_total = 0
+    kept_total = 0
+
+    try:
+        with sync_playwright() as p:
+            browser = p.chromium.launch(
+                headless=True,
+                args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-blink-features=AutomationControlled"],
+            )
+            ctx = browser.new_context(
+                locale="fr-FR",
+                timezone_id="Europe/Paris",
+                viewport={"width": 1365, "height": 2600},
+                user_agent=(
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+                ),
+                extra_http_headers={"Accept-Language": "fr-FR,fr;q=0.9,en;q=0.8"},
+            )
+            page = ctx.new_page()
+            page.goto(FLASHSCORE_URL_FR, wait_until="domcontentloaded", timeout=50000)
+
+            for label in ["J'accepte", "Tout refuser", "Accepter", "OK", "I accept"]:
+                try:
+                    page.get_by_text(label, exact=False).first.click(timeout=1500)
+                    break
+                except Exception:
+                    pass
+
+            try:
+                page.wait_for_load_state("networkidle", timeout=12000)
+            except Exception:
+                pass
+
+            today = now_paris_date()
+            delta = (target_day - today).days
+
+            # Se placer sur target_day si today/tomorrow/past proche.
+            if delta > 0:
+                for _ in range(min(delta, 7)):
+                    clicked = False
+                    for label in ["Jour suivant", "Demain", "Next day", "Tomorrow"]:
+                        try:
+                            page.get_by_title(label, exact=False).first.click(timeout=1500)
+                            page.wait_for_timeout(900)
+                            clicked = True
+                            break
+                        except Exception:
+                            pass
+                    if not clicked:
+                        break
+            elif delta < 0:
+                for _ in range(min(abs(delta), 14)):
+                    clicked = False
+                    for label in ["Jour précédent", "Hier", "Previous day", "Yesterday"]:
+                        try:
+                            page.get_by_title(label, exact=False).first.click(timeout=1500)
+                            page.wait_for_timeout(900)
+                            clicked = True
+                            break
+                        except Exception:
+                            pass
+                    if not clicked:
+                        break
+
+            # Maintenant on remonte les jours AVANT target_day.
+            for day_offset in range(1, days_back + 1):
+                clicked_prev = False
+                for label in ["Jour précédent", "Hier", "Previous day", "Yesterday"]:
+                    try:
+                        page.get_by_title(label, exact=False).first.click(timeout=1500)
+                        page.wait_for_timeout(1200)
+                        clicked_prev = True
+                        break
+                    except Exception:
+                        pass
+
+                if not clicked_prev:
+                    audit.append(f"prior_wins_prev_click_failed_at_offset={day_offset}")
+                    break
+
+                for _ in range(7):
+                    try:
+                        page.mouse.wheel(0, 1600)
+                        page.wait_for_timeout(350)
+                    except Exception:
+                        pass
+
+                raw_rows = page.evaluate(js) or []
+                raw_total += len(raw_rows)
+
+                for item in raw_rows:
+                    comp = normalize_space(str(item.get("competition", "")))
+                    raw_a = normalize_space(str(item.get("playerA", "")))
+                    raw_b = normalize_space(str(item.get("playerB", "")))
+                    winner_raw = normalize_space(str(item.get("winner", "")))
+                    raw = normalize_space(str(item.get("raw", "")))
+
+                    joined = normalize_space(f"{comp} {raw_a} {raw_b} {winner_raw} {raw}")
+
+                    if not flash_header_is_atp_singles(comp):
+                        continue
+                    if is_wta_marker(joined) or is_doubles_marker(joined):
+                        continue
+
+                    tkey = tournament_key_from_text(comp)
+                    if tkey not in tournament_keys_needed:
+                        continue
+
+                    winner = resolve_flash_name(winner_raw, aliases)
+                    if not is_name_like(winner):
+                        continue
+
+                    out[(tkey, canonical_name(winner))] = out.get((tkey, canonical_name(winner)), 0) + 1
+                    kept_total += 1
+
+            browser.close()
+
+    except Exception as exc:
+        audit.append(f"prior_wins_status=failed | {type(exc).__name__}: {exc}")
+        return out
+
+    audit.append("prior_wins_status=ok")
+    audit.append(f"prior_wins_days_back={days_back}")
+    audit.append(f"prior_wins_raw_completed_rows={raw_total}")
+    audit.append(f"prior_wins_kept_completed_atp_rows={kept_total}")
+
+    for (tkey, player), wins in sorted(out.items())[:80]:
+        audit.append(f"[PRIOR WIN] tournament={tkey} player={player} wins={wins}")
+
+    return out
+
+
+
+def build_payload(rows: List[Dict[str, str]], points_map: Dict[str, int], audit: List[str], prior_wins: Optional[Dict[Tuple[str, str], int]] = None) -> List[PayloadItem]:
     payload: List[PayloadItem] = []
     seen: Set[Tuple[str, str, str]] = set()
     missing = 0
+    prior_wins = prior_wins or {}
 
     for row in rows:
         a = clean_name(row.get("playerA", ""))
@@ -1146,6 +1420,10 @@ def build_payload(rows: List[Dict[str, str]], points_map: Dict[str, int], audit:
         evidence = row.get("evidence", "")
         bq = bool(re.search(rf"\(Q\).{{0,80}}{re.escape(b)}|{re.escape(b)}.{{0,80}}\(Q\)", evidence, flags=re.I))
 
+        tkey = tournament_key_from_text(tournament)
+        b_wins = int(prior_wins.get((tkey, canonical_name(b)), 0))
+        audit.append(f"[B CONTEXT] {b} | tournament={tkey} | prior_wins={b_wins} | qualifier={bq}")
+
         payload.append(PayloadItem(
             playerA=a,
             playerB=b,
@@ -1153,7 +1431,7 @@ def build_payload(rows: List[Dict[str, str]], points_map: Dict[str, int], audit:
             playerAPoints=int(pa),
             playerBPoints=int(pb),
             player_b_is_qualifier=bq,
-            player_b_tournament_wins=0,
+            player_b_tournament_wins=b_wins,
             tournament=tournament,
             source=row.get("source", "ATP Singles Daily"),
         ))
@@ -1212,7 +1490,8 @@ def main() -> int:
     audit.append(f"source_final={source_final}")
     audit.append(f"source_final_rows={len(rows)}")
 
-    payload_items = build_payload(rows, points_map, audit)
+    prior_wins = fetch_flashscore_prior_wins(target_day, rows, points_map, audit) if rows else {}
+    payload_items = build_payload(rows, points_map, audit, prior_wins=prior_wins)
 
     stamp = target_day.isoformat()
     lines_path = OUT_DIR / f"lines_{stamp}.txt"
