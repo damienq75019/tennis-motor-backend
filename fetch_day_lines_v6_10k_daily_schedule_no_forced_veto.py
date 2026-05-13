@@ -57,7 +57,7 @@ import requests
 from bs4 import BeautifulSoup
 
 
-MODE = "V6_11G_FINAL_CLEAN_B_WINS_AND_ORIENTATION_CONTEXT"
+MODE = "V6_11H_FINAL_CLEAN_PRIOR_WINS_SCORE_PARSE"
 OUT_DIR = Path("output")
 
 ATP_BASE = "https://www.atptour.com"
@@ -1163,18 +1163,11 @@ def fetch_flashscore_prior_wins(
     """
     Compte les victoires déjà obtenues dans le tournoi avant le jour demandé.
 
-    Important :
-    - ne change pas la liste des matchs ;
-    - ne change pas les points ATP ;
-    - ne touche pas aux cotes ;
-    - sert seulement à remplir player_b_tournament_wins.
-
-    Méthode :
-    - ouvre Flashscore tennis ;
-    - se place sur le jour demandé ;
-    - remonte les jours précédents ;
-    - garde seulement les matchs terminés avec vrai header ATP SIMPLE/SINGLES ;
-    - compte les gagnants par tournoi.
+    V6.11H corrige la V6.11G :
+    - ne dépend plus seulement de la classe CSS "winner" ;
+    - lit aussi les scores Flashscore ;
+    - force le retour sur l'onglet TOUS après chaque changement de jour ;
+    - compte les gagnants ATP simples des jours précédents.
     """
     out: Dict[Tuple[str, str], int] = {}
 
@@ -1223,6 +1216,47 @@ def fetch_flashscore_prior_wins(
     return '';
   }
 
+  function numsFromNodes(nodes) {
+    const arr = [];
+    for (const el of nodes) {
+      const t = clean(el.textContent || '');
+      if (/^\d+$/.test(t)) arr.push(parseInt(t, 10));
+    }
+    return arr;
+  }
+
+  function guessWinner(home, away, homeScores, awayScores, homeCls, awayCls, raw) {
+    const hc = (homeCls || '').toLowerCase();
+    const ac = (awayCls || '').toLowerCase();
+
+    if (hc.includes('winner')) return home;
+    if (ac.includes('winner')) return away;
+
+    // Flashscore tennis terminé contient souvent set-count en première colonne :
+    // homeScores=[2,6,6], awayScores=[0,4,4]
+    if (homeScores.length > 0 && awayScores.length > 0) {
+      const hs0 = homeScores[0];
+      const as0 = awayScores[0];
+
+      // Si la première colonne ressemble à un score de sets.
+      if (hs0 >= 0 && hs0 <= 3 && as0 >= 0 && as0 <= 3 && hs0 !== as0) {
+        return hs0 > as0 ? home : away;
+      }
+
+      // Fallback : compter les sets gagnés par colonne.
+      let hSets = 0;
+      let aSets = 0;
+      const n = Math.min(homeScores.length, awayScores.length);
+      for (let i = 0; i < n; i++) {
+        if (homeScores[i] > awayScores[i]) hSets++;
+        else if (awayScores[i] > homeScores[i]) aSets++;
+      }
+      if (hSets !== aSets) return hSets > aSets ? home : away;
+    }
+
+    return '';
+  }
+
   const out = [];
   const matches = Array.from(document.querySelectorAll('.event__match, [id^="g_2_"], [id^="g_1_"]'));
 
@@ -1238,20 +1272,20 @@ def fetch_flashscore_prior_wins(
     const away = clean(awayEl ? awayEl.textContent : '');
     if (!home || !away) continue;
 
+    const raw = clean(node.innerText || node.textContent || '');
+    const competition = getHeaderForMatch(node);
+
+    const homeScores = numsFromNodes(node.querySelectorAll('[class*="event__score--home"], [class*="event__part--home"]'));
+    const awayScores = numsFromNodes(node.querySelectorAll('[class*="event__score--away"], [class*="event__part--away"]'));
+
     const homeCls = homeEl && homeEl.className ? String(homeEl.className) : '';
     const awayCls = awayEl && awayEl.className ? String(awayEl.className) : '';
 
-    const homeWinner = homeCls.includes('winner');
-    const awayWinner = awayCls.includes('winner');
+    const winner = guessWinner(home, away, homeScores, awayScores, homeCls, awayCls, raw);
 
-    // Match terminé : Flashscore marque le gagnant avec participant--winner.
-    if (!homeWinner && !awayWinner) continue;
+    if (!winner) continue;
 
-    const competition = getHeaderForMatch(node);
-    const raw = clean(node.innerText || node.textContent || '');
-    const winner = homeWinner ? home : away;
-
-    out.push({competition, playerA: home, playerB: away, winner, raw});
+    out.push({competition, playerA: home, playerB: away, winner, raw, homeScores, awayScores});
   }
 
   return out;
@@ -1260,6 +1294,7 @@ def fetch_flashscore_prior_wins(
 
     raw_total = 0
     kept_total = 0
+    sample_rows: List[str] = []
 
     try:
         with sync_playwright() as p:
@@ -1292,43 +1327,16 @@ def fetch_flashscore_prior_wins(
             except Exception:
                 pass
 
-            today = now_paris_date()
-            delta = (target_day - today).days
-
-            # Se placer sur target_day si today/tomorrow/past proche.
-            if delta > 0:
-                for _ in range(min(delta, 7)):
-                    clicked = False
-                    for label in ["Jour suivant", "Demain", "Next day", "Tomorrow"]:
-                        try:
-                            page.get_by_title(label, exact=False).first.click(timeout=1500)
-                            page.wait_for_timeout(900)
-                            clicked = True
-                            break
-                        except Exception:
-                            pass
-                    if not clicked:
-                        break
-            elif delta < 0:
-                for _ in range(min(abs(delta), 14)):
-                    clicked = False
-                    for label in ["Jour précédent", "Hier", "Previous day", "Yesterday"]:
-                        try:
-                            page.get_by_title(label, exact=False).first.click(timeout=1500)
-                            page.wait_for_timeout(900)
-                            clicked = True
-                            break
-                        except Exception:
-                            pass
-                    if not clicked:
-                        break
+            def click_tab_all() -> None:
+                for label in ["TOUS", "Tous", "ALL", "All"]:
+                    try:
+                        page.get_by_text(label, exact=True).first.click(timeout=1200)
+                        page.wait_for_timeout(700)
+                        return
+                    except Exception:
+                        pass
 
             def click_previous_day() -> bool:
-                """
-                Flashscore change souvent l'attribut title.
-                V6.11G utilise plusieurs sélecteurs CSS + JS au lieu de dépendre
-                uniquement de get_by_title().
-                """
                 selectors = [
                     ".calendar__navigation--yesterday",
                     "button.calendar__navigation--yesterday",
@@ -1354,7 +1362,6 @@ def fetch_flashscore_prior_wins(
                     except Exception:
                         pass
 
-                # Fallback JS : cherche un élément cliquable dont class/title/aria évoque hier/précédent.
                 try:
                     ok = page.evaluate("""
 () => {
@@ -1386,26 +1393,40 @@ def fetch_flashscore_prior_wins(
                 except Exception:
                     pass
 
-                # Dernier fallback : touche flèche gauche, parfois acceptée par le calendrier.
-                try:
-                    page.keyboard.press("ArrowLeft")
-                    page.wait_for_timeout(1500)
-                    return True
-                except Exception:
-                    return False
+                return False
+
+            today = now_paris_date()
+            delta = (target_day - today).days
+
+            if delta > 0:
+                for _ in range(min(delta, 7)):
+                    for label in ["Jour suivant", "Demain", "Next day", "Tomorrow"]:
+                        try:
+                            page.get_by_title(label, exact=False).first.click(timeout=1500)
+                            page.wait_for_timeout(900)
+                            break
+                        except Exception:
+                            pass
+            elif delta < 0:
+                for _ in range(min(abs(delta), 14)):
+                    if not click_previous_day():
+                        break
+
+            click_tab_all()
 
             # Maintenant on remonte les jours AVANT target_day.
             for day_offset in range(1, days_back + 1):
                 clicked_prev = click_previous_day()
-
                 if not clicked_prev:
                     audit.append(f"prior_wins_prev_click_failed_at_offset={day_offset}")
                     break
 
-                for _ in range(7):
+                click_tab_all()
+
+                for _ in range(8):
                     try:
-                        page.mouse.wheel(0, 1600)
-                        page.wait_for_timeout(350)
+                        page.mouse.wheel(0, 1700)
+                        page.wait_for_timeout(400)
                     except Exception:
                         pass
 
@@ -1418,6 +1439,9 @@ def fetch_flashscore_prior_wins(
                     raw_b = normalize_space(str(item.get("playerB", "")))
                     winner_raw = normalize_space(str(item.get("winner", "")))
                     raw = normalize_space(str(item.get("raw", "")))
+
+                    if len(sample_rows) < 20:
+                        sample_rows.append(f"offset={day_offset} | {comp} | {raw_a} vs {raw_b} | winner={winner_raw} | raw={raw[:120]}")
 
                     joined = normalize_space(f"{comp} {raw_a} {raw_b} {winner_raw} {raw}")
 
@@ -1448,10 +1472,14 @@ def fetch_flashscore_prior_wins(
     audit.append(f"prior_wins_raw_completed_rows={raw_total}")
     audit.append(f"prior_wins_kept_completed_atp_rows={kept_total}")
 
-    for (tkey, player), wins in sorted(out.items())[:80]:
+    for s in sample_rows:
+        audit.append(f"[PRIOR SAMPLE] {s}")
+
+    for (tkey, player), wins in sorted(out.items())[:120]:
         audit.append(f"[PRIOR WIN] tournament={tkey} player={player} wins={wins}")
 
     return out
+
 
 
 
