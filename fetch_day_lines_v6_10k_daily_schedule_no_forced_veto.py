@@ -57,7 +57,7 @@ import requests
 from bs4 import BeautifulSoup
 
 
-MODE = "V6_11F_FINAL_CLEAN_B_TOURNAMENT_WINS"
+MODE = "V6_11G_FINAL_CLEAN_B_WINS_AND_ORIENTATION_CONTEXT"
 OUT_DIR = Path("output")
 
 ATP_BASE = "https://www.atptour.com"
@@ -87,7 +87,11 @@ class PayloadItem:
     surface: str
     playerAPoints: int
     playerBPoints: int
+    # Champs historiques / veto pour le joueur A et B.
+    # app.py utilise player_a_tournament_wins si le moteur inverse le match.
+    player_a_is_qualifier: bool
     player_b_is_qualifier: bool
+    player_a_tournament_wins: int
     player_b_tournament_wins: int
     tournament: str
     source: str
@@ -1319,17 +1323,80 @@ def fetch_flashscore_prior_wins(
                     if not clicked:
                         break
 
-            # Maintenant on remonte les jours AVANT target_day.
-            for day_offset in range(1, days_back + 1):
-                clicked_prev = False
-                for label in ["Jour précédent", "Hier", "Previous day", "Yesterday"]:
+            def click_previous_day() -> bool:
+                """
+                Flashscore change souvent l'attribut title.
+                V6.11G utilise plusieurs sélecteurs CSS + JS au lieu de dépendre
+                uniquement de get_by_title().
+                """
+                selectors = [
+                    ".calendar__navigation--yesterday",
+                    "button.calendar__navigation--yesterday",
+                    "[class*='calendar__navigation--yesterday']",
+                    "[class*='calendar'][class*='yesterday']",
+                    "[title*='Jour précédent']",
+                    "[aria-label*='Jour précédent']",
+                    "[title*='Yesterday']",
+                    "[aria-label*='Yesterday']",
+                    "[title*='Previous']",
+                    "[aria-label*='Previous']",
+                    "[data-testid*='calendar'][data-testid*='previous']",
+                    "[data-testid*='previous']",
+                ]
+
+                for sel in selectors:
                     try:
-                        page.get_by_title(label, exact=False).first.click(timeout=1500)
-                        page.wait_for_timeout(1200)
-                        clicked_prev = True
-                        break
+                        loc = page.locator(sel).first
+                        if loc.count() > 0:
+                            loc.click(timeout=1500)
+                            page.wait_for_timeout(1500)
+                            return True
                     except Exception:
                         pass
+
+                # Fallback JS : cherche un élément cliquable dont class/title/aria évoque hier/précédent.
+                try:
+                    ok = page.evaluate("""
+() => {
+  const needles = ['yesterday', 'previous', 'prev', 'precedent', 'précédent', 'hier'];
+  const els = Array.from(document.querySelectorAll('button, a, div, span'));
+  for (const el of els) {
+    const blob = [
+      el.className ? String(el.className) : '',
+      el.getAttribute('title') || '',
+      el.getAttribute('aria-label') || '',
+      el.getAttribute('data-testid') || '',
+      el.textContent || ''
+    ].join(' ').toLowerCase();
+
+    if (needles.some(n => blob.includes(n))) {
+      const rect = el.getBoundingClientRect();
+      if (rect.width > 0 && rect.height > 0) {
+        el.click();
+        return true;
+      }
+    }
+  }
+  return false;
+}
+""")
+                    if ok:
+                        page.wait_for_timeout(1500)
+                        return True
+                except Exception:
+                    pass
+
+                # Dernier fallback : touche flèche gauche, parfois acceptée par le calendrier.
+                try:
+                    page.keyboard.press("ArrowLeft")
+                    page.wait_for_timeout(1500)
+                    return True
+                except Exception:
+                    return False
+
+            # Maintenant on remonte les jours AVANT target_day.
+            for day_offset in range(1, days_back + 1):
+                clicked_prev = click_previous_day()
 
                 if not clicked_prev:
                     audit.append(f"prior_wins_prev_click_failed_at_offset={day_offset}")
@@ -1420,8 +1487,12 @@ def build_payload(rows: List[Dict[str, str]], points_map: Dict[str, int], audit:
         evidence = row.get("evidence", "")
         bq = bool(re.search(rf"\(Q\).{{0,80}}{re.escape(b)}|{re.escape(b)}.{{0,80}}\(Q\)", evidence, flags=re.I))
 
+        aq = bool(re.search(rf"\(Q\).{{0,80}}{re.escape(a)}|{re.escape(a)}.{{0,80}}\(Q\)", evidence, flags=re.I))
+
         tkey = tournament_key_from_text(tournament)
+        a_wins = int(prior_wins.get((tkey, canonical_name(a)), 0))
         b_wins = int(prior_wins.get((tkey, canonical_name(b)), 0))
+        audit.append(f"[A CONTEXT] {a} | tournament={tkey} | prior_wins={a_wins} | qualifier={aq}")
         audit.append(f"[B CONTEXT] {b} | tournament={tkey} | prior_wins={b_wins} | qualifier={bq}")
 
         payload.append(PayloadItem(
@@ -1430,7 +1501,9 @@ def build_payload(rows: List[Dict[str, str]], points_map: Dict[str, int], audit:
             surface=row.get("surface") or surface_from_text(row.get("evidence", ""), tournament),
             playerAPoints=int(pa),
             playerBPoints=int(pb),
+            player_a_is_qualifier=aq,
             player_b_is_qualifier=bq,
+            player_a_tournament_wins=a_wins,
             player_b_tournament_wins=b_wins,
             tournament=tournament,
             source=row.get("source", "ATP Singles Daily"),
