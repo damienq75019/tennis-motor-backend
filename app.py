@@ -1623,6 +1623,25 @@ def _reverse_match_for_engine(match: Dict[str, Any]) -> Dict[str, Any]:
         0,
     )
 
+    old_b_is_qualifier = _get_first_existing(
+        match,
+        ["player_b_is_qualifier", "playerBIsQualifier", "player_b_qualifier", "playerBQualifier"],
+        False,
+    )
+    old_b_tournament_wins = _get_first_existing(
+        match,
+        ["player_b_tournament_wins", "playerBTournamentWins", "player_b_wins", "playerBWins"],
+        0,
+    )
+
+    # Après inversion :
+    # - nouveau joueur A = ancien joueur B ;
+    # - nouveau joueur B = ancien joueur A.
+    rev["player_a_is_qualifier"] = old_b_is_qualifier
+    rev["playerAIsQualifier"] = old_b_is_qualifier
+    rev["player_a_tournament_wins"] = old_b_tournament_wins
+    rev["playerATournamentWins"] = old_b_tournament_wins
+
     rev["player_b_is_qualifier"] = old_a_is_qualifier
     rev["playerBIsQualifier"] = old_a_is_qualifier
     rev["player_b_tournament_wins"] = old_a_tournament_wins
@@ -1688,6 +1707,105 @@ def _rebuild_summary_from_matches(matches: List[Dict[str, Any]]) -> Dict[str, An
     }
 
 
+def _to_bool_value(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    s = str(value or "").strip().lower()
+    return s in {"1", "true", "yes", "oui", "y", "o"}
+
+
+def _to_int_value(value: Any, default: int = 0) -> int:
+    try:
+        if value is None:
+            return default
+        if isinstance(value, bool):
+            return int(value)
+        return int(float(str(value).replace(",", ".").strip()))
+    except Exception:
+        return default
+
+
+def _copy_daily_context_to_prediction(
+    source_match: Dict[str, Any],
+    prediction: Dict[str, Any],
+    orientation: str,
+) -> Dict[str, Any]:
+    """
+    Garde les champs récupérés par le script daily V6.11H jusque dans la réponse Unity.
+
+    Problème corrigé :
+    - fetch_day_lines récupère bien player_b_tournament_wins=3 ;
+    - calculate_match_prediction peut ne pas recopier ce champ dans son résultat ;
+    - Unity voyait donc encore 0.
+
+    Règle :
+    - orientation original : A/B restent les mêmes que dans le payload ;
+    - orientation reversed : A/B sont inversés, donc les contextes A/B doivent aussi être inversés.
+    """
+    if not isinstance(source_match, dict) or not isinstance(prediction, dict):
+        return prediction
+
+    source_a_qualifier = _to_bool_value(_get_first_existing(
+        source_match,
+        ["player_a_is_qualifier", "playerAIsQualifier", "player_a_qualifier", "playerAQualifier"],
+        False,
+    ))
+    source_b_qualifier = _to_bool_value(_get_first_existing(
+        source_match,
+        ["player_b_is_qualifier", "playerBIsQualifier", "player_b_qualifier", "playerBQualifier"],
+        False,
+    ))
+
+    source_a_wins = _to_int_value(_get_first_existing(
+        source_match,
+        ["player_a_tournament_wins", "playerATournamentWins", "player_a_wins", "playerAWins"],
+        0,
+    ))
+    source_b_wins = _to_int_value(_get_first_existing(
+        source_match,
+        ["player_b_tournament_wins", "playerBTournamentWins", "player_b_wins", "playerBWins"],
+        0,
+    ))
+
+    if orientation == "reversed":
+        display_a_qualifier = source_b_qualifier
+        display_b_qualifier = source_a_qualifier
+        display_a_wins = source_b_wins
+        display_b_wins = source_a_wins
+    else:
+        display_a_qualifier = source_a_qualifier
+        display_b_qualifier = source_b_qualifier
+        display_a_wins = source_a_wins
+        display_b_wins = source_b_wins
+
+    # Champs snake_case.
+    prediction["player_a_is_qualifier"] = display_a_qualifier
+    prediction["player_b_is_qualifier"] = display_b_qualifier
+    prediction["player_a_tournament_wins"] = display_a_wins
+    prediction["player_b_tournament_wins"] = display_b_wins
+
+    # Champs camelCase attendus par certaines versions Unity.
+    prediction["playerAIsQualifier"] = display_a_qualifier
+    prediction["playerBIsQualifier"] = display_b_qualifier
+    prediction["playerATournamentWins"] = display_a_wins
+    prediction["playerBTournamentWins"] = display_b_wins
+
+    # Alias courts déjà utilisés dans d'anciennes versions.
+    prediction["playerAWins"] = display_a_wins
+    prediction["playerBWins"] = display_b_wins
+
+    # Debug lisible dans /daily si besoin.
+    prediction["contextSource"] = "daily_payload_v6_11h"
+    prediction["contextOrientation"] = orientation
+    prediction["contextPlayerATournamentWins"] = display_a_wins
+    prediction["contextPlayerBTournamentWins"] = display_b_wins
+
+    return prediction
+
+
+
 def calculate_from_matches(matches: List[Dict[str, Any]]) -> Dict[str, Any]:
     if not matches:
         return _empty_response(
@@ -1718,6 +1836,11 @@ def calculate_from_matches(matches: List[Dict[str, Any]]) -> Dict[str, Any]:
         else:
             chosen = dict(original_prediction)
             orientation = "original"
+
+        # Correction V6.11H app.py :
+        # calculate_match_prediction peut ne pas recopier les champs de contexte daily.
+        # On les réinjecte explicitement pour que Unity affiche les vraies victoires tournoi.
+        chosen = _copy_daily_context_to_prediction(match, chosen, orientation)
 
         # Garder la paire ATP d'origine pour rattacher les cotes après réorientation.
         # Flashscore peut afficher le match dans l'ordre ATP original alors que le moteur
@@ -1752,6 +1875,7 @@ def calculate_from_matches(matches: List[Dict[str, Any]]) -> Dict[str, Any]:
             "doubleSideMode": "pairwise_best_premium_no_zip_after_sort",
             "doubleSideMatches": len(final_matches),
             "doubleSideReversedChosen": reversed_chosen,
+            "contextPropagation": "daily_payload_v6_11h_preserved",
         },
     }
 
