@@ -2015,6 +2015,28 @@ def run_daily_fetch_sync(target_day: str) -> Dict[str, Any]:
         }
     )
 
+    # HISTORIQUE PREMIUM — correction V6.11J.
+    # Problème corrigé :
+    # - /daily trouvait bien les Premium ;
+    # - /history ne les voyait pas parce que l'analyse du jour n'était pas enregistrée
+    #   dans premium_history.json après le calcul.
+    #
+    # Sécurité :
+    # - premium_history.record_result_json ignore automatiquement les jours futurs ;
+    # - il dédoublonne les matchs déjà présents ;
+    # - il conserve les résultats déjà réglés win/loss ;
+    # - en cas d'erreur historique, /daily reste utilisable.
+    try:
+        import premium_history
+        history_record = premium_history.record_result_json(result, target_day=target_day)
+        result["daily"]["historyRecord"] = history_record
+    except Exception as exc:
+        result["daily"]["historyRecord"] = {
+            "status": "error",
+            "message": f"{type(exc).__name__}: {exc}",
+            "traceback": traceback.format_exc()[-2000:],
+        }
+
     return result
 
 
