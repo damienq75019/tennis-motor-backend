@@ -57,7 +57,7 @@ import requests
 from bs4 import BeautifulSoup
 
 
-MODE = "V6_11H_FINAL_CLEAN_PRIOR_WINS_SCORE_PARSE"
+MODE = "V6_11I_FINAL_CLEAN_POINTS_ROW_BASED_TENNISTEMPLE"
 OUT_DIR = Path("output")
 
 ATP_BASE = "https://www.atptour.com"
@@ -828,91 +828,133 @@ def _looks_like_country_code(line: str) -> bool:
     return bool(re.fullmatch(r"[A-Z]{3}", s))
 
 
-def _looks_like_ranking_status_line(line: str) -> bool:
+def _is_rank_token(line: str) -> bool:
+    s = normalize_space(line)
+    return bool(re.fullmatch(r"[+-]?\d{1,4}\.?", s))
+
+
+def _is_age_token(line: str) -> bool:
+    s = normalize_space(line)
+    return bool(re.fullmatch(r"\d{1,2}", s)) and 14 <= int(s) <= 45
+
+
+def _first_total_points_from_cells(cells: List[str], name_index: int) -> int:
     """
-    Refuse les lignes de statut tournoi/ranking qui peuvent ressembler à du texte de nom.
-    Exemple : "Défaite Rome QF", "Rome QF", "Rome DF".
+    Format vérifié TennisTemple :
+      Nom, Prénom
+      Age
+      Points Variation
+
+    On ne prend jamais âge, rang, variation isolée, ni petits nombres 150/170/188.
+    On prend la première valeur >= 300 après le nom.
     """
-    ck = canonical_name(line)
-    if not ck:
-        return True
-
-    status_words = {
-        "defaite", "loss", "lost", "win", "wins", "won",
-        "rome", "geneva", "hamburg", "roland", "garros", "stuttgart",
-        "halle", "london", "wimbledon", "qf", "sf", "df", "final",
-        "finale", "semifinal", "quarterfinal", "round", "r16", "r32", "r64",
-        "bye", "live", "official", "ranking", "race", "draw", "draws",
-    }
-
-    parts = set(ck.split())
-    if parts & status_words:
-        return True
-
-    if re.search(r"\b(?:qf|sf|df|r16|r32|r64)\b", ck):
-        return True
-
-    return False
-
-
-def _strict_total_points_after_name(lines: List[str], start_index: int, window: int = 14) -> int:
-    """
-    Cherche le VRAI total de points après un nom de joueur.
-
-    Correction V6.11E :
-    - ne prend plus le plus grand nombre au hasard ;
-    - ignore âge/rang/petites variations ;
-    - prend le premier nombre >= 300 après le nom, car les lignes comme 150/170/188
-      sont souvent des variations, classements ou points gagnés, pas le total ATP.
-    """
-    small_candidates: List[int] = []
-
-    for j in range(start_index + 1, min(len(lines), start_index + window)):
-        line = normalize_space(lines[j])
-        if not line:
+    for j in range(name_index + 1, min(len(cells), name_index + 8)):
+        cell = normalize_space(cells[j])
+        if not cell:
             continue
 
-        # Nouveau nom rencontré => stop.
-        if "," in line and re.search(r"[A-Za-zÀ-ÿ]", line):
+        if j > name_index + 1 and re.match(r"^[A-Za-zÀ-ÿ][A-Za-zÀ-ÿ'’ .-]{1,50},\s*[A-Za-zÀ-ÿ]", cell):
             break
 
-        # Si une ligne ressemble à un autre nom complet, stop aussi.
-        if j > start_index + 1 and is_name_like(line) and not any(ch.isdigit() for ch in line):
-            break
-
-        nums = _line_numbers(line)
-        if not nums:
+        if _is_age_token(cell) or _is_rank_token(cell) or _looks_like_country_code(cell):
             continue
 
-        for n in nums:
-            # Age/rang/variations courantes : on les ignore comme total.
-            if n < 300:
-                small_candidates.append(n)
+        for n in _line_numbers(cell):
+            if n >= 300:
+                return int(n)
+
+    return 0
+
+
+def parse_tennis_temple_points_from_soup(soup: BeautifulSoup, audit: List[str]) -> Dict[str, int]:
+    """
+    V6.11I : parser TennisTemple par lignes/blocs DOM, pas par fenêtre approximative.
+
+    Page observée :
+      #
+      Nom
+      Age
+      Points
+      Sinner, Jannik
+      24
+      13900 -450
+
+    La valeur retenue est la cellule Points, première valeur >= 300.
+    """
+    points: Dict[str, int] = {}
+    name_re = re.compile(r"^([A-Za-zÀ-ÿ][A-Za-zÀ-ÿ'’ .-]{1,50}),\s*([A-Za-zÀ-ÿ][A-Za-zÀ-ÿ'’ .-]{1,50})$")
+
+    dom_rows_checked = 0
+    candidates = soup.select("tr, li, .rankings-table__row, [class*='ranking'], [class*='player']")
+
+    for row in candidates:
+        cells = [normalize_space(x) for x in row.get_text("\n", strip=True).splitlines()]
+        cells = [x for x in cells if x]
+        if len(cells) < 2:
+            continue
+
+        dom_rows_checked += 1
+
+        for i, cell in enumerate(cells):
+            m = name_re.match(cell)
+            if not m:
                 continue
 
-            # Premier gros nombre rencontré = total ATP le plus fiable.
-            return n
+            last = clean_name(m.group(1).replace("’", "'"))
+            first = clean_name(m.group(2).replace("’", "'"))
+            full = clean_name(f"{first} {last}")
 
-    # Fallback uniquement si aucun total crédible n'a été trouvé.
-    # On garde le plus grand petit nombre pour ne pas mettre 0, mais l'audit le signalera.
-    return max(small_candidates) if small_candidates else 0
+            if not is_name_like(full):
+                continue
+
+            total = _first_total_points_from_cells(cells, i)
+            if total >= 300:
+                points[canonical_name(full)] = int(total)
+
+    audit.append(f"tennistemple_dom_rows_checked={dom_rows_checked}")
+    audit.append(f"tennistemple_dom_points_count={len(points)}")
+
+    if len(points) < 50:
+        fallback = parse_tennis_temple_points(soup.get_text("\n", strip=True), audit)
+        points.update(fallback)
+        audit.append(f"tennistemple_points_after_text_fallback={len(points)}")
+
+    return points
+
+
+def parse_tennis_temple_points(text: str, audit: List[str]) -> Dict[str, int]:
+    """
+    Fallback texte strict TennisTemple :
+      Nom, Prénom -> Age -> Points Variation
+    """
+    points: Dict[str, int] = {}
+    lines = [normalize_space(x) for x in (text or "").splitlines() if normalize_space(x)]
+    name_re = re.compile(r"^([A-Za-zÀ-ÿ][A-Za-zÀ-ÿ'’ .-]{1,50}),\s*([A-Za-zÀ-ÿ][A-Za-zÀ-ÿ'’ .-]{1,50})$")
+
+    for i, line in enumerate(lines):
+        m = name_re.match(line)
+        if not m:
+            continue
+
+        last = clean_name(m.group(1).replace("’", "'"))
+        first = clean_name(m.group(2).replace("’", "'"))
+        full = clean_name(f"{first} {last}")
+
+        if not is_name_like(full):
+            continue
+
+        total = _first_total_points_from_cells(lines, i)
+        if total >= 300:
+            points[canonical_name(full)] = int(total)
+
+    audit.append(f"tennistemple_text_points_count={len(points)}")
+    return points
 
 
 def parse_live_tennis_points(text: str, audit: List[str]) -> Dict[str, int]:
     """
-    Parse live-tennis.eu ATP live ranking.
-
-    Format généralement lisible :
-      Luciano Darderi
-      24
-      ITA
-      2060
-      +3
-      +170
-      Rome QF
-
-    Règle stricte :
-      nom -> ignore âge/pays/rang/variations -> premier nombre >= 300 = points ATP.
+    Fallback live-tennis :
+      Nom -> Age -> Pays -> Points
     """
     points: Dict[str, int] = {}
     lines = [normalize_space(x) for x in (text or "").splitlines() if normalize_space(x)]
@@ -924,54 +966,47 @@ def parse_live_tennis_points(text: str, audit: List[str]) -> Dict[str, int]:
     }
 
     for i, line in enumerate(lines):
-        ck_line = canonical_name(line)
-
+        ck = canonical_name(line)
         if not is_name_like(line):
             continue
-
-        if any(w in ck_line.split() for w in banned_words):
+        if any(w in ck.split() for w in banned_words):
             continue
-
-        # Live-tennis noms simples : "Karen Khachanov", pas "Khachanov, Karen".
         if "," in line:
             continue
-
-        # Évite les lignes pays / statut tournoi.
         if _looks_like_country_code(line):
             continue
 
-        if _looks_like_ranking_status_line(line):
-            continue
-
-        total = _strict_total_points_after_name(lines, i, window=14)
-        if total >= 300:
-            points[canonical_name(line)] = int(total)
+        for j in range(i + 1, min(len(lines), i + 12)):
+            cell = normalize_space(lines[j])
+            if not cell:
+                continue
+            if j > i + 1 and is_name_like(cell) and not any(ch.isdigit() for ch in cell):
+                break
+            if _is_age_token(cell) or _is_rank_token(cell) or _looks_like_country_code(cell):
+                continue
+            for n in _line_numbers(cell):
+                if n >= 300:
+                    points[canonical_name(line)] = int(n)
+                    break
+            if canonical_name(line) in points:
+                break
 
     audit.append(f"live_tennis_points_parse_count={len(points)}")
     return points
 
 
 def parse_points_from_text(text: str, audit: List[str]) -> Dict[str, int]:
-    """
-    Parse générique pour ATP officiel / autres pages.
-    V6.11E : premier total crédible >= 300 après le nom, pas max aléatoire.
-    """
     points: Dict[str, int] = {}
     lines = [normalize_space(x) for x in text.splitlines() if normalize_space(x)]
-    banned = {
-        "rank", "ranking", "rankings", "player", "age", "points", "tournament",
-        "move", "official", "singles", "partners", "subscribe", "privacy",
-    }
 
     for i, line in enumerate(lines):
         if not is_name_like(line):
             continue
-
         ck = canonical_name(line)
-        if any(x in ck.split() for x in banned):
+        if any(x in ck.split() for x in {"rank", "ranking", "rankings", "player", "age", "points", "official"}):
             continue
 
-        total = _strict_total_points_after_name(lines, i, window=12)
+        total = _first_total_points_from_cells(lines, i)
         if total >= 300:
             points[ck] = int(total)
 
@@ -979,93 +1014,43 @@ def parse_points_from_text(text: str, audit: List[str]) -> Dict[str, int]:
     return points
 
 
-def parse_tennis_temple_points(text: str, audit: List[str]) -> Dict[str, int]:
-    """
-    Parse TennisTemple live ATP ranking.
-
-    Format :
-      Sinner, Jannik
-      24
-      13900 -450
-
-    Correction V6.11E :
-      on ne prend plus le plus grand nombre proche du nom.
-      On prend le premier total crédible >= 300 après le nom.
-      Ça évite les faux points comme 150, 170, 188.
-    """
-    points: Dict[str, int] = {}
-    lines = [normalize_space(x) for x in (text or "").splitlines() if normalize_space(x)]
-
-    name_re = re.compile(r"^([A-Za-zÀ-ÿ][A-Za-zÀ-ÿ'’ .-]{1,50}),\s*([A-Za-zÀ-ÿ][A-Za-zÀ-ÿ'’ .-]{1,50})$")
-
-    for i, line in enumerate(lines):
-        m = name_re.match(line)
-        if not m:
-            continue
-
-        last = clean_name(m.group(1).replace("’", "'"))
-        first = clean_name(m.group(2).replace("’", "'"))
-
-        if not first or not last:
-            continue
-
-        full = clean_name(f"{first} {last}")
-
-        if not is_name_like(full):
-            continue
-
-        total = _strict_total_points_after_name(lines, i, window=12)
-
-        if total >= 300:
-            points[canonical_name(full)] = int(total)
-
-    audit.append(f"tennistemple_points_parse_count={len(points)}")
-    return points
-
-
 def fetch_points_map(session: requests.Session, audit: List[str]) -> Dict[str, int]:
     """
-    Sources points ATP.
-
-    V6.11E :
-    priorité aux sources live qui donnent un total directement exploitable.
-    Le parser refuse les petites valeurs 150/170/188 comme total ATP.
+    V6.11I : priorité TennisTemple avec extraction DOM Nom/Age/Points.
+    ATP officiel reste en dernier car 403 fréquent sur Railway.
     """
-    # 1) live-tennis.eu : source live lisible quand accessible.
-    for url in [LIVE_TENNIS_ATP_LIVE_URL_EN, LIVE_TENNIS_ATP_LIVE_URL_FR]:
-        try:
-            html = fetch_html(session, url)
-            soup = BeautifulSoup(html, "html.parser")
-            for tag in soup(["script", "style", "noscript"]):
-                tag.decompose()
-            body_text = soup.get_text("\n", strip=True)
-            points = parse_live_tennis_points(body_text, audit)
-            if len(points) >= 50:
-                audit.append(f"points_source={url}")
-                audit.append("points_policy=strict_first_total_ge_300")
-                return points
-            audit.append(f"points_source_too_small={url} | count={len(points)}")
-        except Exception as exc:
-            audit.append(f"points_live_tennis_failed={url} | {type(exc).__name__}: {exc}")
-
-    # 2) TennisTemple live.
     for url in [TENNIS_TEMPLE_ATP_LIVE_URL_EN, TENNIS_TEMPLE_ATP_LIVE_URL]:
         try:
             html = fetch_html(session, url)
             soup = BeautifulSoup(html, "html.parser")
             for tag in soup(["script", "style", "noscript"]):
                 tag.decompose()
-            body_text = soup.get_text("\n", strip=True)
-            points = parse_tennis_temple_points(body_text, audit)
+
+            points = parse_tennis_temple_points_from_soup(soup, audit)
             if len(points) >= 50:
                 audit.append(f"points_source={url}")
-                audit.append("points_policy=strict_first_total_ge_300")
+                audit.append("points_policy=tennistemple_dom_row_name_age_points")
                 return points
+
             audit.append(f"points_source_too_small={url} | count={len(points)}")
         except Exception as exc:
             audit.append(f"points_tennistemple_failed={url} | {type(exc).__name__}: {exc}")
 
-    # 3) ATP officiel en dernier, souvent bloqué 403 sur Railway.
+    for url in [LIVE_TENNIS_ATP_LIVE_URL_EN, LIVE_TENNIS_ATP_LIVE_URL_FR]:
+        try:
+            html = fetch_html(session, url)
+            soup = BeautifulSoup(html, "html.parser")
+            for tag in soup(["script", "style", "noscript"]):
+                tag.decompose()
+            points = parse_live_tennis_points(soup.get_text("\n", strip=True), audit)
+            if len(points) >= 50:
+                audit.append(f"points_source={url}")
+                audit.append("points_policy=live_tennis_name_age_country_points")
+                return points
+            audit.append(f"points_source_too_small={url} | count={len(points)}")
+        except Exception as exc:
+            audit.append(f"points_live_tennis_failed={url} | {type(exc).__name__}: {exc}")
+
     for url in [ATP_RANKINGS_LIVE_URL, ATP_RANKINGS_URL]:
         try:
             html = fetch_html(session, url)
@@ -1075,14 +1060,14 @@ def fetch_points_map(session: requests.Session, audit: List[str]) -> Dict[str, i
             points = parse_points_from_text(soup.get_text("\n", strip=True), audit)
             if len(points) >= 50:
                 audit.append(f"points_source={url}")
-                audit.append("points_policy=strict_first_total_ge_300")
+                audit.append("points_policy=generic_name_age_points")
                 return points
             audit.append(f"points_source_too_small={url} | count={len(points)}")
         except Exception as exc:
             audit.append(f"points_fetch_failed={url} | {type(exc).__name__}: {exc}")
 
     audit.append("points_source=EMPTY")
-    audit.append("points_policy=strict_first_total_ge_300")
+    audit.append("points_policy=EMPTY")
     return {}
 
 
