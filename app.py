@@ -6,16 +6,17 @@ import re
 import os
 import subprocess
 import sys
+import threading
 import traceback
 import unicodedata
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
 
 from fastapi import FastAPI, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 
-from motor import calculate_predictions, calculate_match_prediction, get_state
+from motor import HISTORY_YEARS, calculate_predictions, calculate_match_prediction, get_state
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -27,6 +28,13 @@ DAILY_SCRIPT_NAME = "fetch_day_lines_v6_10k_daily_schedule_no_forced_veto.py"
 # On garde ATP pour les matchs + points + moteur.
 # Flashscore sert uniquement à ajouter les cotes 1 / 2 après calcul moteur.
 FLASHSCORE_TENNIS_URL = "https://www.flashscore.fr/tennis/"
+
+# Historique 2026 automatique.
+# update_2026_history.py met à jour uniquement les matchs ATP terminés.
+# Les matchs du jour non terminés ne sont jamais injectés dans l'Elo.
+UPDATE_2026_SCRIPT = BASE_DIR / "update_2026_history.py"
+UPDATE_2026_MARKER = OUTPUT_DIR / "update_2026_last_run.json"
+_UPDATE_2026_LOCK = threading.Lock()
 
 app = FastAPI(title="Tennis Motor Railway Backend")
 
@@ -60,6 +68,190 @@ def normalize_day(day: str) -> str:
         return (today + timedelta(days=1)).isoformat()
 
     return date.fromisoformat(value).isoformat()
+
+
+def _bool_env(name: str, default: bool = True) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() not in {"0", "false", "no", "off", ""}
+
+
+def _paris_now_iso() -> str:
+    try:
+        from zoneinfo import ZoneInfo
+
+        return datetime.now(ZoneInfo("Europe/Paris")).isoformat()
+    except Exception:
+        return datetime.now().isoformat()
+
+
+def _tail(text: str, max_chars: int = 4000) -> str:
+    text = text or ""
+    if len(text) <= max_chars:
+        return text
+    return text[-max_chars:]
+
+
+def _reset_motor_state_cache() -> Dict[str, Any]:
+    """
+    Important : /health peut charger le moteur avant la mise à jour 2026.
+    Après une mise à jour réussie de data/2026.csv, on vide le cache moteur
+    pour que l'analyse suivante reconstruise l'Elo avec 2026 inclus.
+    """
+    try:
+        import motor
+
+        if hasattr(motor, "_STATE"):
+            motor._STATE = None
+            return {"status": "ok", "message": "motor._STATE réinitialisé"}
+        return {"status": "skipped", "message": "motor._STATE introuvable"}
+    except Exception as exc:
+        return {"status": "error", "message": f"{type(exc).__name__}: {exc}"}
+
+
+def run_update_2026_history_if_needed(force: bool = False) -> Dict[str, Any]:
+    """
+    Lance update_2026_history.py automatiquement avant une analyse.
+
+    Règles :
+    - une seule mise à jour réussie par jour ;
+    - si la mise à jour échoue, on réessaiera au prochain lancement ;
+    - ne met jamais les matchs du jour non terminés dans l'Elo ;
+    - après une réussite, le cache moteur est vidé pour recharger data/2026.csv.
+    """
+    enabled = _bool_env("AUTO_UPDATE_2026_HISTORY", True)
+    today = _paris_today().isoformat()
+
+    if not enabled:
+        return {
+            "enabled": False,
+            "ran": False,
+            "ok": True,
+            "status": "disabled",
+            "date": today,
+            "script": UPDATE_2026_SCRIPT.name,
+        }
+
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+    if not UPDATE_2026_SCRIPT.exists():
+        return {
+            "enabled": True,
+            "ran": False,
+            "ok": False,
+            "status": "missing_script",
+            "date": today,
+            "script": str(UPDATE_2026_SCRIPT),
+            "message": "update_2026_history.py introuvable dans le dossier backend.",
+        }
+
+    if not force and UPDATE_2026_MARKER.exists():
+        try:
+            marker = json.loads(UPDATE_2026_MARKER.read_text(encoding="utf-8"))
+            if marker.get("date") == today and marker.get("ok") is True:
+                return {
+                    "enabled": True,
+                    "ran": False,
+                    "ok": True,
+                    "status": "already_done_today",
+                    "date": today,
+                    "script": UPDATE_2026_SCRIPT.name,
+                    "last_run": marker,
+                }
+        except Exception:
+            # Marqueur illisible : on relance proprement.
+            pass
+
+    if not _UPDATE_2026_LOCK.acquire(blocking=False):
+        return {
+            "enabled": True,
+            "ran": False,
+            "ok": False,
+            "status": "already_running",
+            "date": today,
+            "script": UPDATE_2026_SCRIPT.name,
+        }
+
+    try:
+        timeout_seconds = int(os.environ.get("UPDATE_2026_TIMEOUT_SECONDS", "540"))
+        completed = subprocess.run(
+            [sys.executable, str(UPDATE_2026_SCRIPT)],
+            cwd=str(BASE_DIR),
+            capture_output=True,
+            text=True,
+            timeout=timeout_seconds,
+        )
+
+        ok = completed.returncode == 0
+        result: Dict[str, Any] = {
+            "enabled": True,
+            "ran": True,
+            "ok": ok,
+            "status": "ok" if ok else "error",
+            "date": today,
+            "script": UPDATE_2026_SCRIPT.name,
+            "returncode": completed.returncode,
+            "stdoutTail": _tail(completed.stdout),
+            "stderrTail": _tail(completed.stderr),
+        }
+
+        if ok:
+            reset_info = _reset_motor_state_cache()
+            result["motorReload"] = reset_info
+
+            UPDATE_2026_MARKER.write_text(
+                json.dumps(
+                    {
+                        "date": today,
+                        "ok": True,
+                        "script": UPDATE_2026_SCRIPT.name,
+                        "ranAtParis": _paris_now_iso(),
+                        "returncode": completed.returncode,
+                        "motorReload": reset_info,
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                ),
+                encoding="utf-8",
+            )
+
+        return result
+
+    except subprocess.TimeoutExpired as exc:
+        return {
+            "enabled": True,
+            "ran": True,
+            "ok": False,
+            "status": "timeout",
+            "date": today,
+            "script": UPDATE_2026_SCRIPT.name,
+            "timeoutSeconds": int(os.environ.get("UPDATE_2026_TIMEOUT_SECONDS", "540")),
+            "stdoutTail": _tail(exc.stdout if isinstance(exc.stdout, str) else ""),
+            "stderrTail": _tail(exc.stderr if isinstance(exc.stderr, str) else ""),
+        }
+
+    except Exception as exc:
+        return {
+            "enabled": True,
+            "ran": True,
+            "ok": False,
+            "status": "exception",
+            "date": today,
+            "script": UPDATE_2026_SCRIPT.name,
+            "error": repr(exc),
+        }
+
+    finally:
+        _UPDATE_2026_LOCK.release()
+
+
+def _attach_update_2026(result: Dict[str, Any], update2026: Dict[str, Any]) -> Dict[str, Any]:
+    if not isinstance(result, dict):
+        return result
+    result.setdefault("daily", {})
+    result["daily"]["update2026"] = update2026
+    return result
 
 
 def _extract_matches_from_payload(payload: Any) -> List[Dict[str, Any]]:
@@ -111,7 +303,7 @@ def _empty_response(
         "engine": {
             "name": "Tennis Motor V7",
             "version": "Bayesian Shrinkage",
-            "historyYears": [2022, 2023, 2024, 2025],
+            "historyYears": list(HISTORY_YEARS),
             "historyRowsLoaded": history_rows_loaded,
             "premiumFormula": "Bayesian shrinkage blend of SWE, ATP, Rank, Form5, Form10, SurfaceForm5, Dominance",
             "threshold": "> 0.80",
@@ -1864,7 +2056,7 @@ def calculate_from_matches(matches: List[Dict[str, Any]]) -> Dict[str, Any]:
         "engine": {
             "name": "Tennis Motor V7",
             "version": "Bayesian Shrinkage",
-            "historyYears": [2022, 2023, 2024, 2025],
+            "historyYears": list(HISTORY_YEARS),
             "historyRowsLoaded": state["history_rows_loaded"],
             "premiumFormula": "Bayesian shrinkage blend of SWE, ATP, Rank, Form5, Form10, SurfaceForm5, Dominance",
             "threshold": "> 0.80",
@@ -2056,6 +2248,7 @@ async def root() -> Dict[str, Any]:
             "/history",
             "/history-refresh",
             "/history-reset?confirm=RESET",
+            "/update-2026-history?force=true",
         ],
     }
 
@@ -2086,7 +2279,9 @@ async def health() -> Dict[str, Any]:
 async def calculate(request: Request) -> Dict[str, Any]:
     try:
         matches = await _read_request_matches(request)
-        return calculate_from_matches(matches)
+        update2026 = await asyncio.to_thread(run_update_2026_history_if_needed)
+        result = calculate_from_matches(matches)
+        return _attach_update_2026(result, update2026)
     except Exception as exc:
         return _empty_response(
             status="calculate_failed",
@@ -2099,7 +2294,9 @@ async def calculate(request: Request) -> Dict[str, Any]:
 async def predictions_post(request: Request) -> Dict[str, Any]:
     try:
         matches = await _read_request_matches(request)
-        return calculate_from_matches(matches)
+        update2026 = await asyncio.to_thread(run_update_2026_history_if_needed)
+        result = calculate_from_matches(matches)
+        return _attach_update_2026(result, update2026)
     except Exception as exc:
         return _empty_response(
             status="predictions_post_failed",
@@ -2119,7 +2316,9 @@ async def daily(day: str = Query("today")) -> Dict[str, Any]:
             target_day=str(day),
         )
 
-    return await asyncio.to_thread(run_daily_fetch_sync, target_day)
+    update2026 = await asyncio.to_thread(run_update_2026_history_if_needed)
+    result = await asyncio.to_thread(run_daily_fetch_sync, target_day)
+    return _attach_update_2026(result, update2026)
 
 
 @app.get("/predictions")
@@ -2133,7 +2332,18 @@ async def predictions_get(day: str = Query("today")) -> Dict[str, Any]:
             target_day=str(day),
         )
 
-    return await asyncio.to_thread(run_daily_fetch_sync, target_day)
+    update2026 = await asyncio.to_thread(run_update_2026_history_if_needed)
+    result = await asyncio.to_thread(run_daily_fetch_sync, target_day)
+    return _attach_update_2026(result, update2026)
+
+
+@app.get("/update-2026-history")
+async def update_2026_history_manual(force: bool = Query(True)) -> Dict[str, Any]:
+    """
+    Endpoint manuel de contrôle.
+    force=true relance même si la mise à jour a déjà réussi aujourd'hui.
+    """
+    return await asyncio.to_thread(run_update_2026_history_if_needed, force)
 
 
 @app.get("/state")
