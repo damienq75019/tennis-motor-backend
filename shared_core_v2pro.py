@@ -9,7 +9,7 @@ from typing import Any, Dict, List, Tuple
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.path.join(BASE_DIR, "data")
-HISTORY_YEARS = [2022, 2023, 2024, 2025]
+HISTORY_YEARS = [2022, 2023, 2024, 2025, 2026]
 
 INVALID_SCORE_TOKENS = ("RET", "W/O", "WO", "DEF", "ABD", "ABN")
 
@@ -102,6 +102,31 @@ def form_probability(form_a: float, form_b: float, scale: float = 0.16) -> float
     return 1.0 / (1.0 + math.exp(-((form_a - form_b) / scale)))
 
 
+def resolve_history_file(year: int) -> str:
+    """
+    Trouve le fichier historique ATP singles pour une année.
+    Accepte les deux conventions utilisées dans ton projet :
+    - data/2026.csv
+    - data/atp_matches_2026.csv
+
+    Fallback possible si le fichier est placé à côté du script backend :
+    - 2026.csv
+    - atp_matches_2026.csv
+    """
+    candidates = [
+        os.path.join(DATA_DIR, f"{year}.csv"),
+        os.path.join(DATA_DIR, f"atp_matches_{year}.csv"),
+        os.path.join(BASE_DIR, f"{year}.csv"),
+        os.path.join(BASE_DIR, f"atp_matches_{year}.csv"),
+    ]
+
+    for filepath in candidates:
+        if os.path.exists(filepath) and os.path.isfile(filepath):
+            return filepath
+
+    return ""
+
+
 def load_history_rows() -> List[Dict[str, Any]]:
     rows: List[Dict[str, Any]] = []
 
@@ -111,12 +136,16 @@ def load_history_rows() -> List[Dict[str, Any]]:
     }
 
     for year in HISTORY_YEARS:
-        filepath = os.path.join(DATA_DIR, f"{year}.csv")
-        if not os.path.exists(filepath):
+        filepath = resolve_history_file(year)
+        if not filepath:
             continue
 
         with open(filepath, "r", encoding="utf-8", newline="") as f:
             reader = csv.DictReader(f)
+
+            required_columns = {"winner_name", "loser_name", "surface", "tourney_date"}
+            if not reader.fieldnames or not required_columns.issubset(set(reader.fieldnames)):
+                continue
 
             for row in reader:
                 winner = (row.get("winner_name") or "").strip()
