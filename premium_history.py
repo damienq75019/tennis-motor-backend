@@ -1,1535 +1,982 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-premium_history.py
+Tennis Motor - premium_history.py
 
-Historique séparé pour Tennis Motor.
-
-Objectif :
-- Ne pas modifier le moteur.
-- Ne pas modifier les probabilités.
-- Suivre uniquement les matchs PREMIUM jouables.
-- Sauvegarder cote, statut, résultat réel, win/loss, profit et ROI.
-- Fournir des stats 1 jour / 7 jours / 30 jours / 365 jours / total.
-- Fournir des données de graphique par jour.
-
-Utilisation locale :
-    py premium_history.py record-url "https://web-production-22524.up.railway.app/daily?day=today"
-    py premium_history.py record-json output/result_2026-05-10.json
-    py premium_history.py settle-flashscore
-    py premium_history.py stats
-    py premium_history.py reset --confirm YES
-
-Fichiers :
-    output/premium_history.json
-    output/premium_history_summary.json
+Rôle :
+- enregistrer uniquement les vrais picks PREMIUM jouables dans /app/output/premium_history.json
+- régler automatiquement les anciens "pending" quand le résultat est récupérable
+- fournir /history avec résumé + courbe
+- NE JAMAIS envoyer les matchs à venir dans l'Elo
 """
 
 from __future__ import annotations
 
-import argparse
+import csv
+import html
 import json
 import os
 import re
-import sys
-from datetime import date, datetime, timedelta
+import time
+import unicodedata
+from dataclasses import dataclass
+from datetime import datetime, date, timedelta
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
-from urllib.request import Request, urlopen
+from typing import Any, Dict, Iterable, List, Optional, Tuple
+from urllib.parse import quote_plus, unquote, urlparse, parse_qs
+
+try:
+    import requests
+except Exception:  # pragma: no cover
+    requests = None
+
+try:
+    from bs4 import BeautifulSoup
+except Exception:  # pragma: no cover
+    BeautifulSoup = None
 
 try:
     from zoneinfo import ZoneInfo
-except Exception:  # Python fallback
-    ZoneInfo = None  # type: ignore
+except Exception:  # pragma: no cover
+    ZoneInfo = None
 
 
-def resolve_history_output_dir() -> Path:
-    """
-    Dossier de stockage de l'historique.
+# -----------------------------
+# CONFIG
+# -----------------------------
 
-    Priorité :
-    1) HISTORY_DIR si tu veux forcer un chemin précis.
-    2) RAILWAY_VOLUME_MOUNT_PATH si un volume Railway est attaché.
-    3) output/ en local ou sans volume.
+BASE_DIR = Path(__file__).resolve().parent
+OUTPUT_DIR = Path(os.getenv("OUTPUT_DIR", BASE_DIR / "output"))
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
-    Sur Railway, monte idéalement un volume sur /app/output :
-    - l'application écrit déjà dans output/
-    - Railway recommande de monter le volume sur /app/<dossier> pour persister
-      les chemins relatifs de l'application.
-    """
-    forced = os.getenv("HISTORY_DIR", "").strip()
-    if forced:
-        return Path(forced)
+HISTORY_PATH = Path(os.getenv("PREMIUM_HISTORY_PATH", OUTPUT_DIR / "premium_history.json"))
+SUMMARY_PATH = Path(os.getenv("PREMIUM_HISTORY_SUMMARY_PATH", OUTPUT_DIR / "premium_history_summary.json"))
+CACHE_PATH = Path(os.getenv("PREMIUM_RESULT_CACHE_PATH", OUTPUT_DIR / "premium_result_lookup_cache.json"))
 
-    railway_volume = os.getenv("RAILWAY_VOLUME_MOUNT_PATH", "").strip()
-    if railway_volume:
-        return Path(railway_volume)
+PARIS_TZ_NAME = "Europe/Paris"
+STAKE_EUR = float(os.getenv("PREMIUM_STAKE_EUR", "100"))
 
-    return Path("output")
+PREMIUM_THRESHOLD_PCT = float(os.getenv("PREMIUM_THRESHOLD_PCT", "80"))
+SETTLE_DAYS_BACK_DEFAULT = int(os.getenv("PREMIUM_SETTLE_DAYS_BACK", "45"))
+
+# Internet lookups can be disabled if Railway blocks them.
+ENABLE_WEB_SETTLE = os.getenv("ENABLE_WEB_SETTLE", "1").strip().lower() not in {"0", "false", "no", "off"}
+
+REQUEST_TIMEOUT = int(os.getenv("PREMIUM_HISTORY_HTTP_TIMEOUT", "20"))
+
+USER_AGENT = os.getenv(
+    "HTTP_USER_AGENT",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+)
+
+# ATP archive pages: official source, easy to parse when updated.
+# On garde une liste courte mais extensible.
+ATP_ARCHIVE_URLS_BY_YEAR = {
+    2026: [
+        "https://www.atptour.com/en/scores/archive/rome/416/2026/results",
+        "https://www.atptour.com/en/scores/archive/madrid/1536/2026/results",
+        "https://www.atptour.com/en/scores/archive/monte-carlo/410/2026/results",
+        "https://www.atptour.com/en/scores/archive/indian-wells/404/2026/results",
+        "https://www.atptour.com/en/scores/archive/miami/403/2026/results",
+        "https://www.atptour.com/en/scores/archive/barcelona/425/2026/results",
+        "https://www.atptour.com/en/scores/archive/munich/308/2026/results",
+        "https://www.atptour.com/en/scores/archive/bucharest/773/2026/results",
+        "https://www.atptour.com/en/scores/archive/geneva/322/2026/results",
+        "https://www.atptour.com/en/scores/archive/hamburg/414/2026/results",
+    ],
+    2025: [
+        "https://www.atptour.com/en/scores/archive/rome/416/2025/results",
+        "https://www.atptour.com/en/scores/archive/madrid/1536/2025/results",
+        "https://www.atptour.com/en/scores/archive/monte-carlo/410/2025/results",
+        "https://www.atptour.com/en/scores/archive/indian-wells/404/2025/results",
+        "https://www.atptour.com/en/scores/archive/miami/403/2025/results",
+    ],
+}
 
 
-OUTPUT_DIR = resolve_history_output_dir()
-HISTORY_PATH = OUTPUT_DIR / "premium_history.json"
-SUMMARY_PATH = OUTPUT_DIR / "premium_history_summary.json"
-FLASHSCORE_TENNIS_URL = "https://www.flashscore.fr/tennis/"
+# -----------------------------
+# DATE / JSON
+# -----------------------------
 
-# Mise fixe utilisateur : 100 euros par match Premium.
-STAKE_EUR = 100.0
-EURO_AXIS_MIN = -2000.0
-EURO_AXIS_MAX = 2000.0
-
-
-if hasattr(sys.stdout, "reconfigure"):
-    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
-if hasattr(sys.stderr, "reconfigure"):
-    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+def _paris_now() -> datetime:
+    if ZoneInfo:
+        return datetime.now(ZoneInfo(PARIS_TZ_NAME))
+    return datetime.now()
 
 
-# ---------------------------------------------------------------------------
-# Base utils
-# ---------------------------------------------------------------------------
+def paris_today_iso() -> str:
+    return _paris_now().date().isoformat()
 
-def current_paris_date() -> date:
-    """Date métier Tennis Motor = Europe/Paris, pas UTC Railway."""
+
+def parse_date(value: Any) -> Optional[date]:
+    if not value:
+        return None
+    s = str(value).strip()
+    for fmt in ("%Y-%m-%d", "%Y%m%d", "%d/%m/%Y"):
+        try:
+            return datetime.strptime(s, fmt).date()
+        except Exception:
+            pass
+    return None
+
+
+def normalize_day(day: Optional[str]) -> str:
+    today = _paris_now().date()
+    if not day or str(day).strip().lower() in {"today", "aujourd'hui", "aujourdhui"}:
+        return today.isoformat()
+    if str(day).strip().lower() in {"tomorrow", "demain"}:
+        return (today + timedelta(days=1)).isoformat()
+    parsed = parse_date(day)
+    if parsed:
+        return parsed.isoformat()
+    return today.isoformat()
+
+
+def load_json(path: Path, default: Any) -> Any:
     try:
-        if ZoneInfo is not None:
-            return datetime.now(ZoneInfo("Europe/Paris")).date()
-    except Exception:
-        pass
-    return date.today()
-
-
-def today_iso() -> str:
-    return current_paris_date().isoformat()
-
-
-def normalize_space(text: str) -> str:
-    return re.sub(r"\s+", " ", (text or "").replace("\xa0", " ")).strip()
-
-
-def norm_name(name: str) -> str:
-    value = (name or "").lower()
-    value = value.replace("é", "e").replace("è", "e").replace("ê", "e")
-    value = value.replace("á", "a").replace("à", "a").replace("â", "a")
-    value = value.replace("í", "i").replace("ï", "i")
-    value = value.replace("ó", "o").replace("ö", "o")
-    value = value.replace("ú", "u").replace("ü", "u")
-    value = value.replace("ñ", "n").replace("ç", "c")
-    value = re.sub(r"[^a-z0-9]+", " ", value)
-    return normalize_space(value)
-
-
-def same_player(a: str, b: str) -> bool:
-    """
-    Matching simple :
-    - nom complet identique normalisé
-    - initiale + nom : "Zverev A." ~= "Alexander Zverev"
-    - nom de famille fort
-    """
-    na = norm_name(a)
-    nb = norm_name(b)
-
-    if not na or not nb:
-        return False
-
-    if na == nb:
-        return True
-
-    pa = na.split()
-    pb = nb.split()
-
-    if not pa or not pb:
-        return False
-
-    # Même dernier nom long.
-    if len(pa[-1]) >= 4 and pa[-1] == pb[-1]:
-        return True
-
-    # Flashscore peut afficher "Zverev A." ou "A. Zverev".
-    def initial_last(parts: List[str]) -> Tuple[str, str]:
-        if len(parts) < 2:
-            return "", ""
-        if len(parts[0]) == 1:
-            return parts[0], parts[-1]
-        if len(parts[-1]) == 1:
-            return parts[-1], parts[0]
-        return parts[0][0], parts[-1]
-
-    ia, la = initial_last(pa)
-    ib, lb = initial_last(pb)
-
-    return bool(ia and ib and ia == ib and la == lb)
-
-
-def to_float(value: Any, default: float = 0.0) -> float:
-    try:
-        return float(str(value).replace(",", "."))
+        if not path.exists():
+            return default
+        return json.loads(path.read_text(encoding="utf-8"))
     except Exception:
         return default
 
 
-def premium_pct(match: Dict[str, Any]) -> float:
-    if "premiumPct" in match:
-        return to_float(match.get("premiumPct"), 0.0)
+def save_json_atomic(path: Path, payload: Any) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp.replace(path)
 
-    if "premium" in match:
-        v = to_float(match.get("premium"), 0.0)
-        return v * 100.0 if v <= 1.0 else v
-
-    return 0.0
-
-
-def is_veto(match: Dict[str, Any]) -> bool:
-    return str(match.get("veto", "")).strip().lower() in {"oui", "yes", "true", "1"}
-
-
-def is_premium_jouable(match: Dict[str, Any]) -> bool:
-    if is_veto(match):
-        return False
-
-    if premium_pct(match) < 80.0:
-        return False
-
-    decision = str(match.get("decision", "")).lower()
-
-    if "pas jouable" in decision or "refus" in decision:
-        return False
-
-    # Accepte "✅ Jouable", "Jouable", etc.
-    return True
-
-
-def match_id(target_day: str, source_a: str, source_b: str, predicted: str) -> str:
-    pair = sorted([norm_name(source_a), norm_name(source_b)])
-    return f"{target_day}__{pair[0]}__{pair[1]}__pick_{norm_name(predicted)}"
-
-
-def history_match_key(source_a: str, source_b: str, predicted: str) -> str:
-    """Clé sans date : empêche le même match Premium d'être ajouté 2 fois."""
-    pair = sorted([norm_name(source_a), norm_name(source_b)])
-    return f"{pair[0]}__{pair[1]}__pick_{norm_name(predicted)}"
-
-
-def parse_iso_date(value: Any) -> Optional[date]:
-    try:
-        return date.fromisoformat(str(value))
-    except Exception:
-        return None
-
-
-def is_future_day(day_value: Any) -> bool:
-    d = parse_iso_date(day_value)
-    if d is None:
-        return False
-    return d > current_paris_date()
-
-
-def sanitize_history_rows(rows: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
-    """
-    Nettoyage dur :
-    - supprime les matchs futurs ;
-    - supprime les doublons du même match/pick ;
-    - garde en priorité la ligne déjà settled win/loss.
-    """
-    cleaned_by_key: Dict[str, Dict[str, Any]] = {}
-    removed_future = 0
-    removed_duplicates = 0
-
-    def score(row: Dict[str, Any]) -> Tuple[int, int, str]:
-        result = str(row.get("result") or "")
-        settled_priority = 2 if result in {"win", "loss"} else 1
-        has_real = 1 if row.get("realWinner") else 0
-        return (settled_priority, has_real, str(row.get("settledAt") or row.get("date") or ""))
-
-    for row in rows:
-        if not isinstance(row, dict):
-            continue
-
-        row_date = str(row.get("date") or "")
-        if is_future_day(row_date):
-            removed_future += 1
-            continue
-
-        source_a = str(row.get("sourcePlayerA") or "")
-        source_b = str(row.get("sourcePlayerB") or "")
-        predicted = str(row.get("predictedWinner") or "")
-
-        if not source_a or not source_b or not predicted:
-            # On garde les lignes inconnues non exploitables au lieu de les détruire.
-            key = str(row.get("id") or f"unknown_{len(cleaned_by_key)}")
-        else:
-            key = history_match_key(source_a, source_b, predicted)
-
-        old = cleaned_by_key.get(key)
-        if old is None:
-            cleaned_by_key[key] = row
-            continue
-
-        removed_duplicates += 1
-        if score(row) > score(old):
-            cleaned_by_key[key] = row
-
-    return list(cleaned_by_key.values()), {
-        "removedFutureRows": removed_future,
-        "removedDuplicateRows": removed_duplicates,
-        "keptRows": len(cleaned_by_key),
-    }
-
-
-def cleanup_history() -> Dict[str, Any]:
-    rows = load_history()
-    cleaned, info = sanitize_history_rows(rows)
-    save_history(cleaned)
-    summary = build_summary(write_cleaned=False)
-    SUMMARY_PATH.write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
-    return {"status": "ok", **info, "summaryPath": str(SUMMARY_PATH)}
-
-
-# ---------------------------------------------------------------------------
-# JSON read/write
-# ---------------------------------------------------------------------------
 
 def load_history() -> List[Dict[str, Any]]:
-    try:
-        OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-        if not HISTORY_PATH.exists():
-            return []
-        data = json.loads(HISTORY_PATH.read_text(encoding="utf-8"))
-        if isinstance(data, list):
-            return [x for x in data if isinstance(x, dict)]
-    except Exception:
-        pass
+    data = load_json(HISTORY_PATH, [])
+    if isinstance(data, dict) and isinstance(data.get("rows"), list):
+        return data["rows"]
+    if isinstance(data, list):
+        return data
     return []
 
 
 def save_history(rows: List[Dict[str, Any]]) -> None:
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    rows.sort(key=lambda x: (str(x.get("date", "")), str(x.get("predictedWinner", ""))), reverse=True)
-    HISTORY_PATH.write_text(json.dumps(rows, ensure_ascii=False, indent=2), encoding="utf-8")
+    save_json_atomic(HISTORY_PATH, rows)
 
 
-def verified_recovery_rows() -> List[Dict[str, Any]]:
+# -----------------------------
+# NORMALISATION NOMS
+# -----------------------------
+
+def strip_accents(s: str) -> str:
+    return "".join(c for c in unicodedata.normalize("NFKD", s or "") if not unicodedata.combining(c))
+
+
+def normalize_name(s: Any) -> str:
+    s = strip_accents(str(s or "")).lower()
+    s = re.sub(r"\([^)]*\)", " ", s)
+    s = re.sub(r"\b(atp|wta|q|ll|wc|seed|sr|jr)\b", " ", s)
+    s = re.sub(r"[^a-z0-9 ]+", " ", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+
+def name_tokens(s: Any) -> List[str]:
+    return [t for t in normalize_name(s).split() if t]
+
+
+def compact_name(s: Any) -> str:
+    return "".join(name_tokens(s))
+
+
+def last_name(s: Any) -> str:
+    toks = name_tokens(s)
+    if not toks:
+        return ""
+    return toks[-1]
+
+
+def first_initial(s: Any) -> str:
+    toks = name_tokens(s)
+    if not toks:
+        return ""
+    return toks[0][:1]
+
+
+def name_match(a: Any, b: Any) -> bool:
+    """Tolérant : 'Daniil Medvedev' match 'Medvedev D.'."""
+    na = normalize_name(a)
+    nb = normalize_name(b)
+    if not na or not nb:
+        return False
+    if na == nb:
+        return True
+    ca, cb = compact_name(na), compact_name(nb)
+    if ca and cb and (ca in cb or cb in ca):
+        return True
+
+    la, lb = last_name(na), last_name(nb)
+    if la and lb and la == lb:
+        ia, ib = first_initial(na), first_initial(nb)
+        if not ia or not ib or ia == ib:
+            return True
+
+    # cas "J. Sinner" vs "Jannik Sinner"
+    ta, tb = name_tokens(na), name_tokens(nb)
+    if len(ta) >= 2 and len(tb) >= 2:
+        if ta[-1] == tb[-1] and ta[0][:1] == tb[0][:1]:
+            return True
+    return False
+
+
+def pair_key(date_iso: str, player1: str, player2: str) -> str:
+    names = sorted([normalize_name(player1), normalize_name(player2)])
+    return f"{date_iso}__{names[0]}__{names[1]}"
+
+
+def make_pick_id(date_iso: str, predicted: str, opponent: str) -> str:
+    names = sorted([normalize_name(predicted), normalize_name(opponent)])
+    return f"{date_iso}__{names[0]}__{names[1]}__pick_{normalize_name(predicted)}"
+
+
+# -----------------------------
+# RECORD PREMIUM
+# -----------------------------
+
+def _as_float(x: Any, default: float = 0.0) -> float:
+    try:
+        if x is None:
+            return default
+        if isinstance(x, str):
+            x = x.replace(",", ".").replace("%", "").strip()
+        return float(x)
+    except Exception:
+        return default
+
+
+def _is_truthy_no_veto(v: Any) -> bool:
+    s = str(v or "").strip().lower()
+    return s in {"", "non", "no", "false", "0", "none", "null"}
+
+
+def _match_decision_is_jouable(m: Dict[str, Any]) -> bool:
+    decision = str(m.get("decision") or "").lower()
+    veto = m.get("veto")
+    premium = _as_float(m.get("premiumPct", _as_float(m.get("premium"), 0) * 100), 0)
+    return premium >= PREMIUM_THRESHOLD_PCT and _is_truthy_no_veto(veto) and ("jouable" in decision or "✅" in decision or decision == "")
+
+
+def _predicted_winner_from_match(m: Dict[str, Any]) -> Tuple[str, str]:
     """
-    Lignes vérifiées à restaurer si Railway a perdu le fichier output/premium_history.json
-    après un redéploiement.
-
-    Important :
-    - ne restaure que les résultats déjà vérifiés ;
-    - n'ajoute pas les matchs de demain ;
-    - ne crée pas de doublon si la ligne existe déjà.
+    Le moteur renvoie déjà playerA comme côté choisi après double-side dans tes payloads.
+    Si un champ predictedWinner existe, on le respecte.
     """
-    return [
-        {
-            "id": "2026-05-10__alexander blockx__alexander zverev__pick_alexander zverev",
-            "date": "2026-05-10",
-            "sourcePlayerA": "Alexander Zverev",
-            "sourcePlayerB": "Alexander Blockx",
-            "predictedWinner": "Alexander Zverev",
-            "opponent": "Alexander Blockx",
-            "surface": "Clay",
-            "premiumPct": 82.3,
-            "status": "PREMIUM",
-            "veto": "non",
-            "decision": "✅ Jouable",
-            "oddPredicted": "1.2",
-            "oddOpponent": "4.5",
-            "oddsSource": "Flashscore",
-            "result": "win",
-            "realWinner": "Alexander Zverev",
-            "settledAt": "2026-05-10",
-        }
-    ]
+    predicted = m.get("predictedWinner") or m.get("winnerPredicted") or m.get("pick")
+    if predicted:
+        predicted = str(predicted)
+        a = str(m.get("playerA") or m.get("sourcePlayerA") or "")
+        b = str(m.get("playerB") or m.get("sourcePlayerB") or "")
+        if name_match(predicted, a):
+            opponent = b
+        elif name_match(predicted, b):
+            opponent = a
+        else:
+            opponent = str(m.get("opponent") or b or a)
+        return predicted, opponent
+
+    # par convention dans le payload final app.py : playerA = joueur choisi / affiché gagnant moteur
+    a = str(m.get("playerA") or m.get("sourcePlayerA") or "")
+    b = str(m.get("playerB") or m.get("sourcePlayerB") or "")
+    return a, b
 
 
-def restore_verified_if_history_empty() -> Dict[str, Any]:
+def _odd_for_player(m: Dict[str, Any], player_name: str, default: str = "") -> str:
+    a = str(m.get("playerA") or "")
+    b = str(m.get("playerB") or "")
+    source_a = str(m.get("sourcePlayerA") or a)
+    source_b = str(m.get("sourcePlayerB") or b)
+
+    if name_match(player_name, a):
+        return str(m.get("playerAOdd") or m.get("oddA") or m.get("coteA") or m.get("player_a_odd") or default)
+    if name_match(player_name, b):
+        return str(m.get("playerBOdd") or m.get("oddB") or m.get("coteB") or m.get("player_b_odd") or default)
+    if name_match(player_name, source_a):
+        return str(m.get("oddA") or m.get("coteA") or m.get("playerAOdd") or default)
+    if name_match(player_name, source_b):
+        return str(m.get("oddB") or m.get("coteB") or m.get("playerBOdd") or default)
+    return default
+
+
+def record_daily_analysis(analysis: Dict[str, Any], target_date: Optional[str] = None) -> Dict[str, Any]:
     """
-    Répare le cas Railway : après redéploiement, output/ peut repartir vide.
-    On restaure uniquement les résultats vérifiés, jamais les pending.
+    Enregistre les picks PREMIUM jouables du payload /daily.
+    N'enregistre PAS les veto, PAS les proches, PAS les non-premium.
     """
+    date_iso = normalize_day(target_date or analysis.get("targetDay") or analysis.get("daily", {}).get("targetDay"))
     rows = load_history()
-
-    if rows:
-        return {"restoredVerifiedRows": 0, "reason": "history_not_empty"}
-
-    seeds = []
-    for row in verified_recovery_rows():
-        row_date = str(row.get("date") or "")
-        if is_future_day(row_date):
-            continue
-        seeds.append(row)
-
-    if seeds:
-        save_history(seeds)
-
-    return {"restoredVerifiedRows": len(seeds), "reason": "history_was_empty"}
-
-
-def read_json_file(path: str) -> Dict[str, Any]:
-    p = Path(path)
-    return json.loads(p.read_text(encoding="utf-8"))
-
-
-def read_json_url(url: str, timeout: int = 180) -> Dict[str, Any]:
-    req = Request(
-        url,
-        headers={
-            "User-Agent": "Mozilla/5.0 TennisMotorHistory/1.0",
-            "Accept": "application/json,text/plain,*/*",
-        },
-    )
-    with urlopen(req, timeout=timeout) as resp:
-        raw = resp.read().decode("utf-8", errors="replace")
-    return json.loads(raw)
-
-
-# ---------------------------------------------------------------------------
-# Record Premium picks
-# ---------------------------------------------------------------------------
-
-def infer_target_day(result: Dict[str, Any], fallback: Optional[str] = None) -> str:
-    for key_path in [
-        ("daily", "targetDay"),
-        ("meta", "targetDay"),
-        ("targetDay",),
-    ]:
-        cur: Any = result
-        ok = True
-        for k in key_path:
-            if isinstance(cur, dict) and k in cur:
-                cur = cur[k]
-            else:
-                ok = False
-                break
-        if ok and cur:
-            return str(cur)
-
-    return fallback or today_iso()
-
-
-def cleanup_pending_for_day_against_current_premiums(
-    history: List[Dict[str, Any]],
-    day: str,
-    matches: List[Any],
-) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
-    """
-    Nettoyage anti-pollution historique.
-
-    Cas corrigé :
-    - une extraction précédente a enregistré de faux Premium pending
-      issus de doubles ou de matchs parasites ;
-    - après correction du /daily, on relance l'analyse ;
-    - les pending du même jour qui ne sont plus Premium dans le résultat courant
-      sont supprimés ;
-    - les résultats déjà réglés win/loss ne sont jamais supprimés.
-
-    Important :
-    - ne touche pas au match gagné d'hier ;
-    - ne touche pas aux lignes win/loss ;
-    - ne supprime que les pending du jour ciblé.
-    """
-    current_premium_keys: Set[str] = set()
-
-    for match in matches:
-        if not isinstance(match, dict):
-            continue
-
-        if not is_premium_jouable(match):
-            continue
-
-        predicted = str(match.get("playerA") or match.get("player_a") or "")
-        opponent = str(match.get("playerB") or match.get("player_b") or "")
-        source_a = str(match.get("sourcePlayerA") or predicted)
-        source_b = str(match.get("sourcePlayerB") or opponent)
-
-        if not predicted or not opponent:
-            continue
-
-        current_premium_keys.add(history_match_key(source_a, source_b, predicted))
-
-    cleaned: List[Dict[str, Any]] = []
-    removed: List[str] = []
-
-    for row in history:
-        row_day = str(row.get("date") or "")
-        row_status = str(row.get("status") or "")
-        row_result = str(row.get("result") or "pending")
-
-        if row_day == day and row_status == "PREMIUM" and row_result == "pending":
-            source_a = str(row.get("sourcePlayerA") or "")
-            source_b = str(row.get("sourcePlayerB") or "")
-            predicted = str(row.get("predictedWinner") or "")
-
-            key = history_match_key(source_a, source_b, predicted)
-
-            if key not in current_premium_keys:
-                removed.append(f"{source_a} vs {source_b} | pick={predicted}")
-                continue
-
-        cleaned.append(row)
-
-    return cleaned, {
-        "removedStalePendingRows": len(removed),
-        "currentPremiumRows": len(current_premium_keys),
-        "removedStalePendingSample": removed[:20],
-    }
-
-
-def record_result_json(result: Dict[str, Any], target_day: Optional[str] = None) -> Dict[str, Any]:
-    day = infer_target_day(result, target_day)
-
-    # Règle officielle historique : on ne suit pas les matchs futurs.
-    # Donc /daily?day=tomorrow ne doit jamais remplir premium_history.json.
-    if is_future_day(day):
-        summary = build_summary()
-        SUMMARY_PATH.write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
-        return {
-            "status": "ok",
-            "date": day,
-            "added": 0,
-            "updated": 0,
-            "ignoredFutureDate": True,
-            "message": "Historique ignoré : match futur / demain non enregistré.",
-            "historyPath": str(HISTORY_PATH),
-            "summaryPath": str(SUMMARY_PATH),
-        }
-
-    matches = result.get("matches") if isinstance(result, dict) else None
-
-    if not isinstance(matches, list):
-        return {
-            "status": "error",
-            "message": "JSON sans champ matches[]",
-            "added": 0,
-            "updated": 0,
-        }
-
-    restore_verified_if_history_empty()
-    history, cleanup_info = sanitize_history_rows(load_history())
-
-    # Nettoyage sécurité : supprime les anciens pending du même jour
-    # qui ne sont plus Premium après correction du /daily.
-    history, stale_pending_info = cleanup_pending_for_day_against_current_premiums(history, day, matches)
-    cleanup_info.update(stale_pending_info)
-
-    by_id = {str(row.get("id", "")): row for row in history if row.get("id")}
-    by_unique = {
-        history_match_key(str(row.get("sourcePlayerA") or ""), str(row.get("sourcePlayerB") or ""), str(row.get("predictedWinner") or "")): row
-        for row in history
-        if row.get("sourcePlayerA") and row.get("sourcePlayerB") and row.get("predictedWinner")
-    }
+    existing = {r.get("id"): r for r in rows if r.get("id")}
 
     added = 0
     updated = 0
-    ignored = 0
+    ignored_non_premium = 0
     ignored_duplicates = 0
 
-    for match in matches:
-        if not isinstance(match, dict):
-            ignored += 1
+    matches = analysis.get("matches") if isinstance(analysis, dict) else None
+    if not isinstance(matches, list):
+        matches = []
+
+    for m in matches:
+        if not isinstance(m, dict):
             continue
 
-        if not is_premium_jouable(match):
-            ignored += 1
+        if not _match_decision_is_jouable(m):
+            ignored_non_premium += 1
             continue
 
-        predicted = str(match.get("playerA") or match.get("player_a") or "")
-        opponent = str(match.get("playerB") or match.get("player_b") or "")
-
-        source_a = str(match.get("sourcePlayerA") or predicted)
-        source_b = str(match.get("sourcePlayerB") or opponent)
-
+        predicted, opponent = _predicted_winner_from_match(m)
         if not predicted or not opponent:
-            ignored += 1
+            ignored_non_premium += 1
             continue
 
-        unique_key = history_match_key(source_a, source_b, predicted)
-        existing_same_match = by_unique.get(unique_key)
+        rid = make_pick_id(date_iso, predicted, opponent)
+        premium_pct = round(_as_float(m.get("premiumPct", _as_float(m.get("premium"), 0) * 100), 0), 1)
 
-        if existing_same_match and existing_same_match.get("result") in {"win", "loss"}:
-            # Le même match est déjà réglé : ne jamais recréer un pending.
-            ignored_duplicates += 1
-            continue
+        odd_pred = _odd_for_player(m, predicted)
+        odd_opp = _odd_for_player(m, opponent)
 
-        if existing_same_match:
-            # Même match déjà pending : on met à jour la ligne existante au lieu de créer un doublon.
-            row_id = str(existing_same_match.get("id") or match_id(day, source_a, source_b, predicted))
-            old = existing_same_match
-        else:
-            row_id = match_id(day, source_a, source_b, predicted)
-            old = by_id.get(row_id, {})
-
-        row = {
-            "id": row_id,
-            "date": day,
-            "sourcePlayerA": source_a,
-            "sourcePlayerB": source_b,
+        record = {
+            "id": rid,
+            "date": date_iso,
+            "sourcePlayerA": m.get("sourcePlayerA") or m.get("playerA") or predicted,
+            "sourcePlayerB": m.get("sourcePlayerB") or m.get("playerB") or opponent,
             "predictedWinner": predicted,
             "opponent": opponent,
-            "surface": str(match.get("surface") or ""),
-            "premiumPct": round(premium_pct(match), 3),
+            "surface": m.get("surface", ""),
+            "premiumPct": premium_pct,
             "status": "PREMIUM",
-            "veto": str(match.get("veto") or "non"),
-            "decision": str(match.get("decision") or ""),
-            "oddPredicted": str(match.get("oddA") or match.get("playerAOdd") or match.get("coteA") or ""),
-            "oddOpponent": str(match.get("oddB") or match.get("playerBOdd") or match.get("coteB") or ""),
-            "oddsSource": str(match.get("oddsSource") or ""),
-            "result": old.get("result", "pending"),
-            "realWinner": old.get("realWinner", ""),
-            "settledAt": old.get("settledAt", ""),
+            "veto": m.get("veto", "non"),
+            "decision": m.get("decision", "✅ Jouable"),
+            "oddPredicted": str(odd_pred or ""),
+            "oddOpponent": str(odd_opp or ""),
+            "oddsSource": m.get("oddsSource", ""),
+            "result": "pending",
+            "realWinner": "",
+            "settledAt": "",
+            # champs utiles pour update_2026_history.py
+            "playerAPoints": m.get("playerAPoints", ""),
+            "playerBPoints": m.get("playerBPoints", ""),
+            "playerARank": m.get("playerARank", ""),
+            "playerBRank": m.get("playerBRank", ""),
+            "playerA": m.get("playerA", ""),
+            "playerB": m.get("playerB", ""),
+            "score": "",
+            "settleSource": "",
         }
 
-        if row_id in by_id:
-            # Ne jamais écraser un résultat déjà validé.
-            if by_id[row_id].get("result") in {"win", "loss"}:
-                row["result"] = by_id[row_id].get("result")
-                row["realWinner"] = by_id[row_id].get("realWinner", "")
-                row["settledAt"] = by_id[row_id].get("settledAt", "")
-            by_id[row_id] = row
-            by_unique[unique_key] = row
+        old = existing.get(rid)
+        if old:
+            # Ne pas écraser un résultat déjà réglé.
+            if str(old.get("result", "pending")).lower() in {"win", "loss"}:
+                ignored_duplicates += 1
+                continue
+            old.update({k: v for k, v in record.items() if k not in {"result", "realWinner", "settledAt", "score", "settleSource"}})
             updated += 1
         else:
-            by_id[row_id] = row
-            by_unique[unique_key] = row
+            rows.insert(0, record)
+            existing[rid] = record
             added += 1
 
-    save_history(list(by_id.values()))
-
-    # V5 : après chaque /daily, on tente immédiatement de régler les Premium terminés.
-    # Avant, /daily ajoutait les Premium mais ne faisait pas passer pending -> win/loss.
-    # Maintenant :
-    # - si Flashscore affiche le match terminé, il est réglé ;
-    # - si Flashscore est difficile à parser, le fallback vérifié peut régler les résultats connus ;
-    # - si le match n'est pas encore terminé, il reste pending.
-    auto_settle_info: Dict[str, Any] = {}
-    try:
-        auto_settle_info = settle_flashscore()
-    except Exception as exc:
-        auto_settle_info = {
-            "status": "error",
-            "autoSettleError": f"{type(exc).__name__}: {exc}",
-        }
-
-    summary = build_summary()
-    SUMMARY_PATH.write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
+    cleanup = cleanup_history(rows, save=False)
+    save_history(cleanup["rows"])
+    summary = build_summary(cleanup["rows"])
+    save_json_atomic(SUMMARY_PATH, summary)
 
     return {
         "status": "ok",
-        "date": day,
+        "date": date_iso,
         "added": added,
         "updated": updated,
-        "ignoredNonPremium": ignored,
+        "ignoredNonPremium": ignored_non_premium,
         "ignoredDuplicates": ignored_duplicates,
-        "cleanup": cleanup_info,
-        "autoSettle": auto_settle_info,
+        "cleanup": {k: v for k, v in cleanup.items() if k != "rows"},
         "historyPath": str(HISTORY_PATH),
         "summaryPath": str(SUMMARY_PATH),
     }
 
 
-# ---------------------------------------------------------------------------
-# Manual settle
-# ---------------------------------------------------------------------------
+# -----------------------------
+# SETTLE RESULTATS
+# -----------------------------
 
-def settle_manual(predicted_or_pair: str, winner: str, target_day: Optional[str] = None) -> Dict[str, Any]:
-    """
-    Règle un résultat à la main.
+@dataclass
+class ResultInfo:
+    winner: str
+    loser: str
+    score: str = ""
+    source: str = ""
 
-    Exemple :
-        py premium_history.py settle-manual --pick "Alexander Zverev" --winner "Alexander Zverev"
-    """
-    history = load_history()
-    changed = 0
 
-    for row in history:
-        if target_day and str(row.get("date")) != target_day:
-            continue
-
-        predicted = str(row.get("predictedWinner") or "")
-        source_a = str(row.get("sourcePlayerA") or "")
-        source_b = str(row.get("sourcePlayerB") or "")
-
-        query = predicted_or_pair
-
-        match_pick = same_player(query, predicted)
-        match_pair = same_player(query, source_a) or same_player(query, source_b)
-
-        if not (match_pick or match_pair):
-            continue
-
-        row["realWinner"] = winner
-        row["result"] = "win" if same_player(predicted, winner) else "loss"
-        row["settledAt"] = today_iso()
-        changed += 1
-
-    if changed == 0:
-        # Si Railway a perdu l'historique, autorise la restauration manuelle d'un résultat vérifié.
-        for seed in verified_recovery_rows():
-            seed_date = str(seed.get("date") or "")
-            if target_day and seed_date != target_day:
-                continue
-            if same_player(predicted_or_pair, str(seed.get("predictedWinner") or "")) and same_player(winner, str(seed.get("realWinner") or "")):
-                exists = any(str(r.get("id") or "") == str(seed.get("id") or "") for r in history)
-                if not exists and not is_future_day(seed_date):
-                    history.append(seed)
-                    changed += 1
-                break
-
-    save_history(history)
-    summary = build_summary()
-    SUMMARY_PATH.write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
-
+def _headers() -> Dict[str, str]:
     return {
-        "status": "ok",
-        "changed": changed,
-        "summaryPath": str(SUMMARY_PATH),
+        "User-Agent": USER_AGENT,
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "fr-FR,fr;q=0.9,en;q=0.7",
+        "Cache-Control": "no-cache",
     }
 
 
-
-# ---------------------------------------------------------------------------
-# Flashscore completed results parser
-# ---------------------------------------------------------------------------
-
-def _click_optional(page: Any, labels: List[str], timeout_ms: int = 2500) -> bool:
-    for label in labels:
-        try:
-            loc = page.get_by_text(label, exact=True).first
-            loc.click(timeout=timeout_ms)
-            return True
-        except Exception:
-            pass
-
-        try:
-            loc = page.get_by_text(label, exact=False).first
-            loc.click(timeout=timeout_ms)
-            return True
-        except Exception:
-            pass
-
-    return False
-
-
-def _scroll_until_stable(page: Any, max_rounds: int = 8) -> None:
-    previous = -1
-    stable = 0
-
-    for _ in range(max_rounds):
-        try:
-            current = page.evaluate("() => document.body ? document.body.innerText.length : 0")
-        except Exception:
-            current = previous
-
-        if current == previous:
-            stable += 1
-        else:
-            stable = 0
-
-        if stable >= 2:
-            break
-
-        previous = current
-
-        try:
-            page.mouse.wheel(0, 2200)
-        except Exception:
-            pass
-
-        try:
-            page.wait_for_timeout(900)
-        except Exception:
-            pass
-
-
-def _completed_results_js() -> str:
-    return r"""
-() => {
-    const clean = (s) => (s || '').replace(/\s+/g, ' ').trim();
-
-    const textOne = (root, selectors) => {
-        for (const sel of selectors) {
-            const el = root.querySelector(sel);
-            const t = el ? clean(el.textContent) : '';
-            if (t) return t;
-        }
-        return '';
-    };
-
-    const texts = (root, selectors) => {
-        const out = [];
-        const seen = new Set();
-
-        for (const sel of selectors) {
-            root.querySelectorAll(sel).forEach((el) => {
-                const t = clean(el.textContent);
-                if (t && !seen.has(t)) {
-                    seen.add(t);
-                    out.push(t);
-                }
-            });
-            if (out.length) break;
-        }
-
-        return out;
-    };
-
-    const rows = [];
-    const nodes = Array.from(document.querySelectorAll(
-        '[class*="event__match"], [id^="g_2_"], [id^="g_1_"]'
-    ));
-
-    for (const node of nodes) {
-        const playerA = textOne(node, [
-            '[class*="event__participant--home"]',
-            '[class*="participant__participantNameWrapper"]:nth-of-type(1)',
-            '[class*="participantName"]:nth-of-type(1)'
-        ]);
-
-        const playerB = textOne(node, [
-            '[class*="event__participant--away"]',
-            '[class*="participant__participantNameWrapper"]:nth-of-type(2)',
-            '[class*="participantName"]:nth-of-type(2)'
-        ]);
-
-        const status = textOne(node, [
-            '[class*="event__stage"]',
-            '[class*="event__time"]'
-        ]);
-
-        const homeScores = texts(node, [
-            '[class*="event__score--home"]',
-            '[class*="score--home"]'
-        ]);
-
-        const awayScores = texts(node, [
-            '[class*="event__score--away"]',
-            '[class*="score--away"]'
-        ]);
-
-        const raw = clean(node.innerText || node.textContent || '');
-
-        if (playerA && playerB) {
-            rows.push({
-                playerA,
-                playerB,
-                status,
-                homeScores,
-                awayScores,
-                raw
-            });
-        }
-    }
-
-    return rows;
-}
-"""
-
-
-def _int_list(values: Any) -> List[int]:
-    out: List[int] = []
-
-    if isinstance(values, list):
-        source = values
-    else:
-        source = [values]
-
-    for item in source:
-        text = str(item or "")
-        # Scores entiers seulement. N'attrape pas les cotes 1.20 / 4.50.
-        for m in re.finditer(r"(?<![\d.,])\d{1,2}(?![\d.,])", text):
-            try:
-                out.append(int(m.group(0)))
-            except Exception:
-                pass
-
-    return out
-
-
-def _winner_from_completed_score_row(row: Dict[str, Any]) -> str:
-    a = str(row.get("playerA") or "")
-    b = str(row.get("playerB") or "")
-
-    home_scores = _int_list(row.get("homeScores"))
-    away_scores = _int_list(row.get("awayScores"))
-
-    # Cas normal Flashscore :
-    # homeScores = [0, 1, 4]
-    # awayScores = [2, 6, 6]
-    if home_scores and away_scores and home_scores[0] != away_scores[0]:
-        return a if home_scores[0] > away_scores[0] else b
-
-    # Fallback texte brut :
-    # Blockx A. 0 1 4 Zverev A. 2 6 6
-    raw = str(row.get("raw") or "")
-    if not raw:
+def _http_get(url: str, params: Optional[Dict[str, str]] = None) -> str:
+    if requests is None:
+        return ""
+    try:
+        r = requests.get(url, params=params, headers=_headers(), timeout=REQUEST_TIMEOUT)
+        if r.status_code >= 400:
+            return ""
+        return r.text or ""
+    except Exception:
         return ""
 
-    # On tente d'utiliser les positions des noms dans le brut.
-    raw_norm = norm_name(raw)
-    a_keys = [norm_name(a), norm_name(a).split()[0] if norm_name(a).split() else ""]
-    b_keys = [norm_name(b), norm_name(b).split()[0] if norm_name(b).split() else ""]
 
-    pos_a = min([raw_norm.find(k) for k in a_keys if k and raw_norm.find(k) >= 0] or [-1])
-    pos_b = min([raw_norm.find(k) for k in b_keys if k and raw_norm.find(k) >= 0] or [-1])
-
-    nums = _int_list(raw)
-
-    if len(nums) >= 2:
-        # Dernier recours : dans les lignes terminées tennis, les deux premiers gros marqueurs
-        # sont souvent les sets gagnés joueur A / joueur B.
-        # On l'utilise seulement si le statut indique terminé.
-        status = str(row.get("status") or "").lower()
-        if "termin" in status or "finished" in status or "fini" in status:
-            # Si on n'a que raw, il y a parfois [0,1,4,2,6,6].
-            if len(nums) >= 6 and nums[0] != nums[3]:
-                return a if nums[0] > nums[3] else b
-
-    return ""
+def _text_from_html(raw: str) -> str:
+    if not raw:
+        return ""
+    if BeautifulSoup:
+        try:
+            soup = BeautifulSoup(raw, "html.parser")
+            for tag in soup(["script", "style", "noscript"]):
+                tag.decompose()
+            txt = soup.get_text("\n")
+            txt = html.unescape(txt)
+            return re.sub(r"[ \t\r\f\v]+", " ", txt)
+        except Exception:
+            pass
+    txt = re.sub(r"<[^>]+>", "\n", raw)
+    return html.unescape(re.sub(r"[ \t\r\f\v]+", " ", txt))
 
 
-def fetch_flashscore_completed_results() -> Tuple[List[Dict[str, Any]], str]:
-    """
-    Lit vraiment l'onglet TERMINÉS de Flashscore et récupère les scores.
-
-    Ce n'est pas le parseur des cotes :
-    ici on cherche playerA/playerB + sets gagnés + score final.
-    """
-    audit: List[str] = []
-
-    try:
-        from playwright.sync_api import sync_playwright
-    except Exception as exc:
-        return [], f"playwright_import_error={type(exc).__name__}: {exc}"
-
-    rows: List[Dict[str, Any]] = []
-
-    try:
-        with sync_playwright() as p:
-            browser = p.chromium.launch(
-                headless=True,
-                args=[
-                    "--no-sandbox",
-                    "--disable-dev-shm-usage",
-                    "--disable-blink-features=AutomationControlled",
-                ],
-            )
-
-            context = browser.new_context(
-                locale="fr-FR",
-                timezone_id="Europe/Paris",
-                viewport={"width": 1365, "height": 1800},
-                user_agent=(
-                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                    "AppleWebKit/537.36 (KHTML, like Gecko) "
-                    "Chrome/124.0.0.0 Safari/537.36"
-                ),
-                extra_http_headers={
-                    "Accept-Language": "fr-FR,fr;q=0.9,en;q=0.8",
-                },
-            )
-
-            page = context.new_page()
-            page.goto(FLASHSCORE_TENNIS_URL, wait_until="domcontentloaded", timeout=45000)
-
-            _click_optional(page, ["J'accepte", "Tout refuser", "Accepter", "OK"], timeout_ms=2500)
-
-            try:
-                page.wait_for_load_state("networkidle", timeout=12000)
-            except Exception:
-                pass
-
-            clicked = _click_optional(page, ["TERMINÉS", "Terminé", "Terminés", "Finished"], timeout_ms=4000)
-            audit.append(f"completed_tab_clicked={clicked}")
-
-            try:
-                page.wait_for_timeout(2500)
-            except Exception:
-                pass
-
-            _scroll_until_stable(page, max_rounds=8)
-
-            try:
-                rows = page.evaluate(_completed_results_js())
-                audit.append(f"completed_dom_rows={len(rows)}")
-            except Exception as exc:
-                audit.append(f"completed_dom_extract_error={type(exc).__name__}: {exc}")
-                rows = []
-
-            browser.close()
-
-    except Exception as exc:
-        audit.append(f"completed_flashscore_error={type(exc).__name__}: {exc}")
-
-    clean: List[Dict[str, Any]] = []
+def _extract_links_from_duckduckgo(raw: str) -> List[str]:
+    links: List[str] = []
+    if not raw:
+        return links
+    if BeautifulSoup:
+        soup = BeautifulSoup(raw, "html.parser")
+        for a in soup.find_all("a", href=True):
+            href = a.get("href") or ""
+            if "uddg=" in href:
+                qs = parse_qs(urlparse(href).query)
+                if "uddg" in qs:
+                    links.append(unquote(qs["uddg"][0]))
+            elif href.startswith("http"):
+                links.append(href)
+    else:
+        for m in re.finditer(r'href="([^"]+)"', raw):
+            href = html.unescape(m.group(1))
+            if "uddg=" in href:
+                qs = parse_qs(urlparse(href).query)
+                if "uddg" in qs:
+                    links.append(unquote(qs["uddg"][0]))
+            elif href.startswith("http"):
+                links.append(href)
+    clean = []
     seen = set()
-
-    for row in rows:
-        a = str(row.get("playerA", "")).strip()
-        b = str(row.get("playerB", "")).strip()
-
-        if not a or not b:
+    for u in links:
+        if u in seen:
             continue
-        if "/" in a or "/" in b:
-            continue
-
-        key = (norm_name(a), norm_name(b))
-        if key in seen:
-            continue
-        seen.add(key)
-
-        winner = _winner_from_completed_score_row(row)
-
-        clean.append({
-            "playerA": a,
-            "playerB": b,
-            "status": str(row.get("status") or ""),
-            "homeScores": _int_list(row.get("homeScores")),
-            "awayScores": _int_list(row.get("awayScores")),
-            "winner": winner,
-            "raw": str(row.get("raw") or "")[:350],
-        })
-
-    if clean:
-        audit.append("completed_sample=" + " || ".join(
-            f"{r.get('playerA')} - {r.get('playerB')} scores={r.get('homeScores')}/{r.get('awayScores')} winner={r.get('winner')}"
-            for r in clean[:12]
-        ))
-
-    return clean, " | ".join(audit)
+        seen.add(u)
+        clean.append(u)
+    return clean
 
 
-def _find_winner_in_completed_results(source_a: str, source_b: str, completed_rows: List[Dict[str, Any]]) -> str:
-    for row in completed_rows:
-        fs_a = str(row.get("playerA") or "")
-        fs_b = str(row.get("playerB") or "")
-        winner = str(row.get("winner") or "")
-
-        if not winner:
-            continue
-
-        same_order = same_player(source_a, fs_a) and same_player(source_b, fs_b)
-        reversed_order = same_player(source_a, fs_b) and same_player(source_b, fs_a)
-
-        if not same_order and not reversed_order:
-            continue
-
-        if same_order:
-            return winner
-
-        # Si la ligne Flashscore est inversée, on convertit le gagnant vers les noms source.
-        if same_player(winner, fs_a):
-            return source_b
-        if same_player(winner, fs_b):
-            return source_a
-
-    return ""
-
-
-def _verified_static_winner_fallback(source_a: str, source_b: str, target_date: str) -> str:
+def _parse_flashscore_text_for_pair(text: str, p1: str, p2: str) -> Optional[ResultInfo]:
     """
-    Fallback de sécurité pour un résultat déjà vérifié officiellement.
-    Ne sert que si Flashscore ne se laisse pas parser.
-
-    Important :
-    - Ce fallback ne crée aucun Premium.
-    - Il règle seulement un Premium déjà présent dans l'historique.
-    - Il est volontairement limité aux résultats vérifiés.
+    Flashscore pages/snippets contiennent souvent :
+    Landaluce M. ATP: 94. 1-2. Medvedev D. ATP: 9.
     """
-    verified_by_day: Dict[str, List[Tuple[str, str, str]]] = {
-        "2026-05-10": [
-            ("Alexander Blockx", "Alexander Zverev", "Alexander Zverev"),
-        ],
-        "2026-05-11": [
-            ("Jannik Sinner", "Alexei Popyrin", "Jannik Sinner"),
-            ("Daniil Medvedev", "Pablo Llamas Ruiz", "Daniil Medvedev"),
-            ("Flavio Cobolli", "Thiago Agustin Tirante", "Thiago Agustin Tirante"),
-            ("Frances Tiafoe", "Andrea Pellegrino", "Andrea Pellegrino"),
-            ("Mattia Bellucci", "Martin Landaluce", "Martin Landaluce"),
-            ("Brandon Nakashima", "Nikoloz Basilashvili", "Nikoloz Basilashvili"),
-            ("Andrey Rublev", "Alejandro Davidovich Fokina", "Andrey Rublev"),
-            ("Hamad Medjedovic", "Mariano Navone", "Hamad Medjedovic"),
-        ],
-    }
+    if not text:
+        return None
+    low = normalize_name(text)
+    if not (last_name(p1) in low and last_name(p2) in low):
+        return None
 
-    verified = verified_by_day.get(target_date, [])
+    # Version simple sur texte brut avec ordre des noms + score sets "2-0", "1-2", etc.
+    compact_text = re.sub(r"\s+", " ", text)
+    # On cherche les formes courtes aussi.
+    last1, last2 = last_name(p1), last_name(p2)
+    if not last1 or not last2:
+        return None
 
-    for a, b, winner in verified:
-        same_order = same_player(source_a, a) and same_player(source_b, b)
-        reversed_order = same_player(source_a, b) and same_player(source_b, a)
+    # fenêtre contenant les deux noms et un score sets
+    patterns = [
+        (p1, p2, rf"({re.escape(last1)}[^\.]{{0,80}}?)([0-3])\s*[-:]\s*([0-3])([^\.]{{0,80}}?{re.escape(last2)})"),
+        (p2, p1, rf"({re.escape(last2)}[^\.]{{0,80}}?)([0-3])\s*[-:]\s*([0-3])([^\.]{{0,80}}?{re.escape(last1)})"),
+    ]
 
-        if same_order or reversed_order:
-            return winner
-
-    return ""
-
-
-# ---------------------------------------------------------------------------
-# Optional Flashscore settle by importing app.py helpers
-# ---------------------------------------------------------------------------
-
-def parse_scores_from_flashscore_raw(row: Dict[str, str]) -> Dict[str, Any]:
-    player_a = str(row.get("playerA", ""))
-    player_b = str(row.get("playerB", ""))
-    raw = str(row.get("raw", ""))
-
-    if not player_a or not player_b or not raw:
-        return {}
-
-    parts = [p.strip() for p in re.split(r"\s*\|\s*", raw) if p.strip()]
-    if len(parts) < 4:
-        return {}
-
-    idx_a = -1
-    idx_b = -1
-
-    for i, part in enumerate(parts):
-        if idx_a < 0 and same_player(player_a, part):
-            idx_a = i
-        if idx_b < 0 and same_player(player_b, part):
-            idx_b = i
-
-    if idx_a < 0 or idx_b < 0 or idx_b <= idx_a:
-        return {}
-
-    def collect_ints(start: int, end: int) -> List[int]:
-        nums: List[int] = []
-        for part in parts[start:end]:
-            if re.fullmatch(r"\d+", part):
-                nums.append(int(part))
-        return nums
-
-    a_nums = collect_ints(idx_a + 1, idx_b)
-    b_nums = collect_ints(idx_b + 1, min(len(parts), idx_b + 6))
-
-    if not a_nums or not b_nums:
-        return {}
-
-    # Sur Flashscore, le premier chiffre après le joueur est souvent le nombre de sets gagnés.
-    a_sets = a_nums[0]
-    b_sets = b_nums[0]
-
-    if a_sets == b_sets:
-        return {}
-
-    return {
-        "winner": player_a if a_sets > b_sets else player_b,
-        "scoreA": a_nums,
-        "scoreB": b_nums,
-    }
-
-
-def settle_flashscore() -> Dict[str, Any]:
-    """
-    Met à jour les Premium pending en win/loss.
-
-    Ordre :
-    1) vrai parseur scores Flashscore onglet TERMINÉS ;
-    2) fallback ancien parseur de cotes app.py ;
-    3) fallback statique limité aux résultats vérifiés officiellement.
-    """
-    history = load_history()
-    pending = [row for row in history if row.get("result") == "pending"]
-
-    if not pending:
-        return {"status": "ok", "pendingBefore": 0, "settled": 0, "message": "Aucun Premium en attente."}
-
-    completed_rows: List[Dict[str, Any]] = []
-    completed_audit = ""
-
-    try:
-        completed_rows, completed_audit = fetch_flashscore_completed_results()
-    except Exception as exc:
-        completed_audit = f"completed_parser_error={type(exc).__name__}: {exc}"
-        completed_rows = []
-
-    settled = 0
-
-    for row in history:
-        if row.get("result") != "pending":
+    norm_text = normalize_name(compact_text)
+    for first, second, pat in patterns:
+        m = re.search(pat, norm_text)
+        if not m:
             continue
-
-        source_a = str(row.get("sourcePlayerA") or "")
-        source_b = str(row.get("sourcePlayerB") or "")
-        predicted = str(row.get("predictedWinner") or "")
-        row_date = str(row.get("date") or "")
-
-        real_winner = _find_winner_in_completed_results(source_a, source_b, completed_rows)
-
-        if not real_winner:
-            real_winner = _verified_static_winner_fallback(source_a, source_b, row_date)
-
-        if not real_winner:
-            continue
-
-        row["realWinner"] = real_winner
-        row["result"] = "win" if same_player(predicted, real_winner) else "loss"
-        row["settledAt"] = today_iso()
-        settled += 1
-
-    # Fallback ancien app.py seulement si le nouveau parser n'a rien réglé.
-    app_fallback_info: Dict[str, Any] = {}
-    if settled == 0:
         try:
-            import app  # type: ignore
-
-            flash_rows, flash_audit = app.fetch_flashscore_tennis_odds()
-            app_fallback_settled = 0
-
-            for row in history:
-                if row.get("result") != "pending":
-                    continue
-
-                source_a = str(row.get("sourcePlayerA") or "")
-                source_b = str(row.get("sourcePlayerB") or "")
-                predicted = str(row.get("predictedWinner") or "")
-
-                real_winner = ""
-
-                for fs in flash_rows:
-                    fa = str(fs.get("playerA") or "")
-                    fb = str(fs.get("playerB") or "")
-
-                    same_order = same_player(source_a, fa) and same_player(source_b, fb)
-                    reversed_order = same_player(source_a, fb) and same_player(source_b, fa)
-
-                    if not same_order and not reversed_order:
-                        continue
-
-                    parsed = parse_scores_from_flashscore_raw(fs)
-                    winner = str(parsed.get("winner") or "")
-
-                    if not winner:
-                        continue
-
-                    if same_order:
-                        real_winner = winner
-                    elif same_player(winner, fa):
-                        real_winner = source_b
-                    elif same_player(winner, fb):
-                        real_winner = source_a
-
-                    break
-
-                if not real_winner:
-                    continue
-
-                row["realWinner"] = real_winner
-                row["result"] = "win" if same_player(predicted, real_winner) else "loss"
-                row["settledAt"] = today_iso()
-                settled += 1
-                app_fallback_settled += 1
-
-            app_fallback_info = {
-                "appFallbackStatus": "ok",
-                "appFallbackSettled": app_fallback_settled,
-                "appFlashscoreRows": len(flash_rows),
-                "appFlashscoreAudit": flash_audit[-1200:],
-            }
-
-        except Exception as exc:
-            app_fallback_info = {
-                "appFallbackStatus": "error",
-                "appFallbackError": f"{type(exc).__name__}: {exc}",
-            }
-
-    save_history(history)
-    summary = build_summary()
-    SUMMARY_PATH.write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
-
-    out = {
-        "status": "ok",
-        "pendingBefore": len(pending),
-        "settled": settled,
-        "completedRows": len(completed_rows),
-        "completedAudit": completed_audit[-1600:],
-        "summaryPath": str(SUMMARY_PATH),
-    }
-    out.update(app_fallback_info)
-    return out
-
-
-# ---------------------------------------------------------------------------
-# Stats / chart
-# ---------------------------------------------------------------------------
-
-def stats_for_period(rows: List[Dict[str, Any]], period_days: Optional[int]) -> Dict[str, Any]:
-    today = current_paris_date()
-    selected: List[Dict[str, Any]] = []
-
-    for row in rows:
-        if row.get("status") != "PREMIUM":
-            continue
-
-        try:
-            d = date.fromisoformat(str(row.get("date", "")))
+            s1 = int(m.group(2))
+            s2 = int(m.group(3))
         except Exception:
             continue
+        if s1 == s2:
+            continue
+        winner = first if s1 > s2 else second
+        loser = second if s1 > s2 else first
+        return ResultInfo(winner=winner, loser=loser, score=f"{s1}-{s2}", source="flashscore_text")
 
-        if period_days is not None and d < today - timedelta(days=period_days - 1):
+    # Si le texte contient "X wins the match" ou "bat"
+    ri = _parse_generic_winner_sentence(text, p1, p2)
+    if ri:
+        ri.source = ri.source or "flashscore_text_sentence"
+        return ri
+
+    return None
+
+
+def _parse_generic_winner_sentence(text: str, p1: str, p2: str) -> Optional[ResultInfo]:
+    if not text:
+        return None
+
+    # anglais ATP : "Daniil Medvedev wins the match 1-6 6-4 7-5"
+    for player in (p1, p2):
+        ln = last_name(player)
+        if not ln:
+            continue
+        if re.search(rf"{re.escape(ln)}[^.\n]{{0,120}}\bwins the match\b", text, flags=re.I):
+            loser = p2 if name_match(player, p1) else p1
+            score_match = re.search(r"wins the match\s+([0-9\-\(\) ]{3,40})", text, flags=re.I)
+            return ResultInfo(winner=player, loser=loser, score=(score_match.group(1).strip() if score_match else ""), source="winner_sentence")
+
+    # français : "Medvedev bat Landaluce 1-6, 6-4, 7-5"
+    for player in (p1, p2):
+        ln = last_name(player)
+        if not ln:
+            continue
+        if re.search(rf"{re.escape(ln)}[^.\n]{{0,80}}\b(bat|def|d\.|defeats|defeated)\b", text, flags=re.I):
+            loser = p2 if name_match(player, p1) else p1
+            return ResultInfo(winner=player, loser=loser, source="winner_sentence_fr")
+    return None
+
+
+def resolve_from_duckduckgo_flashscore(record: Dict[str, Any]) -> Optional[ResultInfo]:
+    if not ENABLE_WEB_SETTLE:
+        return None
+    p1 = str(record.get("predictedWinner") or "")
+    p2 = str(record.get("opponent") or "")
+    d = str(record.get("date") or "")
+    if not p1 or not p2 or not d:
+        return None
+
+    queries = [
+        f'site:flashscore.fr/match/tennis "{p1}" "{p2}" "{d}"',
+        f'site:flashscore.fr/match/tennis "{last_name(p1)}" "{last_name(p2)}" tennis {d}',
+        f'"{p1}" "{p2}" tennis score {d}',
+    ]
+    for q in queries:
+        raw = _http_get("https://html.duckduckgo.com/html/", params={"q": q})
+        if not raw:
             continue
 
-        selected.append(row)
+        # Snippet search result can be enough.
+        text = _text_from_html(raw)
+        ri = _parse_flashscore_text_for_pair(text, p1, p2)
+        if ri:
+            ri.source = f"duckduckgo_flashscore_snippet:{q[:80]}"
+            return ri
 
-    settled = [x for x in selected if x.get("result") in {"win", "loss"}]
-    wins = sum(1 for x in settled if x.get("result") == "win")
-    losses = sum(1 for x in settled if x.get("result") == "loss")
-    pending = sum(1 for x in selected if x.get("result") == "pending")
+        links = _extract_links_from_duckduckgo(raw)
+        for link in links[:8]:
+            if "flashscore" not in link and "atptour" not in link and "eurosport" not in link and "reuters" not in link:
+                continue
+            page = _http_get(link)
+            if not page:
+                continue
+            page_text = _text_from_html(page)
+            ri = _parse_flashscore_text_for_pair(page_text, p1, p2) or _parse_generic_winner_sentence(page_text, p1, p2)
+            if ri:
+                ri.source = f"web:{link}"
+                return ri
 
-    total = wins + losses
-    win_rate = round((wins / total) * 100.0, 2) if total else 0.0
+    return None
 
-    profit = 0.0
-    odds_used = 0
 
-    for row in settled:
-        odd = to_float(row.get("oddPredicted"), 0.0)
-        if odd <= 1.0:
+def _parse_atp_archive_page(text: str, p1: str, p2: str) -> Optional[ResultInfo]:
+    if not text:
+        return None
+    if not (last_name(p1) and last_name(p2)):
+        return None
+    if last_name(p1) not in normalize_name(text) or last_name(p2) not in normalize_name(text):
+        return None
+
+    # ATP official page has repeated blocks:
+    # Game Set and Match Jannik Sinner. Jannik Sinner wins the match 6-2 6-4 .
+    # We use a window around both last names to avoid wrong match.
+    raw_lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+    joined = "\n".join(raw_lines)
+
+    # find windows where both names occur
+    lines = raw_lines
+    for i, ln in enumerate(lines):
+        if name_match(ln, p1) or name_match(ln, p2) or last_name(p1) in normalize_name(ln) or last_name(p2) in normalize_name(ln):
+            window = "\n".join(lines[max(0, i - 20): min(len(lines), i + 40)])
+            nwin = normalize_name(window)
+            if last_name(p1) in nwin and last_name(p2) in nwin:
+                ri = _parse_generic_winner_sentence(window, p1, p2)
+                if ri:
+                    ri.source = "atp_archive"
+                    return ri
+
+    # global fallback
+    ri = _parse_generic_winner_sentence(joined, p1, p2)
+    if ri and last_name(p1) in normalize_name(joined) and last_name(p2) in normalize_name(joined):
+        ri.source = "atp_archive_global"
+        return ri
+    return None
+
+
+def resolve_from_atp_archives(record: Dict[str, Any]) -> Optional[ResultInfo]:
+    if not ENABLE_WEB_SETTLE:
+        return None
+    d = parse_date(record.get("date"))
+    if not d:
+        return None
+    p1 = str(record.get("predictedWinner") or "")
+    p2 = str(record.get("opponent") or "")
+    if not p1 or not p2:
+        return None
+    urls = ATP_ARCHIVE_URLS_BY_YEAR.get(d.year, [])
+    for url in urls:
+        raw = _http_get(url)
+        if not raw:
+            continue
+        text = _text_from_html(raw)
+        ri = _parse_atp_archive_page(text, p1, p2)
+        if ri:
+            ri.source = f"atp_archive:{url}"
+            return ri
+    return None
+
+
+def resolve_result(record: Dict[str, Any]) -> Optional[ResultInfo]:
+    """
+    Ordre :
+    1) ATP archive officiel si disponible
+    2) Flashscore / web search direct
+    """
+    cache = load_json(CACHE_PATH, {})
+    cache_key = record.get("id") or pair_key(str(record.get("date", "")), str(record.get("predictedWinner", "")), str(record.get("opponent", "")))
+    if cache_key in cache:
+        c = cache[cache_key]
+        if c.get("winner"):
+            return ResultInfo(winner=c.get("winner", ""), loser=c.get("loser", ""), score=c.get("score", ""), source=c.get("source", "cache"))
+
+    resolvers = [resolve_from_atp_archives, resolve_from_duckduckgo_flashscore]
+    for resolver in resolvers:
+        try:
+            ri = resolver(record)
+            if ri and ri.winner:
+                cache[cache_key] = {"winner": ri.winner, "loser": ri.loser, "score": ri.score, "source": ri.source, "cachedAt": _paris_now().isoformat()}
+                save_json_atomic(CACHE_PATH, cache)
+                return ri
+        except Exception:
+            continue
+    return None
+
+
+def settle_pending(days_back: int = SETTLE_DAYS_BACK_DEFAULT, force: bool = False) -> Dict[str, Any]:
+    rows = load_history()
+    today = _paris_now().date()
+    min_date = today - timedelta(days=max(0, int(days_back)))
+    settled = 0
+    checked = 0
+    pending_before = 0
+    errors: List[str] = []
+    settled_rows: List[Dict[str, Any]] = []
+
+    for r in rows:
+        if str(r.get("result", "pending")).lower() not in {"pending", "", "none", "null"}:
+            continue
+        pending_before += 1
+        rd = parse_date(r.get("date"))
+        if not rd:
+            continue
+        if rd < min_date:
+            continue
+        # Par sécurité, on évite d'insister sur les matchs du futur.
+        if rd > today:
             continue
 
-        odds_used += 1
+        checked += 1
+        ri = resolve_result(r)
+        if not ri:
+            continue
 
-        if row.get("result") == "win":
-            profit += odd - 1.0
-        else:
-            profit -= 1.0
+        predicted = str(r.get("predictedWinner") or "")
+        is_win = name_match(ri.winner, predicted)
+        r["result"] = "win" if is_win else "loss"
+        r["realWinner"] = ri.winner
+        r["settledAt"] = today.isoformat()
+        r["score"] = ri.score or r.get("score", "")
+        r["settleSource"] = ri.source
+        settled += 1
+        settled_rows.append({"id": r.get("id"), "winner": ri.winner, "score": ri.score, "source": ri.source})
 
-    roi = round((profit / odds_used) * 100.0, 2) if odds_used else 0.0
+    cleanup = cleanup_history(rows, save=False)
+    save_history(cleanup["rows"])
+    summary = build_summary(cleanup["rows"])
+    save_json_atomic(SUMMARY_PATH, summary)
 
     return {
-        "trackedPremium": len(selected),
-        "settled": total,
+        "status": "ok",
+        "pendingBefore": pending_before,
+        "checked": checked,
+        "settled": settled,
+        "settledRows": settled_rows,
+        "errors": errors,
+        "summaryPath": str(SUMMARY_PATH),
+        "historyPath": str(HISTORY_PATH),
+    }
+
+
+# -----------------------------
+# CLEANUP / SUMMARY
+# -----------------------------
+
+def cleanup_history(rows: Optional[List[Dict[str, Any]]] = None, save: bool = True) -> Dict[str, Any]:
+    if rows is None:
+        rows = load_history()
+
+    today = _paris_now().date()
+    seen = set()
+    cleaned: List[Dict[str, Any]] = []
+    removed_future = 0
+    removed_duplicate = 0
+
+    for r in rows:
+        if not isinstance(r, dict):
+            continue
+        rd = parse_date(r.get("date"))
+        if rd and rd > today + timedelta(days=1):
+            removed_future += 1
+            continue
+
+        rid = r.get("id") or make_pick_id(str(r.get("date", "")), str(r.get("predictedWinner", "")), str(r.get("opponent", "")))
+        r["id"] = rid
+
+        if rid in seen:
+            removed_duplicate += 1
+            continue
+        seen.add(rid)
+
+        if not r.get("result"):
+            r["result"] = "pending"
+        cleaned.append(r)
+
+    # plus récent en haut
+    cleaned.sort(key=lambda x: (str(x.get("date", "")), str(x.get("id", ""))), reverse=True)
+
+    if save:
+        save_history(cleaned)
+        save_json_atomic(SUMMARY_PATH, build_summary(cleaned))
+
+    return {
+        "removedFutureRows": removed_future,
+        "removedDuplicateRows": removed_duplicate,
+        "keptRows": len(cleaned),
+        "restoredVerifiedRows": 0,
+        "reason": "history_not_empty" if cleaned else "history_empty",
+        "rows": cleaned,
+    }
+
+
+def _odd_value(x: Any) -> float:
+    try:
+        s = str(x or "").replace(",", ".").strip()
+        if not s:
+            return 0.0
+        return float(s)
+    except Exception:
+        return 0.0
+
+
+def _row_profit_units(r: Dict[str, Any]) -> Tuple[float, int]:
+    res = str(r.get("result", "")).lower()
+    odd = _odd_value(r.get("oddPredicted"))
+    if res == "win":
+        return (max(0.0, odd - 1.0) if odd > 1 else 0.0, 1 if odd > 1 else 0)
+    if res == "loss":
+        return (-1.0, 1 if odd > 1 else 0)
+    return (0.0, 0)
+
+
+def _summary_for_rows(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
+    tracked = len(rows)
+    settled_rows = [r for r in rows if str(r.get("result", "")).lower() in {"win", "loss"}]
+    wins = sum(1 for r in settled_rows if str(r.get("result", "")).lower() == "win")
+    losses = sum(1 for r in settled_rows if str(r.get("result", "")).lower() == "loss")
+    pending = sum(1 for r in rows if str(r.get("result", "pending")).lower() not in {"win", "loss"})
+    settled = wins + losses
+    profit_units = 0.0
+    odds_used = 0
+    for r in settled_rows:
+        p, used = _row_profit_units(r)
+        profit_units += p
+        odds_used += used
+    return {
+        "trackedPremium": tracked,
+        "settled": settled,
         "wins": wins,
         "losses": losses,
         "pending": pending,
-        "winRate": win_rate,
-        "profitUnits": round(profit, 3),
-        "roiPct": roi,
+        "winRate": round((wins / settled) * 100, 1) if settled else 0.0,
+        "profitUnits": round(profit_units, 2),
+        "roiPct": round((profit_units / odds_used) * 100, 1) if odds_used else 0.0,
         "oddsUsed": odds_used,
     }
 
 
-def build_summary(write_cleaned: bool = True) -> Dict[str, Any]:
-    recovery_info = restore_verified_if_history_empty()
-    rows_raw = load_history()
-    rows, cleanup_info = sanitize_history_rows(rows_raw)
-    cleanup_info.update(recovery_info)
-
-    if write_cleaned and cleanup_info.get("removedFutureRows", 0) + cleanup_info.get("removedDuplicateRows", 0) > 0:
-        save_history(rows)
-
-    by_day: Dict[str, Dict[str, Any]] = {}
-
-    for row in rows:
-        if row.get("status") != "PREMIUM":
-            continue
-
-        d = str(row.get("date") or "")
-        if not d:
-            continue
-
-        bucket = by_day.setdefault(
-            d,
-            {
-                "date": d,
-                "wins": 0,
-                "losses": 0,
-                "pending": 0,
-                "winRate": 0.0,
-                "profitUnits": 0.0,
-                "profitEur": 0.0,
-                "hadPremiumToday": False,
-                "hadPremiumSettledToday": False,
-            },
-        )
-        bucket["hadPremiumToday"] = True
-
-        odd = to_float(row.get("oddPredicted"), 0.0)
-        result = row.get("result")
-
-        if result == "win":
-            bucket["wins"] += 1
-            bucket["hadPremiumSettledToday"] = True
-            if odd > 1.0:
-                bucket["profitUnits"] += odd - 1.0
-                bucket["profitEur"] += STAKE_EUR * (odd - 1.0)
-        elif result == "loss":
-            bucket["losses"] += 1
-            bucket["hadPremiumSettledToday"] = True
-            if odd > 1.0:
-                bucket["profitUnits"] -= 1.0
-            bucket["profitEur"] -= STAKE_EUR
-        else:
-            bucket["pending"] += 1
+def build_chart(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
+    today = _paris_now().date()
+    dates = [parse_date(r.get("date")) for r in rows if parse_date(r.get("date"))]
+    if dates:
+        start = min(min(dates), today - timedelta(days=5))
+    else:
+        start = today - timedelta(days=5)
+    if (today - start).days < 5:
+        start = today - timedelta(days=5)
 
     days = []
-    for bucket in by_day.values():
-        settled = bucket["wins"] + bucket["losses"]
-        bucket["winRate"] = round((bucket["wins"] / settled) * 100.0, 2) if settled else 0.0
-        bucket["profitUnits"] = round(bucket["profitUnits"], 3)
-        bucket["profitEur"] = round(bucket["profitEur"], 2)
-        days.append(bucket)
+    cumulative = []
+    cum_wins = cum_losses = cum_settled = 0
+    cum_profit = 0.0
 
-    days.sort(key=lambda x: x["date"])
+    d = start
+    while d <= today:
+        iso = d.isoformat()
+        day_rows = [r for r in rows if str(r.get("date")) == iso]
+        day_settled = [r for r in day_rows if str(r.get("result", "")).lower() in {"win", "loss"}]
+        wins = sum(1 for r in day_settled if str(r.get("result", "")).lower() == "win")
+        losses = sum(1 for r in day_settled if str(r.get("result", "")).lower() == "loss")
+        pending = sum(1 for r in day_rows if str(r.get("result", "pending")).lower() not in {"win", "loss"})
+        profit = sum(_row_profit_units(r)[0] for r in day_settled)
+        settled = wins + losses
+        day_win_rate = round((wins / settled) * 100, 1) if settled else 0.0
 
-    # V3 graphique calendrier :
-    # On ajoute aussi les jours sans Premium entre le premier jour suivi et aujourd'hui.
-    # Ces jours gardent les valeurs cumulées, mais hadPremiumSettledToday=false.
-    # Unity pourra donc dessiner ces segments en gris.
-    if days:
-        existing_by_date = {str(d.get("date", "")): d for d in days}
-        start_day = parse_iso_date(str(days[0].get("date", "")))
-        end_day = current_paris_date()
-
-        if start_day and start_day <= end_day:
-            full_days = []
-            cursor = start_day
-            while cursor <= end_day:
-                key = cursor.isoformat()
-                if key in existing_by_date:
-                    full_days.append(existing_by_date[key])
-                else:
-                    full_days.append({
-                        "date": key,
-                        "wins": 0,
-                        "losses": 0,
-                        "pending": 0,
-                        "winRate": 0.0,
-                        "profitUnits": 0.0,
-                        "profitEur": 0.0,
-                        "hadPremiumToday": False,
-                        "hadPremiumSettledToday": False,
-                    })
-                cursor += timedelta(days=1)
-            days = full_days
-
-    cumulative_days: List[Dict[str, Any]] = []
-    cumulative_wins = 0
-    cumulative_losses = 0
-    cumulative_profit = 0.0
-    cumulative_profit_eur = 0.0
-
-    for bucket in days:
-        cumulative_wins += int(bucket.get("wins", 0))
-        cumulative_losses += int(bucket.get("losses", 0))
-        cumulative_profit += float(bucket.get("profitUnits", 0.0) or 0.0)
-        cumulative_profit_eur += float(bucket.get("profitEur", 0.0) or 0.0)
-
-        settled = cumulative_wins + cumulative_losses
-        cumulative_win_rate = round((cumulative_wins / settled) * 100.0, 2) if settled else 0.0
-
-        cumulative_days.append({
-            "date": bucket["date"],
-            "cumulativeWins": cumulative_wins,
-            "cumulativeLosses": cumulative_losses,
-            "cumulativeSettled": settled,
-            "cumulativeWinRate": cumulative_win_rate,
-            "cumulativeProfitUnits": round(cumulative_profit, 3),
-            "cumulativeProfitEur": round(cumulative_profit_eur, 2),
-            "pendingThatDay": int(bucket.get("pending", 0)),
-            "hadPremiumToday": bool(bucket.get("hadPremiumToday", False)),
-            "hadPremiumSettledToday": bool(bucket.get("hadPremiumSettledToday", False)),
+        days.append({
+            "date": iso,
+            "wins": wins,
+            "losses": losses,
+            "pending": pending,
+            "winRate": day_win_rate,
+            "profitUnits": round(profit, 2),
+            "profitEur": round(profit * STAKE_EUR, 2),
+            "hadPremiumToday": bool(day_rows),
+            "hadPremiumSettledToday": bool(day_settled),
         })
+
+        cum_wins += wins
+        cum_losses += losses
+        cum_settled += settled
+        cum_profit += profit
+        cumulative.append({
+            "date": iso,
+            "cumulativeWins": cum_wins,
+            "cumulativeLosses": cum_losses,
+            "cumulativeSettled": cum_settled,
+            "cumulativeWinRate": round((cum_wins / cum_settled) * 100, 1) if cum_settled else 0.0,
+            "cumulativeProfitUnits": round(cum_profit, 2),
+            "cumulativeProfitEur": round(cum_profit * STAKE_EUR, 2),
+            "pendingThatDay": pending,
+            "hadPremiumToday": bool(day_rows),
+            "hadPremiumSettledToday": bool(day_settled),
+        })
+        d += timedelta(days=1)
+
+    return {
+        "days": days,
+        "cumulativeDays": cumulative,
+        "description": "days = jour par jour ; cumulativeDays = courbe cumulée qui ne repart jamais à zéro.",
+        "stakeEur": STAKE_EUR,
+        "euroAxisMin": -2000.0,
+        "euroAxisMax": 2000.0,
+        "winRateAxisMin": 0.0,
+        "winRateAxisMax": 100.0,
+    }
+
+
+def build_summary(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
+    today = _paris_now().date()
+    week_start = today - timedelta(days=6)
+    month_start = today - timedelta(days=29)
+    year_start = date(today.year, 1, 1)
+
+    def in_range(r: Dict[str, Any], start: date, end: date) -> bool:
+        rd = parse_date(r.get("date"))
+        return bool(rd and start <= rd <= end)
+
+    day_rows = [r for r in rows if str(r.get("date")) == today.isoformat()]
+    week_rows = [r for r in rows if in_range(r, week_start, today)]
+    month_rows = [r for r in rows if in_range(r, month_start, today)]
+    year_rows = [r for r in rows if in_range(r, year_start, today)]
+
+    return {
+        "day": _summary_for_rows(day_rows),
+        "week": _summary_for_rows(week_rows),
+        "month": _summary_for_rows(month_rows),
+        "year": _summary_for_rows(year_rows),
+        "all": _summary_for_rows(rows),
+    }
+
+
+def get_history_payload(settle: bool = False) -> Dict[str, Any]:
+    if settle:
+        settle_info = settle_pending()
+    else:
+        settle_info = None
+
+    rows = load_history()
+    cleanup = cleanup_history(rows, save=True)
+    rows = cleanup["rows"]
+    summary = build_summary(rows)
+    chart = build_chart(rows)
+    save_json_atomic(SUMMARY_PATH, summary)
+
+    storage = {
+        "outputDir": str(OUTPUT_DIR),
+        "historyDirEnv": os.getenv("HISTORY_DIR", ""),
+        "railwayVolumeMountPath": os.getenv("RAILWAY_VOLUME_MOUNT_PATH", str(OUTPUT_DIR)),
+        "persistentVolumeDetected": OUTPUT_DIR.exists(),
+    }
 
     return {
         "status": "ok",
         "historyPath": str(HISTORY_PATH),
         "summaryPath": str(SUMMARY_PATH),
-        "storage": {
-            "outputDir": str(OUTPUT_DIR),
-            "historyDirEnv": os.getenv("HISTORY_DIR", ""),
-            "railwayVolumeMountPath": os.getenv("RAILWAY_VOLUME_MOUNT_PATH", ""),
-            "persistentVolumeDetected": bool(os.getenv("RAILWAY_VOLUME_MOUNT_PATH", "")),
-        },
-        "cleanup": cleanup_info,
-        "summary": {
-            "day": stats_for_period(rows, 1),
-            "week": stats_for_period(rows, 7),
-            "month": stats_for_period(rows, 30),
-            "year": stats_for_period(rows, 365),
-            "all": stats_for_period(rows, None),
-        },
-        "chart": {
-            "days": days,
-            "cumulativeDays": cumulative_days,
-            "description": "days = jour par jour ; cumulativeDays = courbe cumulée qui ne repart jamais à zéro.",
-            "stakeEur": STAKE_EUR,
-            "euroAxisMin": EURO_AXIS_MIN,
-            "euroAxisMax": EURO_AXIS_MAX,
-            "winRateAxisMin": 0.0,
-            "winRateAxisMax": 100.0,
-        },
+        "storage": storage,
+        "cleanup": {k: v for k, v in cleanup.items() if k != "rows"},
+        "settle": settle_info,
+        "summary": summary,
+        "chart": chart,
         "rows": rows,
     }
 
 
-def reset_history(confirm: str) -> Dict[str, Any]:
-    if confirm != "YES":
-        return {
-            "status": "refused",
-            "message": "Pour confirmer : py premium_history.py reset --confirm YES",
-        }
+def history_refresh() -> Dict[str, Any]:
+    settle_info = settle_pending(force=True)
+    payload = get_history_payload(settle=False)
+    payload["settle"] = settle_info
+    return payload
 
+
+def reset_history(confirm: str = "") -> Dict[str, Any]:
+    if confirm != "RESET":
+        return {"status": "refused", "message": "Ajoute ?confirm=RESET pour vider l'historique."}
     save_history([])
-    SUMMARY_PATH.write_text(json.dumps(build_summary(), ensure_ascii=False, indent=2), encoding="utf-8")
-    return {"status": "ok", "message": "Historique effacé."}
-
-
-# ---------------------------------------------------------------------------
-# CLI
-# ---------------------------------------------------------------------------
-
-def main() -> int:
-    parser = argparse.ArgumentParser(description="Historique Premium Tennis Motor")
-    sub = parser.add_subparsers(dest="cmd", required=True)
-
-    p = sub.add_parser("record-json", help="Enregistre les Premium depuis un result_YYYY-MM-DD.json")
-    p.add_argument("path")
-    p.add_argument("--date", default="")
-
-    p = sub.add_parser("record-url", help="Appelle une URL /daily?day=... puis enregistre les Premium")
-    p.add_argument("url")
-    p.add_argument("--date", default="")
-
-    p = sub.add_parser("settle-flashscore", help="Met à jour les pending via Flashscore/app.py")
-    p = sub.add_parser("stats", help="Écrit et affiche premium_history_summary.json")
-
-    p = sub.add_parser("settle-manual", help="Valide un résultat à la main")
-    p.add_argument("--pick", required=True, help="Nom du joueur prédit ou un joueur de la paire")
-    p.add_argument("--winner", required=True, help="Vrai gagnant")
-    p.add_argument("--date", default="")
-
-    p = sub.add_parser("reset", help="Efface l'historique")
-    p.add_argument("--confirm", default="")
-
-    args = parser.parse_args()
-
-    if args.cmd == "record-json":
-        result = read_json_file(args.path)
-        out = record_result_json(result, args.date or None)
-
-    elif args.cmd == "record-url":
-        result = read_json_url(args.url)
-        out = record_result_json(result, args.date or None)
-
-    elif args.cmd == "settle-flashscore":
-        out = settle_flashscore()
-
-    elif args.cmd == "settle-manual":
-        out = settle_manual(args.pick, args.winner, args.date or None)
-
-    elif args.cmd == "stats":
-        out = build_summary()
-        OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-        SUMMARY_PATH.write_text(json.dumps(out, ensure_ascii=False, indent=2), encoding="utf-8")
-
-    elif args.cmd == "reset":
-        out = reset_history(args.confirm)
-
-    else:
-        out = {"status": "error", "message": "Commande inconnue."}
-
-    print(json.dumps(out, ensure_ascii=False, indent=2))
-    return 0
+    save_json_atomic(SUMMARY_PATH, build_summary([]))
+    return {"status": "ok", "message": "Historique premium vidé.", "historyPath": str(HISTORY_PATH)}
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    info = history_refresh()
+    print(json.dumps(info, ensure_ascii=False, indent=2))
