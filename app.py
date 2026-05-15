@@ -115,9 +115,9 @@ def run_update_2026_history_if_needed(force: bool = False) -> Dict[str, Any]:
     Lance update_2026_history.py automatiquement avant une analyse.
 
     Règles :
-    - une seule mise à jour réussie par jour ;
-    - si la mise à jour échoue, on réessaiera au prochain lancement ;
-    - ne met jamais les matchs du jour non terminés dans l'Elo ;
+    - lancement à chaque analyse, sans blocage already_done_today ;
+    - le script update_2026_history.py est idempotent et ignore les doublons ;
+    - ne met jamais les matchs futurs / non terminés dans l'Elo ;
     - après une réussite, le cache moteur est vidé pour recharger data/2026.csv.
     """
     enabled = _bool_env("AUTO_UPDATE_2026_HISTORY", True)
@@ -145,23 +145,6 @@ def run_update_2026_history_if_needed(force: bool = False) -> Dict[str, Any]:
             "script": str(UPDATE_2026_SCRIPT),
             "message": "update_2026_history.py introuvable dans le dossier backend.",
         }
-
-    if not force and UPDATE_2026_MARKER.exists():
-        try:
-            marker = json.loads(UPDATE_2026_MARKER.read_text(encoding="utf-8"))
-            if marker.get("date") == today and marker.get("ok") is True:
-                return {
-                    "enabled": True,
-                    "ran": False,
-                    "ok": True,
-                    "status": "already_done_today",
-                    "date": today,
-                    "script": UPDATE_2026_SCRIPT.name,
-                    "last_run": marker,
-                }
-        except Exception:
-            # Marqueur illisible : on relance proprement.
-            pass
 
     if not _UPDATE_2026_LOCK.acquire(blocking=False):
         return {
@@ -199,22 +182,6 @@ def run_update_2026_history_if_needed(force: bool = False) -> Dict[str, Any]:
         if ok:
             reset_info = _reset_motor_state_cache()
             result["motorReload"] = reset_info
-
-            UPDATE_2026_MARKER.write_text(
-                json.dumps(
-                    {
-                        "date": today,
-                        "ok": True,
-                        "script": UPDATE_2026_SCRIPT.name,
-                        "ranAtParis": _paris_now_iso(),
-                        "returncode": completed.returncode,
-                        "motorReload": reset_info,
-                    },
-                    ensure_ascii=False,
-                    indent=2,
-                ),
-                encoding="utf-8",
-            )
 
         return result
 
