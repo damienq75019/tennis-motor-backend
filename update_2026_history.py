@@ -49,6 +49,8 @@ OUTPUT_DIR = BASE_DIR / "output"
 
 HISTORY_PATH = DATA_DIR / "2026.csv"
 AUDIT_PATH = OUTPUT_DIR / "update_2026_history_audit.json"
+PREMIUM_HISTORY_PATH = OUTPUT_DIR / "premium_history.json"
+PREMIUM_HISTORY_SUMMARY_PATH = OUTPUT_DIR / "premium_history_summary.json"
 
 FLASH_URL_FR = "https://www.flashscore.fr/tennis/"
 FLASH_URL_COM = "https://www.flashscore.com/tennis/"
@@ -1042,6 +1044,279 @@ def write_history(fieldnames: List[str], rows: List[Dict[str, Any]]) -> None:
             writer.writerow({key: row.get(key, "") for key in fieldnames})
 
 
+
+# ---------------------------------------------------------------------------
+# Historique premiums Unity : settlement pending -> win/loss
+# ---------------------------------------------------------------------------
+
+def _parse_iso_date(value: Any) -> Optional[date]:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        return date.fromisoformat(text[:10])
+    except Exception:
+        return None
+
+
+def _is_pending_value(value: Any) -> bool:
+    return str(value or "").strip().lower() in {"", "pending", "open", "en attente"}
+
+
+def _premium_row_players(row: Dict[str, Any]) -> Tuple[str, str, str]:
+    source_a = str(get_first(row, ["sourcePlayerA", "playerA", "source_player_a"], "") or "").strip()
+    source_b = str(get_first(row, ["sourcePlayerB", "opponent", "playerB", "source_player_b"], "") or "").strip()
+    predicted = str(get_first(row, ["predictedWinner", "pick", "winner", "playerA"], "") or "").strip()
+    if predicted and source_b and not source_a:
+        source_a = predicted
+    return source_a, source_b, predicted
+
+
+def _find_completed_for_history_row(row: Dict[str, Any], completed_rows: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    source_a, source_b, predicted = _premium_row_players(row)
+    if source_a and source_b:
+        found = find_completed_for_payload(source_a, source_b, completed_rows)
+        if found:
+            return found
+    opponent = str(get_first(row, ["opponent", "sourcePlayerB", "playerB"], "") or "").strip()
+    if predicted and opponent:
+        found = find_completed_for_payload(predicted, opponent, completed_rows)
+        if found:
+            return found
+    return None
+
+
+def _rebuild_premium_summary(history: Dict[str, Any], rows: List[Dict[str, Any]]) -> Dict[str, Any]:
+    out = dict(history) if isinstance(history, dict) else {}
+    out["rows"] = rows
+
+    settled_rows = [r for r in rows if str(r.get("result", "")).lower() in {"win", "loss"}]
+    wins = sum(1 for r in settled_rows if str(r.get("result", "")).lower() == "win")
+    losses = sum(1 for r in settled_rows if str(r.get("result", "")).lower() == "loss")
+    pending = sum(1 for r in rows if _is_pending_value(r.get("result")))
+
+    summary = dict(out.get("summary") or {}) if isinstance(out.get("summary"), dict) else {}
+    stake_eur = safe_int(summary.get("stakeEur", 100), 100)
+
+    by_day: Dict[str, Dict[str, Any]] = {}
+    total_profit_units = 0.0
+
+    for r in rows:
+        d = str(r.get("date") or "")[:10]
+        if not d:
+            continue
+
+        bucket = by_day.setdefault(d, {
+            "date": d,
+            "wins": 0,
+            "losses": 0,
+            "settled": 0,
+            "pending": 0,
+            "profitUnits": 0.0,
+            "profitEur": 0.0,
+            "winRate": 0.0,
+            "hadPremiumToday": True,
+            "hadPremiumSettledToday": False,
+        })
+
+        res = str(r.get("result") or "").lower()
+        if res == "win":
+            bucket["wins"] += 1
+            bucket["settled"] += 1
+            bucket["hadPremiumSettledToday"] = True
+            odd = str(get_first(r, ["oddPredicted", "playerAOdd", "oddA", "coteA"], "") or "").replace(",", ".")
+            try:
+                profit = max(float(odd) - 1.0, 0.0)
+            except Exception:
+                profit = 0.0
+            bucket["profitUnits"] += profit
+            total_profit_units += profit
+        elif res == "loss":
+            bucket["losses"] += 1
+            bucket["settled"] += 1
+            bucket["hadPremiumSettledToday"] = True
+            bucket["profitUnits"] -= 1.0
+            total_profit_units -= 1.0
+        else:
+            bucket["pending"] += 1
+
+    days: List[Dict[str, Any]] = []
+    cumulative_days: List[Dict[str, Any]] = []
+    cum_wins = 0
+    cum_losses = 0
+    cum_profit = 0.0
+
+    for d in sorted(by_day.keys()):
+        b = by_day[d]
+        b["profitUnits"] = round(float(b["profitUnits"]), 4)
+        b["profitEur"] = round(float(b["profitUnits"]) * stake_eur, 2)
+        b["winRate"] = round((b["wins"] / b["settled"] * 100.0), 2) if b["settled"] else 0.0
+        days.append(b)
+
+        cum_wins += int(b["wins"])
+        cum_losses += int(b["losses"])
+        cum_profit += float(b["profitUnits"])
+        cum_settled = cum_wins + cum_losses
+        cumulative_days.append({
+            "date": d,
+            "cumulativeWins": cum_wins,
+            "cumulativeLosses": cum_losses,
+            "cumulativeSettled": cum_settled,
+            "cumulativeWinRate": round((cum_wins / cum_settled * 100.0), 2) if cum_settled else 0.0,
+            "cumulativeProfitUnits": round(cum_profit, 4),
+            "cumulativeProfitEur": round(cum_profit * stake_eur, 2),
+            "pendingThatDay": int(b["pending"]),
+            "hadPremiumToday": bool(b["hadPremiumToday"]),
+            "hadPremiumSettledToday": bool(b["hadPremiumSettledToday"]),
+        })
+
+    settled_count = wins + losses
+    summary.update({
+        "total": len(rows),
+        "wins": wins,
+        "losses": losses,
+        "settled": settled_count,
+        "pending": pending,
+        "winRate": round((wins / settled_count * 100.0), 2) if settled_count else 0.0,
+        "profitUnits": round(total_profit_units, 4),
+        "profitEur": round(total_profit_units * stake_eur, 2),
+        "days": days,
+        "cumulativeDays": cumulative_days,
+        "description": "days = jour par jour ; cumulativeDays = courbe cumulée qui ne repart jamais à zéro.",
+        "stakeEur": stake_eur,
+        "euroAxisMin": summary.get("euroAxisMin", -2000.0),
+        "euroAxisMax": summary.get("euroAxisMax", 2000.0),
+        "winRateAxisMin": summary.get("winRateAxisMin", 0.0),
+        "winRateAxisMax": summary.get("winRateAxisMax", 100.0),
+    })
+    out["summary"] = summary
+    return out
+
+
+def premium_pending_dates(max_day: date, audit: List[str], lookback_days: int = 14) -> List[date]:
+    if not PREMIUM_HISTORY_PATH.exists():
+        audit.append(f"premium_history_missing={PREMIUM_HISTORY_PATH}")
+        return []
+
+    try:
+        history = json.loads(PREMIUM_HISTORY_PATH.read_text(encoding="utf-8"))
+    except Exception as exc:
+        audit.append(f"premium_history_read_error={type(exc).__name__}: {exc}")
+        return []
+
+    rows = history.get("rows") if isinstance(history, dict) else []
+    if not isinstance(rows, list):
+        audit.append("premium_history_rows_invalid")
+        return []
+
+    min_day = max_day - timedelta(days=lookback_days)
+    dates = set()
+
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        if not _is_pending_value(row.get("result")):
+            continue
+        d = _parse_iso_date(row.get("date"))
+        if d and min_day <= d <= max_day:
+            dates.add(d)
+
+    out = sorted(dates)
+    audit.append("premium_pending_dates=" + ",".join(x.isoformat() for x in out))
+    return out
+
+
+def settle_premium_history(completed_by_day: Dict[str, List[Dict[str, Any]]], audit: List[str]) -> Dict[str, Any]:
+    if not PREMIUM_HISTORY_PATH.exists():
+        return {"status": "missing", "path": str(PREMIUM_HISTORY_PATH), "settled": 0}
+
+    try:
+        history = json.loads(PREMIUM_HISTORY_PATH.read_text(encoding="utf-8"))
+    except Exception as exc:
+        audit.append(f"premium_history_settle_read_error={type(exc).__name__}: {exc}")
+        return {"status": "read_error", "error": f"{type(exc).__name__}: {exc}", "settled": 0}
+
+    if not isinstance(history, dict):
+        return {"status": "invalid_json_root", "settled": 0}
+
+    rows = history.get("rows")
+    if not isinstance(rows, list):
+        return {"status": "missing_rows", "settled": 0}
+
+    settled = 0
+    checked = 0
+    samples: List[str] = []
+
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        if not _is_pending_value(row.get("result")):
+            continue
+
+        d = _parse_iso_date(row.get("date"))
+        if not d:
+            continue
+
+        day_key = d.isoformat()
+        completed_rows = completed_by_day.get(day_key) or []
+        if not completed_rows:
+            continue
+
+        checked += 1
+        found = _find_completed_for_history_row(row, completed_rows)
+        if not found:
+            continue
+
+        real_winner = str(found.get("winner") or "").strip()
+        if not real_winner:
+            continue
+
+        predicted = str(get_first(row, ["predictedWinner", "pick", "playerA"], "") or "").strip()
+        if not predicted:
+            continue
+
+        row["result"] = "win" if same_player(real_winner, predicted) else "loss"
+        row["realWinner"] = real_winner
+        row["settledAt"] = day_key
+        row["settledSource"] = "Flashscore"
+        row["settledScore"] = str(found.get("score") or "")
+        settled += 1
+
+        if len(samples) < 10:
+            samples.append(f"{day_key}: predicted={predicted} realWinner={real_winner} result={row['result']}")
+
+    if settled:
+        backup = PREMIUM_HISTORY_PATH.with_name(
+            f"premium_history_backup_before_settle_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+        )
+        try:
+            shutil.copyfile(PREMIUM_HISTORY_PATH, backup)
+        except Exception as exc:
+            audit.append(f"premium_history_backup_error={type(exc).__name__}: {exc}")
+
+        rebuilt = _rebuild_premium_summary(history, rows)
+        PREMIUM_HISTORY_PATH.write_text(json.dumps(rebuilt, ensure_ascii=False, indent=2), encoding="utf-8")
+        PREMIUM_HISTORY_SUMMARY_PATH.write_text(json.dumps(rebuilt.get("summary", {}), ensure_ascii=False, indent=2), encoding="utf-8")
+        audit.append(f"premium_history_settled={settled}")
+        return {
+            "status": "ok",
+            "path": str(PREMIUM_HISTORY_PATH),
+            "summaryPath": str(PREMIUM_HISTORY_SUMMARY_PATH),
+            "settled": settled,
+            "checkedPendingRows": checked,
+            "sample": samples,
+            "backupPath": str(backup),
+        }
+
+    return {
+        "status": "ok",
+        "path": str(PREMIUM_HISTORY_PATH),
+        "settled": 0,
+        "checkedPendingRows": checked,
+        "sample": samples,
+    }
+
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -1076,26 +1351,46 @@ def main() -> int:
         print(f"audit={AUDIT_PATH}")
         return 0
 
+    completed_by_day: Dict[str, List[Dict[str, Any]]] = {}
+
     try:
         completed_rows = fetch_flashscore_completed_results(target_day, audit)
     except Exception as exc:
         completed_rows = []
         audit.append(f"flashscore_global_error={type(exc).__name__}: {exc}")
 
+    completed_by_day[target_day.isoformat()] = completed_rows
+
+    # L'historique Unity peut avoir des premiums pending depuis 1 à 14 jours.
+    # On corrige seulement premium_history.json, sans toucher au daily 10k.
+    for pending_day in premium_pending_dates(target_day, audit, lookback_days=14):
+        day_key = pending_day.isoformat()
+        if day_key in completed_by_day:
+            continue
+        try:
+            completed_by_day[day_key] = fetch_flashscore_completed_results(pending_day, audit)
+        except Exception as exc:
+            completed_by_day[day_key] = []
+            audit.append(f"flashscore_pending_day_error date={day_key} error={type(exc).__name__}: {exc}")
+
+    premium_settlement = settle_premium_history(completed_by_day, audit)
+
     if not completed_rows:
         result = {
             "status": "ok",
             "targetDay": target_day.isoformat(),
-            "message": "Flashscore n'a donné aucun match terminé exploitable. Rien ajouté à 2026.csv.",
+            "message": "Flashscore n'a donné aucun match terminé exploitable pour 2026.csv. Historique premium traité séparément.",
             "payloadRows": len(payload_matches),
             "completedRows": 0,
             "addedRows": 0,
+            "premiumSettlement": premium_settlement,
             "audit": audit,
         }
         AUDIT_PATH.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
-        print("✅ update_2026_history terminé sans ajout")
-        print("reason=no_completed_flashscore_rows")
+        print("✅ update_2026_history terminé sans ajout CSV")
+        print("reason=no_completed_flashscore_rows_for_target_day")
         print(f"payload_rows={len(payload_matches)}")
+        print(f"premium_history_settled={premium_settlement.get('settled', 0)}")
         print(f"audit={AUDIT_PATH}")
         return 0
 
@@ -1161,6 +1456,7 @@ def main() -> int:
         "completedRows": len(completed_rows),
         "existingRowsBefore": len(existing_rows),
         "addedRows": len(added_rows),
+        "premiumSettlement": premium_settlement,
         "skippedNotFoundOnFlashscore": skipped_not_found,
         "skippedNotFinished": skipped_not_finished,
         "skippedDuplicate": skipped_duplicate,
@@ -1190,6 +1486,7 @@ def main() -> int:
     print(f"payload_rows={len(payload_matches)}")
     print(f"flashscore_completed_rows={len(completed_rows)}")
     print(f"added_rows={len(added_rows)}")
+    print(f"premium_history_settled={premium_settlement.get('settled', 0)}")
     print(f"skipped_not_found={skipped_not_found}")
     print(f"skipped_duplicate={skipped_duplicate}")
     print(f"audit={AUDIT_PATH}")
