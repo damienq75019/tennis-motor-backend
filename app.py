@@ -203,7 +203,19 @@ def run_update_2026_history_if_needed(force: bool = False) -> Dict[str, Any]:
             "message": "update_2026_history.py introuvable dans le dossier backend.",
         }
 
-    if not force and UPDATE_2026_MARKER.exists():
+    # FIX 2026 / PREMIUM HISTORY
+    # Ancien bug : si update_2026_last_run.json existait déjà pour aujourd'hui,
+    # Railway retournait "already_done_today" et ne relançait pas update_2026_history.py.
+    # Résultat : les anciens premiums restaient pending et les dates précédentes
+    # n'étaient pas recheckées.
+    #
+    # Nouvelle règle : chaque appel /daily relance update_2026_history.py.
+    # Le script update_2026_history.py est idempotent : il ignore les doublons,
+    # n'ajoute pas les matchs interrompus/non terminés dans 2026.csv, et settle
+    # uniquement les picks avec vainqueur final fiable.
+    marker_skip_disabled = True
+
+    if False and not force and UPDATE_2026_MARKER.exists():
         try:
             marker = json.loads(UPDATE_2026_MARKER.read_text(encoding="utf-8"))
             if marker.get("date") == today and marker.get("ok") is True:
