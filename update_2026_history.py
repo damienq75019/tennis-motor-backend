@@ -1215,7 +1215,17 @@ def premium_pending_dates(max_day: date, audit: List[str], lookback_days: int = 
         audit.append(f"premium_history_read_error={type(exc).__name__}: {exc}")
         return []
 
-    rows = history.get("rows") if isinstance(history, dict) else []
+    # Accepte les deux formats possibles de premium_history.json :
+    # 1) objet normal : {"summary": {...}, "rows": [...]}
+    # 2) ancienne sauvegarde / format brut : [{...}, {...}]
+    if isinstance(history, dict):
+        rows = history.get("rows")
+    elif isinstance(history, list):
+        rows = history
+        audit.append("premium_history_root=list_accepted")
+    else:
+        rows = None
+
     if not isinstance(rows, list):
         audit.append("premium_history_rows_invalid")
         return []
@@ -1247,12 +1257,23 @@ def settle_premium_history(completed_by_day: Dict[str, List[Dict[str, Any]]], au
         audit.append(f"premium_history_settle_read_error={type(exc).__name__}: {exc}")
         return {"status": "read_error", "error": f"{type(exc).__name__}: {exc}", "settled": 0}
 
-    if not isinstance(history, dict):
-        return {"status": "invalid_json_root", "settled": 0}
+    original_root_is_list = False
 
-    rows = history.get("rows")
-    if not isinstance(rows, list):
-        return {"status": "missing_rows", "settled": 0}
+    # Accepte les deux formats possibles :
+    # - objet : {"summary": {...}, "rows": [...]}
+    # - liste brute : [{...}, {...}]
+    # Ancien bug : une liste brute déclenchait invalid_json_root et bloquait Unity.
+    if isinstance(history, dict):
+        rows = history.get("rows")
+        if not isinstance(rows, list):
+            return {"status": "missing_rows", "settled": 0}
+    elif isinstance(history, list):
+        rows = history
+        history = {"rows": rows, "summary": {}}
+        original_root_is_list = True
+        audit.append("premium_history_root=list_accepted_for_settle")
+    else:
+        return {"status": "invalid_json_root", "rootType": type(history).__name__, "settled": 0}
 
     settled = 0
     checked = 0
@@ -1306,7 +1327,17 @@ def settle_premium_history(completed_by_day: Dict[str, List[Dict[str, Any]]], au
             audit.append(f"premium_history_backup_error={type(exc).__name__}: {exc}")
 
         rebuilt = _rebuild_premium_summary(history, rows)
-        PREMIUM_HISTORY_PATH.write_text(json.dumps(rebuilt, ensure_ascii=False, indent=2), encoding="utf-8")
+
+        # Préserve le format existant du fichier principal pour ne pas casser Unity :
+        # si premium_history.json était une liste brute, on réécrit une liste brute mise à jour.
+        # Le résumé complet est quand même écrit dans premium_history_summary.json.
+        if original_root_is_list:
+            PREMIUM_HISTORY_PATH.write_text(json.dumps(rows, ensure_ascii=False, indent=2), encoding="utf-8")
+            output_format = "list"
+        else:
+            PREMIUM_HISTORY_PATH.write_text(json.dumps(rebuilt, ensure_ascii=False, indent=2), encoding="utf-8")
+            output_format = "dict"
+
         PREMIUM_HISTORY_SUMMARY_PATH.write_text(json.dumps(rebuilt.get("summary", {}), ensure_ascii=False, indent=2), encoding="utf-8")
         audit.append(f"premium_history_settled={settled}")
         return {
@@ -1317,6 +1348,7 @@ def settle_premium_history(completed_by_day: Dict[str, List[Dict[str, Any]]], au
             "checkedPendingRows": checked,
             "sample": samples,
             "backupPath": str(backup),
+            "format": output_format,
         }
 
     return {
