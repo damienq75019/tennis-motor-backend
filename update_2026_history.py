@@ -1194,6 +1194,17 @@ def _rebuild_premium_summary(history: Dict[str, Any], rows: List[Dict[str, Any]]
 
 
 def premium_pending_dates(max_day: date, audit: List[str], lookback_days: int = 14) -> List[date]:
+    """
+    Retourne TOUTES les dates qui ont encore au moins un premium en pending.
+
+    Ancien bug : le script ne vérifiait que la date courante / target_day,
+    donc les premiums de J-1, J-2, etc. restaient bloqués en pending dans Unity.
+
+    Règle corrigée : on relit output/premium_history.json et on récupère les dates
+    directement depuis les lignes result=pending. On ignore seulement les dates futures.
+    Le paramètre lookback_days est conservé pour compatibilité, mais il n'est plus
+    utilisé pour bloquer les anciens pending.
+    """
     if not PREMIUM_HISTORY_PATH.exists():
         audit.append(f"premium_history_missing={PREMIUM_HISTORY_PATH}")
         return []
@@ -1209,7 +1220,7 @@ def premium_pending_dates(max_day: date, audit: List[str], lookback_days: int = 
         audit.append("premium_history_rows_invalid")
         return []
 
-    min_day = max_day - timedelta(days=lookback_days)
+    today = paris_today()
     dates = set()
 
     for row in rows:
@@ -1218,11 +1229,11 @@ def premium_pending_dates(max_day: date, audit: List[str], lookback_days: int = 
         if not _is_pending_value(row.get("result")):
             continue
         d = _parse_iso_date(row.get("date"))
-        if d and min_day <= d <= max_day:
+        if d and d <= today:
             dates.add(d)
 
     out = sorted(dates)
-    audit.append("premium_pending_dates=" + ",".join(x.isoformat() for x in out))
+    audit.append("premium_pending_dates_all=" + ",".join(x.isoformat() for x in out))
     return out
 
 
@@ -1374,6 +1385,8 @@ def main() -> int:
             audit.append(f"flashscore_pending_day_error date={day_key} error={type(exc).__name__}: {exc}")
 
     premium_settlement = settle_premium_history(completed_by_day, audit)
+    dates_checked = sorted(completed_by_day.keys())
+    audit.append("dates_checked=" + ",".join(dates_checked))
 
     if not completed_rows:
         result = {
@@ -1384,6 +1397,7 @@ def main() -> int:
             "completedRows": 0,
             "addedRows": 0,
             "premiumSettlement": premium_settlement,
+            "datesChecked": dates_checked,
             "audit": audit,
         }
         AUDIT_PATH.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -1391,6 +1405,7 @@ def main() -> int:
         print("reason=no_completed_flashscore_rows_for_target_day")
         print(f"payload_rows={len(payload_matches)}")
         print(f"premium_history_settled={premium_settlement.get('settled', 0)}")
+        print(f"dates_checked={','.join(dates_checked)}")
         print(f"audit={AUDIT_PATH}")
         return 0
 
