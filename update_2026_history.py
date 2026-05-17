@@ -906,6 +906,87 @@ def parse_flashscore_text_completed_results(body_text: str, audit: List[str]) ->
         ))
     return dedup
 
+
+
+def collect_flashscore_body_text_by_scrolling(page: Any, audit: List[str], max_steps: int = 28) -> str:
+    """
+    Flashscore virtualise une partie des lignes : si on lit le body uniquement
+    en bas de page, on perd des matchs déjà sortis du DOM. Cette fonction
+    collecte le texte à plusieurs positions de scroll puis concatène les blocs
+    uniques. C'est indispensable pour récupérer toutes les sections ATP - SIMPLES
+    d'une journée complète.
+    """
+    blocks: List[str] = []
+    seen_blocks = set()
+
+    def add_current(label: str) -> None:
+        try:
+            txt = page.inner_text("body", timeout=8000)
+        except Exception as exc:
+            audit.append(f"flashscore_body_text_error_{label}={type(exc).__name__}: {exc}")
+            return
+        clean = str(txt or "").strip()
+        if not clean:
+            return
+        # Signature assez courte pour éviter de stocker 20 fois le même viewport.
+        sig = clean[:300] + "::" + clean[-300:] + f"::len={len(clean)}"
+        if sig not in seen_blocks:
+            seen_blocks.add(sig)
+            blocks.append(clean)
+
+    try:
+        page.evaluate("window.scrollTo(0, 0)")
+        page.wait_for_timeout(700)
+    except Exception:
+        pass
+
+    add_current("top")
+
+    last_y = -1
+    stable = 0
+    for step in range(max_steps):
+        try:
+            info = page.evaluate("""() => {
+                const y = window.scrollY || document.documentElement.scrollTop || 0;
+                const h = document.body.scrollHeight || document.documentElement.scrollHeight || 0;
+                const vh = window.innerHeight || 900;
+                window.scrollBy(0, Math.max(650, Math.floor(vh * 0.75)));
+                return {y, h, vh};
+            }""")
+        except Exception:
+            info = {"y": last_y, "h": 0, "vh": 0}
+
+        try:
+            page.mouse.wheel(0, 1200)
+        except Exception:
+            pass
+
+        try:
+            page.wait_for_timeout(650)
+        except Exception:
+            pass
+
+        add_current(f"step{step + 1}")
+
+        try:
+            y2 = int(page.evaluate("() => window.scrollY || document.documentElement.scrollTop || 0"))
+        except Exception:
+            y2 = last_y
+
+        audit.append(f"flashscore_text_scroll_step={step + 1} y={y2} blocks={len(blocks)}")
+
+        if y2 == last_y:
+            stable += 1
+        else:
+            stable = 0
+        last_y = y2
+        if stable >= 3:
+            break
+
+    combined = "\n".join(blocks)
+    audit.append(f"flashscore_text_blocks_collected={len(blocks)} combined_len={len(combined)}")
+    return combined
+
 def fetch_flashscore_completed_results(target_day: date, audit: List[str]) -> List[Dict[str, Any]]:
     """
     Lit Flashscore avec Playwright et récupère les matchs terminés ATP simples.
@@ -970,14 +1051,10 @@ def fetch_flashscore_completed_results(target_day: date, audit: List[str]) -> Li
                 except Exception:
                     pass
 
-                # Scroll plus long : certains blocs ATP qualifications sont plus bas dans la page.
-                scroll_until_stable(page, audit, max_rounds=12)
-
-                body_text = ""
-                try:
-                    body_text = page.inner_text("body", timeout=10000)
-                except Exception as exc:
-                    audit.append(f"flashscore_body_text_error={type(exc).__name__}: {exc}")
+                # Flashscore virtualise les lignes : on doit collecter le texte
+                # à plusieurs positions de scroll, sinon on ne récupère qu'une partie
+                # des matchs ATP simples terminés.
+                body_text = collect_flashscore_body_text_by_scrolling(page, audit, max_steps=30)
 
                 text_rows = parse_flashscore_text_completed_results(body_text, audit)
                 audit.append(f"flashscore_text_body_len={len(body_text)}")
