@@ -154,7 +154,11 @@ def _update_2026_marker_allowed(audit_data: Dict[str, Any], stdout_text: str) ->
     added = int(audit_data.get("addedRows") or 0)
     duplicates = int(audit_data.get("skippedDuplicate") or 0)
     payload_rows = int(audit_data.get("payloadRows") or 0)
-    completed_rows = int(audit_data.get("completedRows") or 0)
+    completed_rows = int(audit_data.get("completedRows") or audit_data.get("sourceRows") or 0)
+    history_already_current = bool(audit_data.get("historyAlreadyCurrent"))
+    sync_days = audit_data.get("syncDays")
+    if sync_days == []:
+        history_already_current = True
 
     if added > 0:
         return True, "rows_added"
@@ -164,6 +168,12 @@ def _update_2026_marker_allowed(audit_data: Dict[str, Any], stdout_text: str) ->
 
     if payload_rows > 0 and completed_rows > 0:
         return True, "processed_no_new_rows"
+
+    # Nouveau mode sync_from_last_csv_date : si data/2026.csv est déjà à jour
+    # jusqu'à hier, ce n'est pas une erreur. On autorise le marqueur pour éviter
+    # que Railway relance inutilement le script en boucle.
+    if history_already_current:
+        return True, "history_already_current"
 
     return False, "no_confirmed_history_processing"
 
