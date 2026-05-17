@@ -29,6 +29,13 @@ DAILY_SCRIPT_NAME = "fetch_day_lines_v6_10k_daily_schedule_no_forced_veto.py"
 # Flashscore sert uniquement à ajouter les cotes 1 / 2 après calcul moteur.
 FLASHSCORE_TENNIS_URL = "https://www.flashscore.fr/tennis/"
 
+# Exclusion définitive analyse Unity.
+# Les joueurs listés ici ne seront plus affichés dans /daily, /calculate ou /predictions.
+# Important : cela ne supprime PAS leurs matchs de data/2026.csv ; l'historique Elo reste complet.
+EXCLUDED_ANALYSIS_PLAYERS = [
+    "Jannik Sinner",
+]
+
 # Historique 2026 automatique.
 # update_2026_history.py met à jour uniquement les matchs ATP terminés.
 # Les matchs du jour non terminés ne sont jamais injectés dans l'Elo.
@@ -2097,12 +2104,107 @@ def _copy_daily_context_to_prediction(
 
 
 
+def _excluded_analysis_names() -> List[str]:
+    """
+    Liste des joueurs à exclure de l'analyse Unity.
+
+    Par défaut : Jannik Sinner.
+    Optionnel : variable d'environnement EXCLUDED_ANALYSIS_PLAYERS="Jannik Sinner,Nom 2".
+    """
+    raw = os.environ.get("EXCLUDED_ANALYSIS_PLAYERS", "")
+    if raw.strip():
+        names = [x.strip() for x in raw.split(",") if x.strip()]
+    else:
+        names = list(EXCLUDED_ANALYSIS_PLAYERS)
+
+    out: List[str] = []
+    for name in names:
+        if name and name not in out:
+            out.append(name)
+    return out
+
+
+def _match_has_excluded_player(match: Dict[str, Any], excluded_names: List[str]) -> bool:
+    """
+    Détecte un joueur exclu dans toutes les orientations possibles :
+    - playerA / playerB du payload ;
+    - sourcePlayerA / sourcePlayerB après double-side ;
+    - sourceOriginalPair.
+    """
+    if not isinstance(match, dict):
+        return False
+
+    fields = [
+        match.get("playerA"),
+        match.get("playerB"),
+        match.get("player_a"),
+        match.get("player_b"),
+        match.get("sourcePlayerA"),
+        match.get("sourcePlayerB"),
+        match.get("sourceOriginalPair"),
+    ]
+
+    normalized_fields = [_norm_name(str(value or "")) for value in fields]
+
+    for excluded in excluded_names:
+        excluded_norm = _norm_name(excluded)
+        if not excluded_norm:
+            continue
+
+        for field_norm in normalized_fields:
+            if not field_norm:
+                continue
+
+            # Cas exact : "Jannik Sinner".
+            if field_norm == excluded_norm:
+                return True
+
+            # Cas paire : "Jannik Sinner vs Casper Ruud".
+            if re.search(rf"\b{re.escape(excluded_norm)}\b", field_norm):
+                return True
+
+            # Cas matching robuste nom/prénom.
+            if _same_player(excluded, field_norm):
+                return True
+
+    return False
+
+
+def _filter_excluded_analysis_matches(matches: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], List[Dict[str, str]]]:
+    excluded_names = _excluded_analysis_names()
+    if not excluded_names:
+        return matches, []
+
+    kept: List[Dict[str, Any]] = []
+    removed: List[Dict[str, str]] = []
+
+    for match in matches:
+        if _match_has_excluded_player(match, excluded_names):
+            player_a = str(match.get("playerA") or match.get("player_a") or match.get("sourcePlayerA") or "")
+            player_b = str(match.get("playerB") or match.get("player_b") or match.get("sourcePlayerB") or "")
+            removed.append({"playerA": player_a, "playerB": player_b})
+        else:
+            kept.append(match)
+
+    return kept, removed
+
+
+
 def calculate_from_matches(matches: List[Dict[str, Any]]) -> Dict[str, Any]:
+    original_match_count = len(matches or [])
+    matches, excluded_removed = _filter_excluded_analysis_matches(matches or [])
+
     if not matches:
-        return _empty_response(
-            status="empty_payload",
-            message="Aucun match exploitable dans le payload daily.",
+        response = _empty_response(
+            status="empty_payload_after_exclusion" if excluded_removed else "empty_payload",
+            message="Aucun match exploitable après exclusion joueur." if excluded_removed else "Aucun match exploitable dans le payload daily.",
         )
+        response.setdefault("daily", {})
+        response["daily"]["excludedPlayers"] = _excluded_analysis_names()
+        response["daily"]["excludedMatches"] = len(excluded_removed)
+        response["daily"]["excludedSample"] = excluded_removed[:10]
+        response["daily"]["originalPayloadMatches"] = original_match_count
+        return response
 
     # Correction importante :
     # Ne pas utiliser calculate_predictions() sur deux listes puis zip(),
@@ -2147,6 +2249,11 @@ def calculate_from_matches(matches: List[Dict[str, Any]]) -> Dict[str, Any]:
         chosen["sourceOriginalPair"] = f"{source_player_a} vs {source_player_b}"
         final_matches.append(chosen)
 
+    # Double sécurité : même après inversion double-side, aucun match contenant
+    # un joueur exclu ne doit sortir vers Unity.
+    final_matches, excluded_removed_after_engine = _filter_excluded_analysis_matches(final_matches)
+    excluded_removed.extend(excluded_removed_after_engine)
+
     final_matches.sort(key=lambda row: row.get("premium", -1), reverse=True)
 
     return {
@@ -2167,6 +2274,10 @@ def calculate_from_matches(matches: List[Dict[str, Any]]) -> Dict[str, Any]:
             "doubleSideMatches": len(final_matches),
             "doubleSideReversedChosen": reversed_chosen,
             "contextPropagation": "daily_payload_v6_11h_preserved",
+            "excludedPlayers": _excluded_analysis_names(),
+            "excludedMatches": len(excluded_removed),
+            "excludedSample": excluded_removed[:10],
+            "originalPayloadMatches": original_match_count,
         },
     }
 
