@@ -2180,6 +2180,126 @@ def settle_premium_history(completed_by_day: Dict[str, List[Dict[str, Any]]], au
     }
 
 
+
+def latest_history_date(existing_rows: List[Dict[str, Any]]) -> Optional[date]:
+    """Retourne la dernière date réellement présente dans data/2026.csv."""
+    best: Optional[date] = None
+    for row in existing_rows:
+        raw = str(row.get("tourney_date") or "").strip()
+        if not re.fullmatch(r"\d{8}", raw):
+            continue
+        try:
+            d = datetime.strptime(raw, "%Y%m%d").date()
+        except Exception:
+            continue
+        if best is None or d > best:
+            best = d
+    return best
+
+
+def resolve_sync_days(existing_rows: List[Dict[str, Any]], audit: List[str]) -> List[date]:
+    """
+    Mode propre pour Elo 2026 : synchroniser depuis la dernière date du CSV
+    jusqu'à hier inclus.
+
+    Si UPDATE_2026_TARGET_DATE est défini, on garde le mode test manuel
+    sur une seule date.
+    """
+    raw = os.getenv("UPDATE_2026_TARGET_DATE", "").strip()
+    if raw:
+        d = date.fromisoformat(raw)
+        audit.append(f"sync_mode=single_env_target date={d.isoformat()}")
+        return [d]
+
+    today = paris_today()
+    end_day = today - timedelta(days=1)
+    last_day = latest_history_date(existing_rows)
+
+    if last_day is None:
+        start_day = end_day
+        audit.append("sync_mode=no_history_fallback_yesterday")
+    else:
+        start_day = last_day + timedelta(days=1)
+        audit.append(f"sync_mode=from_last_csv_date last_csv_date={last_day.isoformat()} start={start_day.isoformat()} end={end_day.isoformat()}")
+
+    if start_day > end_day:
+        audit.append("sync_days=none_history_already_current")
+        return []
+
+    days: List[date] = []
+    d = start_day
+    while d <= end_day:
+        days.append(d)
+        d += timedelta(days=1)
+
+    # Sécurité anti-run massif involontaire : on limite par défaut aux 45 derniers jours.
+    # Tu peux augmenter avec UPDATE_2026_MAX_SYNC_DAYS.
+    max_days = int(os.getenv("UPDATE_2026_MAX_SYNC_DAYS", "45"))
+    if len(days) > max_days:
+        audit.append(f"sync_days_truncated original={len(days)} max={max_days}")
+        days = days[-max_days:]
+
+    audit.append("sync_days=" + ",".join(x.isoformat() for x in days))
+    return days
+
+
+def source_rows_from_flashscore_rows(
+    flash_rows: List[Dict[str, Any]],
+    known_names: List[str],
+) -> List[Dict[str, Any]]:
+    source_rows: List[Dict[str, Any]] = []
+    for row in flash_rows:
+        tournament = str(row.get("header") or "ATP Daily Completed")
+        if not looks_like_atp_singles_header(tournament):
+            continue
+        winner = str(row.get("winner") or "").strip()
+        fs_a = str(row.get("playerA") or "").strip()
+        fs_b = str(row.get("playerB") or "").strip()
+        loser = fs_b if same_player(winner, fs_a) else fs_a
+        if not winner or not loser:
+            continue
+        source_rows.append({
+            "source": "Flashscore",
+            "playerA": winner,
+            "playerB": loser,
+            "winner": canonical_from_known_names(winner, known_names),
+            "loser": canonical_from_known_names(loser, known_names),
+            "score": str(row.get("score") or score_from_completed_row(row, winner) or ""),
+            "tournament": tournament if tournament else "ATP Daily Completed",
+            "surface": infer_surface_from_tournament(tournament, "Hard"),
+            "level": infer_level_from_tournament(tournament),
+            "header": tournament,
+            "raw": str(row.get("raw") or ""),
+        })
+    return source_rows
+
+
+def fetch_source_rows_for_day(
+    target_day: date,
+    audit: List[str],
+    known_names: List[str],
+) -> Tuple[List[Dict[str, Any]], str, List[Dict[str, Any]]]:
+    """Récupère les résultats ATP simples terminés pour une date donnée."""
+    audit.append(f"--- sync_day_start={target_day.isoformat()} ---")
+
+    payload_matches = load_target_payload(target_day, audit)
+
+    source_rows = fetch_tennis_explorer_atp_singles_results(target_day, audit, known_names=known_names)
+    source_name = "TennisExplorer"
+
+    if not source_rows:
+        audit.append(f"tennisexplorer_empty_fallback_flashscore=on date={target_day.isoformat()}")
+        try:
+            flash_rows = fetch_flashscore_completed_results(target_day, audit)
+        except Exception as exc:
+            flash_rows = []
+            audit.append(f"flashscore_global_error date={target_day.isoformat()} {type(exc).__name__}: {exc}")
+        source_rows = source_rows_from_flashscore_rows(flash_rows, known_names)
+        source_name = "FlashscoreFallback"
+
+    audit.append(f"sync_day_done={target_day.isoformat()} source={source_name} source_rows={len(source_rows)} payload_rows={len(payload_matches)}")
+    return source_rows, source_name, payload_matches
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -2192,9 +2312,9 @@ def main() -> int:
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     DATA_DIR.mkdir(parents=True, exist_ok=True)
 
-    target_day = resolve_target_day()
-    audit.append(f"target_day={target_day.isoformat()}")
-    audit.append("source_policy=tennisexplorer_atp_singles_results_primary")
+    audit.append("source_policy=sync_from_last_csv_date_atp_singles_results")
+    audit.append("primary_source=TennisExplorer")
+    audit.append("fallback_source=Flashscore_text_scroll")
     audit.append("payload_policy=secondary_for_player_points_only")
     audit.append("jeff_sackmann=disabled")
     audit.append("non_completed_today_policy=reject")
@@ -2205,126 +2325,92 @@ def main() -> int:
             fieldnames.append(col)
 
     existing_rows = read_existing_rows(fieldnames)
+    existing_rows_before = len(existing_rows)
     known_names = known_player_names_from_history(existing_rows)
     player_info = latest_player_info_from_history(existing_rows)
 
-    payload_matches = load_target_payload(target_day, audit)
-    add_payload_player_info(payload_matches, player_info)
-
-    # Source principale pour Elo 2026 : résultats ATP singles terminés par date.
-    source_rows = fetch_tennis_explorer_atp_singles_results(target_day, audit, known_names=known_names)
-    source_name = "TennisExplorer"
-
-    # Fallback : si TennisExplorer est bloqué ou vide, on garde Flashscore pour ne pas casser le backend.
-    if not source_rows:
-        audit.append("tennisexplorer_empty_fallback_flashscore=on")
-        try:
-            flash_rows = fetch_flashscore_completed_results(target_day, audit)
-        except Exception as exc:
-            flash_rows = []
-            audit.append(f"flashscore_global_error={type(exc).__name__}: {exc}")
-        source_rows = []
-        for row in flash_rows:
-            tournament = str(row.get("header") or "ATP Daily Completed")
-            if not looks_like_atp_singles_header(tournament):
-                continue
-            winner = str(row.get("winner") or "").strip()
-            fs_a = str(row.get("playerA") or "").strip()
-            fs_b = str(row.get("playerB") or "").strip()
-            loser = fs_b if same_player(winner, fs_a) else fs_a
-            if not winner or not loser:
-                continue
-            source_rows.append({
-                "source": "Flashscore",
-                "playerA": winner,
-                "playerB": loser,
-                "winner": canonical_from_known_names(winner, known_names),
-                "loser": canonical_from_known_names(loser, known_names),
-                "score": str(row.get("score") or score_from_completed_row(row, winner) or ""),
-                "tournament": tournament if tournament else "ATP Daily Completed",
-                "surface": infer_surface_from_tournament(tournament, "Hard"),
-                "level": infer_level_from_tournament(tournament),
-                "header": tournament,
-                "raw": str(row.get("raw") or ""),
-            })
-        source_name = "FlashscoreFallback"
-
-    completed_by_day: Dict[str, List[Dict[str, Any]]] = {target_day.isoformat(): source_rows}
-
-    # L'historique premium Unity reste réglé avec les résultats disponibles.
-    # Si la date pending n'est pas target_day, on relit TennisExplorer pour cette date.
-    for pending_day in premium_pending_dates(target_day, audit, lookback_days=14):
-        day_key = pending_day.isoformat()
-        if day_key in completed_by_day:
-            continue
-        rows_for_pending = fetch_tennis_explorer_atp_singles_results(pending_day, audit, known_names=known_names)
-        if not rows_for_pending:
-            try:
-                rows_for_pending = fetch_flashscore_completed_results(pending_day, audit)
-            except Exception as exc:
-                rows_for_pending = []
-                audit.append(f"premium_pending_source_error date={day_key} error={type(exc).__name__}: {exc}")
-        completed_by_day[day_key] = rows_for_pending
-
-    premium_settlement = settle_premium_history(completed_by_day, audit)
-    dates_checked = sorted(completed_by_day.keys())
-    audit.append("dates_checked=" + ",".join(dates_checked))
-
-    if not source_rows:
-        result = {
-            "status": "ok",
-            "targetDay": target_day.isoformat(),
-            "message": "Aucune source ATP singles terminée exploitable pour 2026.csv.",
-            "source": source_name,
-            "sourceRows": 0,
-            "payloadRows": len(payload_matches),
-            "addedRows": 0,
-            "premiumSettlement": premium_settlement,
-            "datesChecked": dates_checked,
-            "audit": audit,
-        }
-        AUDIT_PATH.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
-        print("✅ update_2026_history terminé sans ajout CSV")
-        print("reason=no_atp_singles_completed_source_rows")
-        print(f"target_day={target_day.isoformat()}")
-        print(f"premium_history_settled={premium_settlement.get('settled', 0)}")
-        print(f"dates_checked={','.join(dates_checked)}")
-        print(f"audit={AUDIT_PATH}")
-        return 0
+    sync_days = resolve_sync_days(existing_rows, audit)
 
     seen_pair_day = {pair_day_key(row) for row in existing_rows}
     added_rows: List[Dict[str, Any]] = []
     skipped_duplicate = 0
     skipped_bad_source = 0
+    total_source_rows = 0
+    total_payload_rows = 0
+    sources_by_day: Dict[str, str] = {}
+    source_rows_by_day: Dict[str, int] = {}
+    added_by_day: Dict[str, int] = {}
+    completed_by_day: Dict[str, List[Dict[str, Any]]] = {}
 
-    match_num = next_match_num(existing_rows, target_day)
+    for target_day in sync_days:
+        source_rows, source_name, payload_matches = fetch_source_rows_for_day(target_day, audit, known_names)
+        add_payload_player_info(payload_matches, player_info)
 
-    for result_row in source_rows:
-        winner = str(result_row.get("winner") or "").strip()
-        loser = str(result_row.get("loser") or result_row.get("playerB") or "").strip()
-        score = str(result_row.get("score") or "").strip()
-        tournament = str(result_row.get("tournament") or "").strip()
+        day_key = target_day.isoformat()
+        sources_by_day[day_key] = source_name
+        source_rows_by_day[day_key] = len(source_rows)
+        total_source_rows += len(source_rows)
+        total_payload_rows += len(payload_matches)
+        completed_by_day[day_key] = source_rows
 
-        if not winner or not loser or not score or not tournament:
-            skipped_bad_source += 1
+        match_num = next_match_num(existing_rows + added_rows, target_day)
+        day_added = 0
+
+        for result_row in source_rows:
+            winner = str(result_row.get("winner") or "").strip()
+            loser = str(result_row.get("loser") or result_row.get("playerB") or "").strip()
+            score = str(result_row.get("score") or "").strip()
+            tournament = str(result_row.get("tournament") or "").strip()
+
+            if not winner or not loser or not score or not tournament:
+                skipped_bad_source += 1
+                continue
+            if "/" in winner or "/" in loser:
+                skipped_bad_source += 1
+                continue
+            if not tournament_is_allowed_atp_main(tournament):
+                skipped_bad_source += 1
+                continue
+
+            temp_row = make_history_row_from_result(fieldnames, result_row, target_day, match_num, player_info)
+            key = pair_day_key(temp_row)
+
+            if key in seen_pair_day:
+                skipped_duplicate += 1
+                continue
+
+            seen_pair_day.add(key)
+            added_rows.append(temp_row)
+            day_added += 1
+            match_num += 1
+
+            # Les lignes ajoutées peuvent enrichir légèrement le mapping points/rangs
+            # pour les dates suivantes du même run.
+            for side in ("winner", "loser"):
+                nm = str(temp_row.get(f"{side}_name") or "").strip()
+                if nm:
+                    player_info[norm_name(nm)] = {
+                        "rank": str(temp_row.get(f"{side}_rank") or ""),
+                        "rank_points": str(temp_row.get(f"{side}_rank_points") or ""),
+                    }
+                    known_names.append(nm)
+
+        added_by_day[day_key] = day_added
+        audit.append(f"sync_day_added={day_key} added={day_added}")
+
+    # Même si aucun jour Elo n'est à synchroniser, on règle l'historique premium
+    # en relisant toutes les dates encore pending.
+    base_for_pending = paris_today() - timedelta(days=1)
+    for pending_day in premium_pending_dates(base_for_pending, audit, lookback_days=21):
+        day_key = pending_day.isoformat()
+        if day_key in completed_by_day:
             continue
-        if "/" in winner or "/" in loser:
-            skipped_bad_source += 1
-            continue
-        if not tournament_is_allowed_atp_main(tournament):
-            skipped_bad_source += 1
-            continue
+        rows_for_pending, _source_name, _payload = fetch_source_rows_for_day(pending_day, audit, known_names)
+        completed_by_day[day_key] = rows_for_pending
 
-        temp_row = make_history_row_from_result(fieldnames, result_row, target_day, match_num, player_info)
-        key = pair_day_key(temp_row)
-
-        if key in seen_pair_day:
-            skipped_duplicate += 1
-            continue
-
-        seen_pair_day.add(key)
-        added_rows.append(temp_row)
-        match_num += 1
+    premium_settlement = settle_premium_history(completed_by_day, audit)
+    dates_checked = sorted(completed_by_day.keys())
+    audit.append("dates_checked=" + ",".join(dates_checked))
 
     backup_path = ""
     if added_rows:
@@ -2333,20 +2419,25 @@ def main() -> int:
 
     result = {
         "status": "ok",
-        "targetDay": target_day.isoformat(),
+        "mode": "sync_from_last_csv_date",
         "historyPath": str(HISTORY_PATH),
         "backupPath": backup_path,
-        "source": source_name,
-        "sourceRows": len(source_rows),
-        "payloadRows": len(payload_matches),
-        "existingRowsBefore": len(existing_rows),
+        "syncDays": [d.isoformat() for d in sync_days],
+        "datesChecked": dates_checked,
+        "sourcesByDay": sources_by_day,
+        "sourceRowsByDay": source_rows_by_day,
+        "addedByDay": added_by_day,
+        "sourceRows": total_source_rows,
+        "payloadRows": total_payload_rows,
+        "existingRowsBefore": existing_rows_before,
         "addedRows": len(added_rows),
         "premiumSettlement": premium_settlement,
         "skippedDuplicate": skipped_duplicate,
         "skippedBadSource": skipped_bad_source,
-        "finalRows": len(existing_rows) + len(added_rows),
+        "finalRows": existing_rows_before + len(added_rows),
         "addedSample": [
             {
+                "tourney_date": row.get("tourney_date"),
                 "tourney_name": row.get("tourney_name"),
                 "winner_name": row.get("winner_name"),
                 "loser_name": row.get("loser_name"),
@@ -2355,7 +2446,7 @@ def main() -> int:
                 "winner_rank_points": row.get("winner_rank_points"),
                 "loser_rank_points": row.get("loser_rank_points"),
             }
-            for row in added_rows[:30]
+            for row in added_rows[:50]
         ],
         "audit": audit,
     }
@@ -2363,17 +2454,18 @@ def main() -> int:
     AUDIT_PATH.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
 
     print("✅ update_2026_history terminé")
-    print(f"target_day={target_day.isoformat()}")
+    print("mode=sync_from_last_csv_date")
     print(f"history={HISTORY_PATH}")
     if backup_path:
         print(f"backup={backup_path}")
-    print(f"source={source_name}")
-    print(f"source_rows={len(source_rows)}")
-    print(f"payload_rows={len(payload_matches)}")
+    print("sync_days=" + ",".join(d.isoformat() for d in sync_days))
+    print(f"source_rows={total_source_rows}")
+    print(f"payload_rows={total_payload_rows}")
     print(f"added_rows={len(added_rows)}")
     print(f"premium_history_settled={premium_settlement.get('settled', 0)}")
     print(f"skipped_duplicate={skipped_duplicate}")
-    print(f"audit={AUDIT_PATH}")
+    print(f"final_rows={existing_rows_before + len(added_rows)}")
+    print(f"a_done={AUDIT_PATH}")
 
     return 0
 
