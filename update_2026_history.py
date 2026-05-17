@@ -1046,6 +1046,287 @@ def write_history(fieldnames: List[str], rows: List[Dict[str, Any]]) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Ajout ELO global : tous les ATP simples terminés, pas seulement premiums
+# ---------------------------------------------------------------------------
+
+def header_tourney_name(header: str) -> str:
+    txt = normalize_space(header or "")
+    if not txt:
+        return "ATP Daily Completed"
+    # Exemples Flashscore : "ATP - SIMPLES: Rome (Italie), terre battue"
+    if ":" in txt:
+        right = normalize_space(txt.split(":", 1)[1])
+    else:
+        right = txt
+    right = re.sub(r",?\s*(terre battue|clay|dur|hard|gazon|grass).*", "", right, flags=re.I)
+    right = normalize_space(right)
+    return right or "ATP Daily Completed"
+
+
+def surface_from_completed_or_ctx(completed_row: Dict[str, Any], ctx: Optional[Dict[str, Any]] = None) -> str:
+    header = str(completed_row.get("header") or "")
+    surf = normalize_surface(header)
+    if surf != "Hard" or re.search(r"hard|dur", header, flags=re.I):
+        return surf
+    if ctx:
+        return normalize_surface(ctx.get("surface"))
+    return surf
+
+
+def build_existing_player_refs(existing_rows: List[Dict[str, Any]]) -> Tuple[Dict[str, str], Dict[str, int], Dict[str, int]]:
+    names: Dict[str, str] = {}
+    latest_points: Dict[str, int] = {}
+    latest_rank: Dict[str, int] = {}
+
+    for row in existing_rows:
+        for side in ("winner", "loser"):
+            name = str(row.get(f"{side}_name") or "").strip()
+            if not name:
+                continue
+            key = norm_name(name)
+            if key:
+                names[key] = name
+            pts = safe_int(row.get(f"{side}_rank_points"), 0)
+            rnk = safe_int(row.get(f"{side}_rank"), 0)
+            if pts > 0:
+                latest_points[key] = pts
+            if rnk > 0:
+                latest_rank[key] = rnk
+    return names, latest_points, latest_rank
+
+
+def fetch_live_points_map_for_update(audit: List[str]) -> Dict[str, int]:
+    """
+    Réutilise le module 10k pour récupérer les points ATP live.
+    Si le web bloque, le script continue avec points issus de 2026.csv/payload.
+    """
+    try:
+        import importlib.util
+        import requests
+        module_path = BASE_DIR / "fetch_day_lines_v6_10k_daily_schedule_no_forced_veto.py"
+        spec = importlib.util.spec_from_file_location("tm_fetch_10k_for_update", module_path)
+        if spec is None or spec.loader is None:
+            audit.append("live_points_import_error=spec_none")
+            return {}
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)  # type: ignore[attr-defined]
+        session = requests.Session()
+        pts = mod.fetch_points_map(session, audit)  # type: ignore[attr-defined]
+        if isinstance(pts, dict):
+            out = {norm_name(str(k)): safe_int(v, 0) for k, v in pts.items() if safe_int(v, 0) > 0}
+            audit.append(f"live_points_loaded_for_update={len(out)}")
+            return out
+    except Exception as exc:
+        audit.append(f"live_points_for_update_error={type(exc).__name__}: {exc}")
+    return {}
+
+
+def resolve_full_name(
+    fs_name: str,
+    payload_contexts: List[Dict[str, Any]],
+    live_points: Dict[str, int],
+    existing_names: Dict[str, str],
+) -> str:
+    raw = normalize_space(fs_name)
+    if not raw:
+        return ""
+
+    candidates: List[str] = []
+
+    for ctx in payload_contexts:
+        for key in ("sourceA", "sourceB"):
+            val = str(ctx.get(key) or "").strip()
+            if val and same_player(val, raw):
+                candidates.append(val)
+
+    for val in existing_names.values():
+        if val and same_player(val, raw):
+            candidates.append(val)
+
+    for key in live_points.keys():
+        # live_points keys sont normalisées; on les remet en Title Case si nécessaire.
+        if key and same_player(key, raw):
+            candidates.append(" ".join(part.capitalize() for part in key.split()))
+
+    # Déduplique en gardant l'ordre.
+    seen = set()
+    unique: List[str] = []
+    for c in candidates:
+        nk = norm_name(c)
+        if nk and nk not in seen:
+            seen.add(nk)
+            unique.append(c)
+
+    if len(unique) == 1:
+        return unique[0]
+
+    # Si plusieurs candidats, choisir celui qui contient le plus de tokens du nom Flashscore.
+    fs_tokens = set(name_tokens(raw, keep_short=False))
+    if unique and fs_tokens:
+        unique.sort(key=lambda x: len(fs_tokens.intersection(set(name_tokens(x, keep_short=False)))), reverse=True)
+        return unique[0]
+
+    return raw
+
+
+def points_rank_for_player(
+    player_name: str,
+    ctx: Optional[Dict[str, Any]],
+    live_points: Dict[str, int],
+    existing_points: Dict[str, int],
+    existing_rank: Dict[str, int],
+) -> Tuple[int, int]:
+    key = norm_name(player_name)
+
+    if ctx:
+        pbn = ctx.get("pointsByName") or {}
+        rbn = ctx.get("rankByName") or {}
+        if isinstance(pbn, dict):
+            for k, v in pbn.items():
+                if same_player(str(k), player_name):
+                    pts = safe_int(v, 0)
+                    if pts > 0:
+                        rank = 0
+                        if isinstance(rbn, dict):
+                            for rk, rv in rbn.items():
+                                if same_player(str(rk), player_name):
+                                    rank = safe_int(rv, 0)
+                                    break
+                        return pts, rank
+
+    if key in live_points and live_points[key] > 0:
+        # Rang approximé par ordre des points live. Suffisant pour garder le format; Elo utilise surtout points + SWE.
+        sorted_pts = sorted(set(live_points.values()), reverse=True)
+        rank = sorted_pts.index(live_points[key]) + 1 if live_points[key] in sorted_pts else 0
+        return live_points[key], rank
+
+    # matching souple dans live_points
+    matches = [k for k in live_points if same_player(k, player_name)]
+    if len(matches) == 1:
+        pts = live_points[matches[0]]
+        sorted_pts = sorted(set(live_points.values()), reverse=True)
+        rank = sorted_pts.index(pts) + 1 if pts in sorted_pts else 0
+        return pts, rank
+
+    if key in existing_points:
+        return existing_points.get(key, 0), existing_rank.get(key, 0)
+
+    matches = [k for k in existing_points if same_player(k, player_name)]
+    if len(matches) == 1:
+        k = matches[0]
+        return existing_points.get(k, 0), existing_rank.get(k, 0)
+
+    return 1, 0
+
+
+def find_payload_context_for_completed(completed_row: Dict[str, Any], payload_contexts: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    fs_a = str(completed_row.get("playerA") or "")
+    fs_b = str(completed_row.get("playerB") or "")
+    for ctx in payload_contexts:
+        source_a = str(ctx.get("sourceA") or "")
+        source_b = str(ctx.get("sourceB") or "")
+        if not source_a or not source_b:
+            continue
+        if (same_player(source_a, fs_a) and same_player(source_b, fs_b)) or (same_player(source_a, fs_b) and same_player(source_b, fs_a)):
+            return ctx
+    return None
+
+
+def make_history_row_from_completed_all_atp(
+    fieldnames: List[str],
+    completed_row: Dict[str, Any],
+    target_day: date,
+    match_num: int,
+    payload_contexts: List[Dict[str, Any]],
+    live_points: Dict[str, int],
+    existing_names: Dict[str, str],
+    existing_points: Dict[str, int],
+    existing_rank: Dict[str, int],
+) -> Dict[str, Any]:
+    ctx = find_payload_context_for_completed(completed_row, payload_contexts)
+
+    fs_a = str(completed_row.get("playerA") or "").strip()
+    fs_b = str(completed_row.get("playerB") or "").strip()
+    fs_winner = str(completed_row.get("winner") or "").strip()
+
+    full_a = resolve_full_name(fs_a, payload_contexts, live_points, existing_names)
+    full_b = resolve_full_name(fs_b, payload_contexts, live_points, existing_names)
+
+    if same_player(fs_winner, fs_a):
+        winner = full_a
+        loser = full_b
+    elif same_player(fs_winner, fs_b):
+        winner = full_b
+        loser = full_a
+    else:
+        winner = resolve_full_name(fs_winner, payload_contexts, live_points, existing_names)
+        loser = full_b if same_player(winner, full_a) else full_a
+
+    w_points, w_rank = points_rank_for_player(winner, ctx, live_points, existing_points, existing_rank)
+    l_points, l_rank = points_rank_for_player(loser, ctx, live_points, existing_points, existing_rank)
+
+    base: Dict[str, Any] = {key: "" for key in fieldnames}
+    score = score_from_completed_row(completed_row, fs_winner) or str(completed_row.get("score") or "")
+
+    values = {
+        "tourney_id": f"{target_day.year}-TM-{target_day.strftime('%m%d')}",
+        "tourney_name": header_tourney_name(str(completed_row.get("header") or "")),
+        "surface": surface_from_completed_or_ctx(completed_row, ctx),
+        "draw_size": "",
+        "tourney_level": "A",
+        "tourney_date": str(ymd_int(target_day)),
+        "match_num": str(match_num),
+        "winner_id": "",
+        "winner_seed": "",
+        "winner_entry": "",
+        "winner_name": winner,
+        "winner_hand": "",
+        "winner_ht": "",
+        "winner_ioc": "",
+        "winner_age": "",
+        "loser_id": "",
+        "loser_seed": "",
+        "loser_entry": "",
+        "loser_name": loser,
+        "loser_hand": "",
+        "loser_ht": "",
+        "loser_ioc": "",
+        "loser_age": "",
+        "score": score,
+        "best_of": "3",
+        "round": "R128",
+        "minutes": "",
+        "w_ace": "0",
+        "w_df": "0",
+        "w_svpt": "0",
+        "w_1stIn": "0",
+        "w_1stWon": "0",
+        "w_2ndWon": "0",
+        "w_SvGms": "0",
+        "w_bpSaved": "0",
+        "w_bpFaced": "0",
+        "l_ace": "0",
+        "l_df": "0",
+        "l_svpt": "0",
+        "l_1stIn": "0",
+        "l_1stWon": "0",
+        "l_2ndWon": "0",
+        "l_SvGms": "0",
+        "l_bpSaved": "0",
+        "l_bpFaced": "0",
+        "winner_rank": str(w_rank or ""),
+        "winner_rank_points": str(w_points or 1),
+        "loser_rank": str(l_rank or ""),
+        "loser_rank_points": str(l_points or 1),
+    }
+
+    for key, value in values.items():
+        if key in base:
+            base[key] = value
+    return base
+
+
+# ---------------------------------------------------------------------------
 # Historique premiums Unity : settlement pending -> win/loss
 # ---------------------------------------------------------------------------
 
@@ -1449,7 +1730,11 @@ def main() -> int:
             fieldnames.append(col)
 
     existing_rows = read_existing_rows(fieldnames)
+    existing_names, existing_points, existing_rank = build_existing_player_refs(existing_rows)
     seen_pair_day = {pair_day_key(row) for row in existing_rows}
+
+    payload_contexts = [payload_context(m) for m in payload_matches if isinstance(m, dict)]
+    live_points = fetch_live_points_map_for_update(audit)
 
     added_rows: List[Dict[str, Any]] = []
     skipped_not_finished = 0
@@ -1459,26 +1744,31 @@ def main() -> int:
 
     match_num = next_match_num(existing_rows, target_day)
 
-    for match in payload_matches:
-        ctx = payload_context(match)
-        source_a = str(ctx.get("sourceA") or "").strip()
-        source_b = str(ctx.get("sourceB") or "").strip()
+    # IMPORTANT : pour l'Elo, on ajoute TOUS les ATP simples terminés trouvés par Flashscore,
+    # pas seulement les premiums et pas seulement les lignes présentes dans le payload daily.
+    for found in completed_rows:
+        fs_a = str(found.get("playerA") or "").strip()
+        fs_b = str(found.get("playerB") or "").strip()
+        winner = str(found.get("winner") or "").strip()
 
-        if not source_a or not source_b or "/" in source_a or "/" in source_b:
+        if not fs_a or not fs_b or "/" in fs_a or "/" in fs_b:
             skipped_bad_payload += 1
             continue
-
-        found = find_completed_for_payload(source_a, source_b, completed_rows)
-        if not found:
-            skipped_not_found += 1
-            continue
-
-        winner = str(found.get("winner") or "")
         if not winner:
             skipped_not_finished += 1
             continue
 
-        temp_row = make_history_row(fieldnames, ctx, found, target_day, match_num)
+        temp_row = make_history_row_from_completed_all_atp(
+            fieldnames=fieldnames,
+            completed_row=found,
+            target_day=target_day,
+            match_num=match_num,
+            payload_contexts=payload_contexts,
+            live_points=live_points,
+            existing_names=existing_names,
+            existing_points=existing_points,
+            existing_rank=existing_rank,
+        )
         key = pair_day_key(temp_row)
 
         if key in seen_pair_day:
@@ -1488,6 +1778,10 @@ def main() -> int:
         seen_pair_day.add(key)
         added_rows.append(temp_row)
         match_num += 1
+
+    # Ancien compteur conservé dans l'audit : maintenant il indique les lignes payload non utilisées
+    # comme source CSV directe. Ce n'est plus une erreur si payloadRows > addedRows.
+    skipped_not_found = max(0, len(payload_matches) - len(added_rows) - skipped_duplicate)
 
     backup_path = ""
     if added_rows:
