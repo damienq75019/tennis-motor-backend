@@ -2660,29 +2660,81 @@ async def _reset_premium_history_files() -> Dict[str, Any]:
     - payload_latest.json
     - l'Elo / SWE
 
-    Supprime seulement :
-    - output/premium_history.json
-    - output/premium_history_summary.json
-    puis reconstruit un résumé vide si premium_history.py est disponible.
+    IMPORTANT : on n'efface pas seulement les fichiers.
+    On réécrit aussi des fichiers VIDES valides pour éviter que Unity ou
+    premium_history.py ne reconstruise un vieux résumé/fallback avec 1 ancien premium.
     """
+    written: List[str] = []
     deleted: List[str] = []
-    missing: List[str] = []
     errors: List[str] = []
 
-    candidate_dirs: List[Path] = []
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
-    try:
-        candidate_dirs.append(OUTPUT_DIR)
-    except Exception:
-        pass
+    # Format racine utilisé par premium_history.json dans ton backend : liste de lignes.
+    empty_history_rows: List[Dict[str, Any]] = []
 
-    try:
-        volume_dir = os.environ.get("RAILWAY_VOLUME_MOUNT_PATH", "").strip()
-        if volume_dir:
-            candidate_dirs.append(Path(volume_dir))
-            candidate_dirs.append(Path(volume_dir) / "output")
-    except Exception:
-        pass
+    # Résumé vide robuste : contient les clés simples + les clés détaillées possibles.
+    empty_bucket = {
+        "total": 0,
+        "wins": 0,
+        "losses": 0,
+        "pending": 0,
+        "winRate": 0.0,
+        "winRatePct": 0.0,
+        "profitUnits": 0.0,
+        "profitEur": 0.0,
+        "roi": 0.0,
+        "roiPct": 0.0,
+    }
+
+    empty_summary: Dict[str, Any] = {
+        "status": "ok",
+        "reset": True,
+        "generatedAtParis": _paris_now_iso(),
+        "description": "Historique Premium remis à zéro manuellement depuis Unity.",
+        "today": dict(empty_bucket),
+        "last7": dict(empty_bucket),
+        "last30": dict(empty_bucket),
+        "last365": dict(empty_bucket),
+        "all": dict(empty_bucket),
+        "total": 0,
+        "wins": 0,
+        "losses": 0,
+        "pending": 0,
+        "profitTotal": 0.0,
+        "profitTotalEur": 0.0,
+        "roiTotal": 0.0,
+        "roiTotalPct": 0.0,
+        "stakeEur": 100.0,
+        "euroAxisMin": -2000.0,
+        "euroAxisMax": 2000.0,
+        "winRateAxisMin": 0.0,
+        "winRateAxisMax": 100.0,
+        "days": [],
+        "cumulativeDays": [],
+        "rows": [],
+        "summary": {
+            "today": dict(empty_bucket),
+            "last7": dict(empty_bucket),
+            "last30": dict(empty_bucket),
+            "last365": dict(empty_bucket),
+            "all": dict(empty_bucket),
+            "profitTotal": 0.0,
+            "roiTotal": 0.0,
+        },
+    }
+
+    files_to_write = {
+        OUTPUT_DIR / "premium_history.json": empty_history_rows,
+        OUTPUT_DIR / "premium_history_summary.json": empty_summary,
+    }
+
+    # Si un volume Railway existe, on écrit aussi dedans et dans son /output.
+    candidate_dirs = [OUTPUT_DIR]
+    volume_dir = os.environ.get("RAILWAY_VOLUME_MOUNT_PATH", "").strip()
+    if volume_dir:
+        candidate_dirs.append(Path(volume_dir))
+        candidate_dirs.append(Path(volume_dir) / "output")
 
     unique_dirs: List[Path] = []
     for d in candidate_dirs:
@@ -2693,40 +2745,36 @@ async def _reset_premium_history_files() -> Dict[str, Any]:
         if resolved not in unique_dirs:
             unique_dirs.append(resolved)
 
-    filenames = [
-        "premium_history.json",
-        "premium_history_summary.json",
-    ]
-
     for directory in unique_dirs:
-        for filename in filenames:
+        try:
+            directory.mkdir(parents=True, exist_ok=True)
+        except Exception as exc:
+            errors.append(f"{directory}: mkdir {type(exc).__name__}: {exc}")
+            continue
+
+        for filename, payload in [
+            ("premium_history.json", empty_history_rows),
+            ("premium_history_summary.json", empty_summary),
+        ]:
             path = directory / filename
             try:
                 if path.exists():
-                    path.unlink()
                     deleted.append(str(path))
-                else:
-                    missing.append(str(path))
+                path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+                written.append(str(path))
             except Exception as exc:
                 errors.append(f"{path}: {type(exc).__name__}: {exc}")
-
-    rebuilt: Dict[str, Any] = {}
-    try:
-        import premium_history
-        rebuilt = await asyncio.to_thread(premium_history.build_summary)
-    except Exception as exc:
-        rebuilt = {
-            "status": "warning",
-            "message": f"Historique supprimé, mais résumé non reconstruit automatiquement : {type(exc).__name__}: {exc}",
-        }
 
     return {
         "status": "ok" if not errors else "partial",
         "message": "Historique Premium remis à zéro.",
-        "deleted": deleted,
-        "missing": missing,
+        "written": written,
+        "deletedPrevious": deleted,
         "errors": errors,
-        "history": rebuilt,
+        "history": {
+            "rows": [],
+            "summary": empty_summary,
+        },
     }
 
 
