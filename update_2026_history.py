@@ -724,9 +724,197 @@ def looks_like_atp_singles_header(header: str) -> bool:
     return True
 
 
+
+
+def is_flashscore_score_number(line: str) -> bool:
+    return bool(re.fullmatch(r"\d{1,2}", normalize_space(str(line or ""))))
+
+
+def is_flashscore_section_category(line: str) -> bool:
+    n = strip_accents(str(line or "")).lower()
+    return any(key in n for key in (
+        "atp - simples", "wta - simples", "atp - doubles", "wta - doubles",
+        "challenger masculin", "challenger feminin", "itf masculin", "itf feminin",
+        "exhibition", "garcons", "filles", "doubles mixtes"
+    ))
+
+
+def is_flashscore_tournament_header(line: str) -> bool:
+    s = normalize_space(str(line or ""))
+    n = strip_accents(s).lower()
+    if not s:
+        return False
+    if is_flashscore_section_category(s):
+        return False
+    if s in {"Tableau", "Classement", "Calendrier", "Résultats", "Resultats", "Publicité", "Publicite"}:
+        return False
+    if n.startswith(("termine", "forfait", "abandon", "direct", "a venir")):
+        return False
+    # Flashscore écrit généralement : "Genève (Suisse) - Qualifications, terre battue"
+    # ou "Rome (Italie), terre battue".
+    return ("(" in s and ")" in s and ("," in s or " - " in s))
+
+
+def parse_flashscore_text_completed_results(body_text: str, audit: List[str]) -> List[Dict[str, Any]]:
+    """
+    Parse le texte complet de Flashscore, beaucoup plus fiable que certains sélecteurs DOM.
+
+    Format vu sur Flashscore FR :
+      Rome (Italie), terre battue
+      ATP - SIMPLES:
+      Tableau
+      Terminé
+      Sinner J.
+      Medvedev D.
+      2
+      1
+      6
+      2
+      ...
+
+    Règle stricte : on garde uniquement les sections ATP - SIMPLES.
+    On rejette WTA, ATP doubles, Challenger, ITF, Exhibition, juniors.
+    """
+    raw_lines = [normalize_space(x) for x in str(body_text or "").splitlines()]
+    lines = [x for x in raw_lines if x]
+
+    results: List[Dict[str, Any]] = []
+    current_tournament = ""
+    current_category = ""
+    current_header = ""
+    i = 0
+
+    while i < len(lines):
+        line = lines[i]
+        n = strip_accents(line).lower()
+
+        if is_flashscore_tournament_header(line):
+            current_tournament = line
+            current_header = line
+            i += 1
+            continue
+
+        if is_flashscore_section_category(line):
+            current_category = line
+            current_header = (current_tournament + " " + line).strip()
+            i += 1
+            continue
+
+        is_atp_singles = "atp - simples" in strip_accents(current_category).lower()
+
+        if is_atp_singles and n.startswith("termine"):
+            j = i + 1
+
+            # Rejeter abandons/forfaits : pas de résultat propre pour Elo.
+            if j < len(lines) and any(x in strip_accents(lines[j]).lower() for x in ("abandon", "forfait", "walkover")):
+                i += 1
+                continue
+
+            players: List[str] = []
+            while j < len(lines) and len(players) < 2:
+                candidate = lines[j]
+                cn = strip_accents(candidate).lower()
+                if (
+                    not is_flashscore_score_number(candidate)
+                    and not is_flashscore_section_category(candidate)
+                    and not is_flashscore_tournament_header(candidate)
+                    and candidate.lower() not in {"tableau", "classement"}
+                    and not cn.startswith(("termine", "forfait", "abandon"))
+                ):
+                    players.append(candidate)
+                j += 1
+
+            if len(players) < 2:
+                i += 1
+                continue
+
+            nums: List[int] = []
+            while j < len(lines):
+                nxt = lines[j]
+                nn = strip_accents(nxt).lower()
+                if is_flashscore_score_number(nxt):
+                    nums.append(int(nxt))
+                    j += 1
+                    continue
+                # fin du bloc match dès qu'une nouvelle section/un nouveau match commence
+                if nn.startswith(("termine", "forfait", "abandon")) or is_flashscore_tournament_header(nxt) or is_flashscore_section_category(nxt):
+                    break
+                # Texte parasite : on stoppe pour éviter de manger le match suivant.
+                break
+
+            if len(nums) >= 2 and nums[0] != nums[1] and max(nums[0], nums[1]) >= 2:
+                player_a, player_b = players[0], players[1]
+                winner = player_a if nums[0] > nums[1] else player_b
+                score_parts: List[str] = []
+                set_count = max(1, min(nums[0] + nums[1], 5))
+                games = nums[2:]
+
+                # Si Flashscore ajoute les points de tie-break comme lignes séparées,
+                # le nombre de valeurs dépasse set_count*2. Dans ce cas, on garde
+                # seulement le score en sets pour éviter d'écrire un faux 7-7 / 6-6.
+                detailed_score_is_safe = len(games) == set_count * 2
+                if detailed_score_is_safe:
+                    for k in range(0, len(games), 2):
+                        if k + 1 >= len(games):
+                            break
+                        a_games, b_games = games[k], games[k + 1]
+                        if winner == player_a:
+                            score_parts.append(f"{a_games}-{b_games}")
+                        else:
+                            score_parts.append(f"{b_games}-{a_games}")
+
+                set_score = f"{max(nums[0], nums[1])}-{min(nums[0], nums[1])}"
+
+                results.append({
+                    "playerA": player_a,
+                    "playerB": player_b,
+                    "winner": winner,
+                    "score": " ".join(score_parts) if score_parts else set_score,
+                    "homeScores": nums[0:1] + nums[2::2],
+                    "awayScores": nums[1:2] + nums[3::2],
+                    "status": "Terminé",
+                    "header": current_header[:250],
+                    "tournament": current_tournament,
+                    "surface": infer_surface_from_tournament(current_header, "Hard"),
+                    "raw": " | ".join(lines[i:j])[:500],
+                })
+                i = j
+                continue
+
+        i += 1
+
+    # déduplication stricte par date/paires/score implicite
+    dedup: List[Dict[str, Any]] = []
+    seen = set()
+    for row in results:
+        key = (
+            norm_name(row.get("playerA")),
+            norm_name(row.get("playerB")),
+            str(row.get("score") or ""),
+            norm_name(row.get("header")),
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        dedup.append(row)
+
+    audit.append(f"flashscore_text_rows_kept={len(dedup)}")
+    if dedup:
+        audit.append("flashscore_text_sample=" + " || ".join(
+            f"{r.get('playerA')} - {r.get('playerB')} winner={r.get('winner')} score={r.get('score')}"
+            for r in dedup[:20]
+        ))
+    return dedup
+
 def fetch_flashscore_completed_results(target_day: date, audit: List[str]) -> List[Dict[str, Any]]:
     """
-    Lit Flashscore avec Playwright et récupère les matchs terminés.
+    Lit Flashscore avec Playwright et récupère les matchs terminés ATP simples.
+
+    Version corrigée :
+    - source principale = texte complet de la page Flashscore après clic TERMINÉS ;
+    - garde toutes les sections ATP - SIMPLES ;
+    - rejette WTA / doubles / Challenger / ITF ;
+    - évite les mauvais couples DOM du type Duckworth-Butvilas qui venaient des sélecteurs.
     """
     try:
         from playwright.sync_api import sync_playwright
@@ -750,7 +938,7 @@ def fetch_flashscore_completed_results(target_day: date, audit: List[str]) -> Li
         context = browser.new_context(
             locale="fr-FR",
             timezone_id="Europe/Paris",
-            viewport={"width": 1365, "height": 1800},
+            viewport={"width": 1365, "height": 2200},
             user_agent=(
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                 "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -767,25 +955,41 @@ def fetch_flashscore_completed_results(target_day: date, audit: List[str]) -> Li
                 audit.append(f"flashscore_url={url}")
                 page.goto(url, wait_until="domcontentloaded", timeout=45000)
 
-                click_optional(page, ["J'accepte", "Tout refuser", "Accepter", "OK"], timeout_ms=2500)
+                click_optional(page, ["J'accepte", "Tout refuser", "Accepter", "OK"], timeout_ms=3000)
 
                 try:
                     page.wait_for_load_state("networkidle", timeout=12000)
                 except Exception:
                     pass
 
-                clicked = click_optional(page, ["TERMINÉS", "Terminés", "Terminé", "Finished", "Results", "Résultats"], timeout_ms=4000)
+                clicked = click_optional(page, ["TERMINÉS", "Terminés", "Terminé", "Finished", "Results", "Résultats"], timeout_ms=5000)
                 audit.append(f"completed_tab_clicked={clicked}")
 
                 try:
-                    page.wait_for_timeout(2500)
+                    page.wait_for_timeout(3000)
                 except Exception:
                     pass
 
-                scroll_until_stable(page, audit, max_rounds=10)
+                # Scroll plus long : certains blocs ATP qualifications sont plus bas dans la page.
+                scroll_until_stable(page, audit, max_rounds=12)
 
-                rows = page.evaluate(completed_results_js())
-                audit.append(f"flashscore_rows_raw={len(rows)}")
+                body_text = ""
+                try:
+                    body_text = page.inner_text("body", timeout=10000)
+                except Exception as exc:
+                    audit.append(f"flashscore_body_text_error={type(exc).__name__}: {exc}")
+
+                text_rows = parse_flashscore_text_completed_results(body_text, audit)
+                audit.append(f"flashscore_text_body_len={len(body_text)}")
+
+                if text_rows:
+                    rows = text_rows
+                    audit.append("flashscore_parser=text_body")
+                else:
+                    # Fallback DOM seulement si le texte complet ne donne rien.
+                    rows = page.evaluate(completed_results_js())
+                    audit.append(f"flashscore_rows_raw={len(rows)}")
+                    audit.append("flashscore_parser=dom_fallback")
 
                 kept = 0
                 for row in rows:
@@ -800,11 +1004,11 @@ def fetch_flashscore_completed_results(target_day: date, audit: List[str]) -> Li
                     if not is_completed_row(row):
                         continue
 
-                    winner = winner_from_completed_row(row)
+                    winner = str(row.get("winner") or "").strip() or winner_from_completed_row(row)
                     if not winner:
                         continue
 
-                    key = (norm_name(a), norm_name(b), str(row.get("raw") or "")[:80])
+                    key = (norm_name(a), norm_name(b), str(row.get("score") or row.get("raw") or "")[:120])
                     if key in seen:
                         continue
                     seen.add(key)
@@ -813,11 +1017,13 @@ def fetch_flashscore_completed_results(target_day: date, audit: List[str]) -> Li
                         "playerA": a,
                         "playerB": b,
                         "winner": winner,
-                        "score": score_from_completed_row(row, winner),
+                        "score": str(row.get("score") or score_from_completed_row(row, winner) or ""),
                         "homeScores": int_list(row.get("homeScores")),
                         "awayScores": int_list(row.get("awayScores")),
                         "status": str(row.get("status") or ""),
                         "header": str(row.get("header") or "")[:250],
+                        "tournament": str(row.get("tournament") or row.get("header") or "")[:250],
+                        "surface": infer_surface_from_tournament(str(row.get("header") or row.get("tournament") or ""), "Hard"),
                         "raw": str(row.get("raw") or "")[:500],
                     }
                     all_rows.append(clean)
@@ -841,10 +1047,10 @@ def fetch_flashscore_completed_results(target_day: date, audit: List[str]) -> Li
 
     if all_rows:
         sample = []
-        for row in all_rows[:15]:
+        for row in all_rows[:25]:
             sample.append(
                 f"{row.get('playerA')} - {row.get('playerB')} "
-                f"winner={row.get('winner')} score={row.get('score')}"
+                f"winner={row.get('winner')} score={row.get('score')} surface={row.get('surface')}"
             )
         audit.append("flashscore_sample=" + " || ".join(sample))
 
@@ -887,22 +1093,47 @@ BANNED_TE_TOURNAMENT_WORDS = (
 TOURNAMENT_SURFACE_HINTS = {
     # Terre battue période actuelle / tournois ATP connus.
     "rome": "Clay",
+    "roma": "Clay",
     "geneva": "Clay",
+    "geneve": "Clay",
+    "genève": "Clay",
     "hamburg": "Clay",
+    "hambourg": "Clay",
     "lyon": "Clay",
     "munich": "Clay",
+    "munchen": "Clay",
+    "muenchen": "Clay",
     "madrid": "Clay",
     "monte carlo": "Clay",
     "barcelona": "Clay",
+    "barcelone": "Clay",
     "bastad": "Clay",
     "kitzbuhel": "Clay",
+    "kitzbuehel": "Clay",
     "gstaad": "Clay",
     "roland garros": "Clay",
     "french open": "Clay",
+    "buenos aires": "Clay",
+    "rio de janeiro": "Clay",
+    "santiago": "Clay",
+    "houston": "Clay",
+    "estoril": "Clay",
+    "marrakech": "Clay",
+    "bucharest": "Clay",
+    "bucarest": "Clay",
+    "belgrade": "Clay",
+    "umag": "Clay",
+    "los cabos": "Hard",
+    "acapulco": "Hard",
+    "doha": "Hard",
+    "dubai": "Hard",
+    "indian wells": "Hard",
+    "miami": "Hard",
     # Gazon.
     "halle": "Grass",
     "stuttgart": "Grass",
     "s hertogenbosch": "Grass",
+    "hertogenbosch": "Grass",
     "queens": "Grass",
     "queen": "Grass",
     "mallorca": "Grass",
@@ -948,11 +1179,64 @@ def tournament_is_allowed_atp_main(name: str) -> bool:
 
 
 def infer_surface_from_tournament(name: str, fallback: str = "Hard") -> str:
-    n = strip_accents(name or "").lower()
+    """
+    Déduit la surface depuis le libellé tournoi/source.
+
+    IMPORTANT pour Tennis Motor : ne jamais laisser le fallback mettre Hard
+    quand la source contient clairement "terre battue". Le fallback Flashscore
+    renvoie souvent des headers français du type :
+      "Genève (Suisse) - Qualifications, terre battue ATP - SIMPLES: Tableau"
+      "Hambourg (Allemagne) - Qualifications, terre battue ATP - SIMPLES: Tableau"
+    Ces lignes doivent devenir Clay, sinon le Surface-Weighted Elo est pollué.
+    """
+    raw = str(name or "")
+    n = strip_accents(raw).lower()
+    n = n.replace("'", " ").replace("’", " ")
+    n = re.sub(r"[^a-z0-9]+", " ", n)
+    n = normalize_space(n)
+
+    # Indices explicites de surface, prioritaires sur les noms de tournoi.
+    clay_words = (
+        "terre battue",
+        "clay",
+        "red clay",
+        "green clay",
+        "terre",
+        "terra batida",
+        "polvere di mattone",
+    )
+    grass_words = (
+        "gazon",
+        "grass",
+        "herbe",
+        "cesped",
+    )
+    hard_words = (
+        "hard",
+        "dur",
+        "dure",
+        "indoor hard",
+        "outdoor hard",
+        "cement",
+        "carpet",
+    )
+
+    for word in clay_words:
+        if word in n:
+            return "Clay"
+    for word in grass_words:
+        if word in n:
+            return "Grass"
+    for word in hard_words:
+        if word in n:
+            return "Hard"
+
+    # Indices par tournoi ATP connus. Inclut les noms FR/accents supprimés.
     for key, value in TOURNAMENT_SURFACE_HINTS.items():
         if key in n:
             return value
-    return fallback
+
+    return normalize_surface(fallback)
 
 
 def infer_level_from_tournament(name: str) -> str:
