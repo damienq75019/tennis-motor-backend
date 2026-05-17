@@ -23,6 +23,7 @@ Fonctionnement attendu avec ton app.py actuel :
 from __future__ import annotations
 
 import csv
+import hashlib
 import json
 import os
 import re
@@ -928,8 +929,11 @@ def collect_flashscore_body_text_by_scrolling(page: Any, audit: List[str], max_s
         clean = str(txt or "").strip()
         if not clean:
             return
-        # Signature assez courte pour éviter de stocker 20 fois le même viewport.
-        sig = clean[:300] + "::" + clean[-300:] + f"::len={len(clean)}"
+        # IMPORTANT : Flashscore garde souvent le même haut/bas de page (pubs, cookies, menu)
+        # pendant que le contenu central change avec la virtualisation.
+        # L'ancienne signature début+fin+longueur confondait donc plusieurs vues différentes
+        # et ne gardait que 2 blocs. On hash maintenant tout le texte du viewport.
+        sig = hashlib.sha1(clean.encode("utf-8", "ignore")).hexdigest()
         if sig not in seen_blocks:
             seen_blocks.add(sig)
             blocks.append(clean)
@@ -950,19 +954,19 @@ def collect_flashscore_body_text_by_scrolling(page: Any, audit: List[str], max_s
                 const y = window.scrollY || document.documentElement.scrollTop || 0;
                 const h = document.body.scrollHeight || document.documentElement.scrollHeight || 0;
                 const vh = window.innerHeight || 900;
-                window.scrollBy(0, Math.max(650, Math.floor(vh * 0.75)));
+                window.scrollBy(0, Math.max(420, Math.floor(vh * 0.45)));
                 return {y, h, vh};
             }""")
         except Exception:
             info = {"y": last_y, "h": 0, "vh": 0}
 
         try:
-            page.mouse.wheel(0, 1200)
+            page.mouse.wheel(0, 700)
         except Exception:
             pass
 
         try:
-            page.wait_for_timeout(650)
+            page.wait_for_timeout(850)
         except Exception:
             pass
 
@@ -984,7 +988,8 @@ def collect_flashscore_body_text_by_scrolling(page: Any, audit: List[str], max_s
             break
 
     combined = "\n".join(blocks)
-    audit.append(f"flashscore_text_blocks_collected={len(blocks)} combined_len={len(combined)}")
+    atp_sections = len(re.findall(r"ATP\s*-\s*SIMPLES", strip_accents(combined), flags=re.IGNORECASE))
+    audit.append(f"flashscore_text_blocks_collected={len(blocks)} combined_len={len(combined)} atp_sections_seen={atp_sections}")
     return combined
 
 def fetch_flashscore_completed_results(target_day: date, audit: List[str]) -> List[Dict[str, Any]]:
@@ -1054,7 +1059,7 @@ def fetch_flashscore_completed_results(target_day: date, audit: List[str]) -> Li
                 # Flashscore virtualise les lignes : on doit collecter le texte
                 # à plusieurs positions de scroll, sinon on ne récupère qu'une partie
                 # des matchs ATP simples terminés.
-                body_text = collect_flashscore_body_text_by_scrolling(page, audit, max_steps=30)
+                body_text = collect_flashscore_body_text_by_scrolling(page, audit, max_steps=55)
 
                 text_rows = parse_flashscore_text_completed_results(body_text, audit)
                 audit.append(f"flashscore_text_body_len={len(body_text)}")
