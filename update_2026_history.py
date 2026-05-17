@@ -2218,13 +2218,21 @@ def resolve_sync_days(existing_rows: List[Dict[str, Any]], audit: List[str]) -> 
     if last_day is None:
         start_day = end_day
         audit.append("sync_mode=no_history_fallback_yesterday")
-    else:
-        start_day = last_day + timedelta(days=1)
-        audit.append(f"sync_mode=from_last_csv_date last_csv_date={last_day.isoformat()} start={start_day.isoformat()} end={end_day.isoformat()}")
-
-    if start_day > end_day:
+    elif last_day >= end_day:
+        # Historique Elo déjà synchronisé au moins jusqu'à hier.
+        # Ne pas produire une plage incohérente du type start > end :
+        # app.py doit pouvoir marquer le run comme proprement terminé.
+        audit.append(
+            f"sync_mode=history_already_current last_csv_date={last_day.isoformat()} end={end_day.isoformat()}"
+        )
         audit.append("sync_days=none_history_already_current")
         return []
+    else:
+        start_day = last_day + timedelta(days=1)
+        audit.append(
+            f"sync_mode=from_last_csv_date last_csv_date={last_day.isoformat()} "
+            f"start={start_day.isoformat()} end={end_day.isoformat()}"
+        )
 
     days: List[date] = []
     d = start_day
@@ -2428,7 +2436,9 @@ def main() -> int:
         "sourceRowsByDay": source_rows_by_day,
         "addedByDay": added_by_day,
         "sourceRows": total_source_rows,
+        "completedRows": total_source_rows,
         "payloadRows": total_payload_rows,
+        "historyAlreadyCurrent": len(sync_days) == 0,
         "existingRowsBefore": existing_rows_before,
         "addedRows": len(added_rows),
         "premiumSettlement": premium_settlement,
