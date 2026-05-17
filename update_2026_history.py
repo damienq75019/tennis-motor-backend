@@ -33,6 +33,9 @@ from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+import requests
+from bs4 import BeautifulSoup
+
 try:
     from zoneinfo import ZoneInfo
 except Exception:
@@ -863,6 +866,457 @@ def find_completed_for_payload(source_a: str, source_b: str, completed: List[Dic
 
 
 # ---------------------------------------------------------------------------
+# TennisExplorer ATP singles terminés par date (source principale 2026.csv)
+# ---------------------------------------------------------------------------
+
+TENNIS_EXPLORER_RESULTS_URL = "https://www.tennisexplorer.com/results/"
+
+BANNED_TE_TOURNAMENT_WORDS = (
+    "challenger",
+    "futures",
+    "utr",
+    "exhibition",
+    "boys",
+    "girls",
+    "juniors",
+    "wta",
+    "doubles",
+    "double",
+)
+
+TOURNAMENT_SURFACE_HINTS = {
+    # Terre battue période actuelle / tournois ATP connus.
+    "rome": "Clay",
+    "geneva": "Clay",
+    "hamburg": "Clay",
+    "lyon": "Clay",
+    "munich": "Clay",
+    "madrid": "Clay",
+    "monte carlo": "Clay",
+    "barcelona": "Clay",
+    "bastad": "Clay",
+    "kitzbuhel": "Clay",
+    "gstaad": "Clay",
+    "roland garros": "Clay",
+    "french open": "Clay",
+    # Gazon.
+    "halle": "Grass",
+    "stuttgart": "Grass",
+    "s hertogenbosch": "Grass",
+    "queens": "Grass",
+    "queen": "Grass",
+    "mallorca": "Grass",
+    "eastbourne": "Grass",
+    "wimbledon": "Grass",
+}
+
+TOURNAMENT_LEVEL_HINTS = {
+    "rome": "M",
+    "madrid": "M",
+    "monte carlo": "M",
+    "miami": "M",
+    "indian wells": "M",
+    "canada": "M",
+    "cincinnati": "M",
+    "shanghai": "M",
+    "paris masters": "M",
+    "roland garros": "G",
+    "french open": "G",
+    "australian open": "G",
+    "wimbledon": "G",
+    "us open": "G",
+}
+
+
+def tennis_explorer_url_for_day(target_day: date) -> str:
+    # TennisExplorer accepte ces paramètres. La page /results/ affiche aussi une navigation
+    # jour précédent/suivant ; le parser limite ensuite au bloc target_day.
+    return (
+        f"{TENNIS_EXPLORER_RESULTS_URL}"
+        f"?type=atp-single&year={target_day.year}&month={target_day.month:02d}&day={target_day.day:02d}"
+    )
+
+
+def tournament_is_allowed_atp_main(name: str) -> bool:
+    n = strip_accents(name or "").lower()
+    if not n:
+        return False
+    if any(w in n for w in BANNED_TE_TOURNAMENT_WORDS):
+        return False
+    # On garde les tournois ATP principaux. Les challengers/futures sont explicitement rejetés.
+    return True
+
+
+def infer_surface_from_tournament(name: str, fallback: str = "Hard") -> str:
+    n = strip_accents(name or "").lower()
+    for key, value in TOURNAMENT_SURFACE_HINTS.items():
+        if key in n:
+            return value
+    return fallback
+
+
+def infer_level_from_tournament(name: str) -> str:
+    n = strip_accents(name or "").lower()
+    for key, value in TOURNAMENT_LEVEL_HINTS.items():
+        if key in n:
+            return value
+    return "A"
+
+
+def clean_te_player_name(raw: str) -> str:
+    text = normalize_space(raw)
+    text = re.sub(r"\(\d+\)", " ", text)          # seed
+    text = re.sub(r"\b(?:WC|Q|LL|PR|ALT)\b", " ", text, flags=re.I)
+    return normalize_space(text)
+
+
+def canonical_from_known_names(name: str, known_names: List[str]) -> str:
+    for known in known_names:
+        if same_player(name, known):
+            return known
+    return clean_te_player_name(name)
+
+
+def parse_te_player_line(line: str, starts_with_time: bool) -> Optional[Dict[str, Any]]:
+    """
+    Parse une ligne TennisExplorer du type :
+      11:10 Feldbausch K. 2 6 6 3.01 1.36 info
+      Ofner S. (3) 0 4 0
+    """
+    text = normalize_space(line)
+    if not text:
+        return None
+
+    if starts_with_time:
+        m = re.match(r"^(\d{1,2}:\d{2}|--:--)\s+(.+)$", text)
+        if not m:
+            return None
+        time_value = m.group(1)
+        rest = m.group(2)
+    else:
+        time_value = ""
+        rest = text
+
+    rest = re.sub(r"\s+info\b.*$", "", rest, flags=re.I).strip()
+    # Retire les cotes décimales finales.
+    rest = re.sub(r"\s+\d+\.\d+\s+\d+\.\d+\s*$", "", rest).strip()
+    rest = re.sub(r"\s+\d+\.\d+\s*$", "", rest).strip()
+
+    # Les scores apparaissent sous forme d'entiers éventuellement suivis d'un tie-break ^{x}.
+    score_matches = list(re.finditer(r"(?<![A-Za-z])\d{1,2}(?:\^\{\d+\})?(?![A-Za-z])", rest))
+    if not score_matches:
+        return None
+
+    first_score = score_matches[0]
+    name_raw = rest[:first_score.start()].strip()
+    nums_raw = [m.group(0) for m in score_matches]
+
+    if not name_raw or not nums_raw:
+        return None
+
+    sets = safe_int(re.sub(r"\^\{\d+\}", "", nums_raw[0]), -1)
+    games_raw = nums_raw[1:]
+
+    games: List[str] = []
+    for item in games_raw:
+        tb = re.match(r"^(\d+)(?:\^\{(\d+)\})?$", item)
+        if not tb:
+            continue
+        if tb.group(2):
+            games.append(f"{tb.group(1)}({tb.group(2)})")
+        else:
+            games.append(tb.group(1))
+
+    return {
+        "time": time_value,
+        "name": clean_te_player_name(name_raw),
+        "sets": sets,
+        "games": games,
+        "raw": line,
+    }
+
+
+def build_score_from_te(winner_line: Dict[str, Any], loser_line: Dict[str, Any]) -> str:
+    wg = list(winner_line.get("games") or [])
+    lg = list(loser_line.get("games") or [])
+    parts = []
+    for w, l in zip(wg, lg):
+        if str(w) and str(l):
+            parts.append(f"{w}-{l}")
+    if parts:
+        return " ".join(parts)
+    ws = safe_int(winner_line.get("sets"), 0)
+    ls = safe_int(loser_line.get("sets"), 0)
+    return f"{ws}-{ls}" if ws or ls else ""
+
+
+def tennis_explorer_text_lines(html: str) -> List[str]:
+    soup = BeautifulSoup(html, "lxml")
+    # On privilégie le texte ligne par ligne : TennisExplorer est assez stable en texte.
+    text = soup.get_text("\n", strip=True)
+    lines = [normalize_space(x) for x in text.splitlines()]
+    return [x for x in lines if x]
+
+
+def fetch_tennis_explorer_atp_singles_results(target_day: date, audit: List[str], known_names: Optional[List[str]] = None) -> List[Dict[str, Any]]:
+    known_names = known_names or []
+    url = tennis_explorer_url_for_day(target_day)
+    audit.append(f"tennisexplorer_url={url}")
+
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+        ),
+        "Accept-Language": "fr-FR,fr;q=0.9,en;q=0.8",
+    }
+
+    try:
+        response = requests.get(url, headers=headers, timeout=35)
+        audit.append(f"tennisexplorer_status={response.status_code}")
+        response.raise_for_status()
+    except Exception as exc:
+        audit.append(f"tennisexplorer_fetch_error={type(exc).__name__}: {exc}")
+        return []
+
+    lines = tennis_explorer_text_lines(response.text)
+    audit.append(f"tennisexplorer_lines={len(lines)}")
+
+    # La page peut contenir aujourd'hui + hier. On parse tout, puis on ne garde que le bloc
+    # après la date cible jusqu'à la date précédente/suivante suivante.
+    date_marker = f"{target_day.day:02d}. {target_day.month:02d}. {target_day.year}"
+    alt_marker = f"{target_day.day}. {target_day.month:02d}. {target_day.year}"
+
+    start_idx = None
+    for idx, line in enumerate(lines):
+        if date_marker in line or alt_marker in line:
+            start_idx = idx
+            break
+
+    if start_idx is None:
+        audit.append(f"tennisexplorer_target_date_not_found={date_marker}")
+        work_lines = lines
+    else:
+        work_lines = []
+        for line in lines[start_idx + 1:]:
+            if re.search(r"\b\d{1,2}\.\s*\d{2}\.\s*\d{4}\b", line):
+                break
+            work_lines.append(line)
+
+    results: List[Dict[str, Any]] = []
+    current_tournament = ""
+    seen = set()
+    i = 0
+
+    def is_tournament_header(line: str) -> bool:
+        if re.match(r"^(\d{1,2}:\d{2}|--:--)", line):
+            return False
+        low = strip_accents(line).lower()
+        if " s 1 2 3 4 5" in low or re.search(r"\bS\s+1\s+2\s+3\s+4\s+5\b", line):
+            return True
+        # Fallback : noms de tournois connus suivis d'un S.
+        return bool(re.search(r"\bS\s+1\s+2\s+3", line))
+
+    while i < len(work_lines):
+        line = work_lines[i]
+
+        if is_tournament_header(line):
+            current_tournament = re.sub(r"\s+S\s+1\s+2\s+3.*$", "", line).strip()
+            i += 1
+            continue
+
+        if not re.match(r"^(\d{1,2}:\d{2}|--:--)", line):
+            i += 1
+            continue
+
+        if i + 1 >= len(work_lines):
+            i += 1
+            continue
+
+        p1 = parse_te_player_line(work_lines[i], starts_with_time=True)
+        p2 = parse_te_player_line(work_lines[i + 1], starts_with_time=False)
+        i += 2
+
+        if not p1 or not p2:
+            continue
+
+        if not tournament_is_allowed_atp_main(current_tournament):
+            continue
+
+        s1 = safe_int(p1.get("sets"), -1)
+        s2 = safe_int(p2.get("sets"), -1)
+        if s1 < 0 or s2 < 0 or s1 == s2 or max(s1, s2) < 2:
+            continue
+
+        winner_line = p1 if s1 > s2 else p2
+        loser_line = p2 if s1 > s2 else p1
+        winner = canonical_from_known_names(str(winner_line.get("name") or ""), known_names)
+        loser = canonical_from_known_names(str(loser_line.get("name") or ""), known_names)
+
+        if not winner or not loser or "/" in winner or "/" in loser:
+            continue
+
+        key = (norm_name(current_tournament), norm_name(winner), norm_name(loser), build_score_from_te(winner_line, loser_line))
+        if key in seen:
+            continue
+        seen.add(key)
+
+        score = build_score_from_te(winner_line, loser_line)
+        results.append({
+            "source": "TennisExplorer",
+            "playerA": winner,
+            "playerB": loser,
+            "winner": winner,
+            "loser": loser,
+            "score": score,
+            "tournament": current_tournament,
+            "surface": infer_surface_from_tournament(current_tournament, "Hard"),
+            "level": infer_level_from_tournament(current_tournament),
+            "time": str(p1.get("time") or ""),
+            "header": current_tournament,
+            "raw": f"{work_lines[i-2]} || {work_lines[i-1]}",
+        })
+
+    audit.append(f"tennisexplorer_rows_kept={len(results)}")
+    if results:
+        audit.append("tennisexplorer_sample=" + " || ".join(
+            f"{r['tournament']}: {r['winner']} d. {r['loser']} {r['score']}" for r in results[:20]
+        ))
+    return results
+
+
+def known_player_names_from_history(rows: List[Dict[str, Any]]) -> List[str]:
+    names: List[str] = []
+    seen = set()
+    for row in rows:
+        for key in ("winner_name", "loser_name"):
+            name = str(row.get(key) or "").strip()
+            nk = norm_name(name)
+            if name and nk and nk not in seen:
+                seen.add(nk)
+                names.append(name)
+    return names
+
+
+def latest_player_info_from_history(rows: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
+    info: Dict[str, Dict[str, Any]] = {}
+    for row in sorted(rows, key=lambda r: safe_int(r.get("tourney_date"), 0)):
+        for prefix in ("winner", "loser"):
+            name = str(row.get(f"{prefix}_name") or "").strip()
+            nk = norm_name(name)
+            if not nk:
+                continue
+            current = info.setdefault(nk, {"name": name})
+            for field in ("id", "hand", "ht", "ioc", "age", "rank", "rank_points"):
+                v = row.get(f"{prefix}_{field}")
+                if v not in (None, "", 0, "0"):
+                    current[field] = v
+            current["name"] = name
+    return info
+
+
+def add_payload_player_info(payload_matches: List[Dict[str, Any]], info: Dict[str, Dict[str, Any]]) -> None:
+    for match in payload_matches:
+        ctx = payload_context(match)
+        for name in (ctx.get("sourceA"), ctx.get("sourceB")):
+            nk = norm_name(str(name or ""))
+            if nk and name:
+                info.setdefault(nk, {"name": str(name)})
+        for nk, pts in (ctx.get("pointsByName") or {}).items():
+            if pts:
+                info.setdefault(nk, {"name": nk})["rank_points"] = str(pts)
+        for nk, rk in (ctx.get("rankByName") or {}).items():
+            if rk:
+                info.setdefault(nk, {"name": nk})["rank"] = str(rk)
+
+
+def find_player_info(name: str, info: Dict[str, Dict[str, Any]]) -> Dict[str, Any]:
+    nk = norm_name(name)
+    if nk in info:
+        return info[nk]
+    for key, value in info.items():
+        if same_player(name, str(value.get("name") or key)):
+            return value
+    return {"name": name}
+
+
+def make_history_row_from_result(
+    fieldnames: List[str],
+    result: Dict[str, Any],
+    target_day: date,
+    match_num: int,
+    player_info: Dict[str, Dict[str, Any]],
+) -> Dict[str, Any]:
+    winner = str(result.get("winner") or result.get("playerA") or "").strip()
+    loser = str(result.get("loser") or result.get("playerB") or "").strip()
+    winfo = find_player_info(winner, player_info)
+    linfo = find_player_info(loser, player_info)
+
+    base: Dict[str, Any] = {key: "" for key in fieldnames}
+    tourney_name = str(result.get("tournament") or "ATP Daily Completed").strip() or "ATP Daily Completed"
+    tourney_level = str(result.get("level") or infer_level_from_tournament(tourney_name) or "A")
+    surface = normalize_surface(result.get("surface") or infer_surface_from_tournament(tourney_name, "Hard"))
+
+    values = {
+        "tourney_id": f"{target_day.year}-TE-{target_day.strftime('%m%d')}-{norm_name(tourney_name).replace(' ', '-')[:18]}",
+        "tourney_name": tourney_name,
+        "surface": surface,
+        "draw_size": "",
+        "tourney_level": tourney_level,
+        "indoor": "",
+        "tourney_date": str(ymd_int(target_day)),
+        "match_num": str(match_num),
+        "winner_id": str(winfo.get("id") or ""),
+        "winner_seed": "",
+        "winner_entry": "",
+        "winner_name": winner,
+        "winner_hand": str(winfo.get("hand") or ""),
+        "winner_ht": str(winfo.get("ht") or ""),
+        "winner_ioc": str(winfo.get("ioc") or ""),
+        "winner_age": str(winfo.get("age") or ""),
+        "winner_rank": str(winfo.get("rank") or ""),
+        "winner_rank_points": str(winfo.get("rank_points") or ""),
+        "loser_id": str(linfo.get("id") or ""),
+        "loser_seed": "",
+        "loser_entry": "",
+        "loser_name": loser,
+        "loser_hand": str(linfo.get("hand") or ""),
+        "loser_ht": str(linfo.get("ht") or ""),
+        "loser_ioc": str(linfo.get("ioc") or ""),
+        "loser_age": str(linfo.get("age") or ""),
+        "loser_rank": str(linfo.get("rank") or ""),
+        "loser_rank_points": str(linfo.get("rank_points") or ""),
+        "score": str(result.get("score") or ""),
+        "best_of": "3",
+        "round": "",
+        "minutes": "",
+        "w_ace": "",
+        "w_df": "",
+        "w_svpt": "",
+        "w_1stIn": "",
+        "w_1stWon": "",
+        "w_2ndWon": "",
+        "w_SvGms": "",
+        "w_bpSaved": "",
+        "w_bpFaced": "",
+        "l_ace": "",
+        "l_df": "",
+        "l_svpt": "",
+        "l_1stIn": "",
+        "l_1stWon": "",
+        "l_2ndWon": "",
+        "l_SvGms": "",
+        "l_bpSaved": "",
+        "l_bpFaced": "",
+    }
+
+    for key, value in values.items():
+        if key in base:
+            base[key] = value
+    return base
+
+
+# ---------------------------------------------------------------------------
 # CSV 2026
 # ---------------------------------------------------------------------------
 
@@ -1043,287 +1497,6 @@ def write_history(fieldnames: List[str], rows: List[Dict[str, Any]]) -> None:
         for row in rows:
             writer.writerow({key: row.get(key, "") for key in fieldnames})
 
-
-
-# ---------------------------------------------------------------------------
-# Ajout ELO global : tous les ATP simples terminés, pas seulement premiums
-# ---------------------------------------------------------------------------
-
-def header_tourney_name(header: str) -> str:
-    txt = normalize_space(header or "")
-    if not txt:
-        return "ATP Daily Completed"
-    # Exemples Flashscore : "ATP - SIMPLES: Rome (Italie), terre battue"
-    if ":" in txt:
-        right = normalize_space(txt.split(":", 1)[1])
-    else:
-        right = txt
-    right = re.sub(r",?\s*(terre battue|clay|dur|hard|gazon|grass).*", "", right, flags=re.I)
-    right = normalize_space(right)
-    return right or "ATP Daily Completed"
-
-
-def surface_from_completed_or_ctx(completed_row: Dict[str, Any], ctx: Optional[Dict[str, Any]] = None) -> str:
-    header = str(completed_row.get("header") or "")
-    surf = normalize_surface(header)
-    if surf != "Hard" or re.search(r"hard|dur", header, flags=re.I):
-        return surf
-    if ctx:
-        return normalize_surface(ctx.get("surface"))
-    return surf
-
-
-def build_existing_player_refs(existing_rows: List[Dict[str, Any]]) -> Tuple[Dict[str, str], Dict[str, int], Dict[str, int]]:
-    names: Dict[str, str] = {}
-    latest_points: Dict[str, int] = {}
-    latest_rank: Dict[str, int] = {}
-
-    for row in existing_rows:
-        for side in ("winner", "loser"):
-            name = str(row.get(f"{side}_name") or "").strip()
-            if not name:
-                continue
-            key = norm_name(name)
-            if key:
-                names[key] = name
-            pts = safe_int(row.get(f"{side}_rank_points"), 0)
-            rnk = safe_int(row.get(f"{side}_rank"), 0)
-            if pts > 0:
-                latest_points[key] = pts
-            if rnk > 0:
-                latest_rank[key] = rnk
-    return names, latest_points, latest_rank
-
-
-def fetch_live_points_map_for_update(audit: List[str]) -> Dict[str, int]:
-    """
-    Réutilise le module 10k pour récupérer les points ATP live.
-    Si le web bloque, le script continue avec points issus de 2026.csv/payload.
-    """
-    try:
-        import importlib.util
-        import requests
-        module_path = BASE_DIR / "fetch_day_lines_v6_10k_daily_schedule_no_forced_veto.py"
-        spec = importlib.util.spec_from_file_location("tm_fetch_10k_for_update", module_path)
-        if spec is None or spec.loader is None:
-            audit.append("live_points_import_error=spec_none")
-            return {}
-        mod = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(mod)  # type: ignore[attr-defined]
-        session = requests.Session()
-        pts = mod.fetch_points_map(session, audit)  # type: ignore[attr-defined]
-        if isinstance(pts, dict):
-            out = {norm_name(str(k)): safe_int(v, 0) for k, v in pts.items() if safe_int(v, 0) > 0}
-            audit.append(f"live_points_loaded_for_update={len(out)}")
-            return out
-    except Exception as exc:
-        audit.append(f"live_points_for_update_error={type(exc).__name__}: {exc}")
-    return {}
-
-
-def resolve_full_name(
-    fs_name: str,
-    payload_contexts: List[Dict[str, Any]],
-    live_points: Dict[str, int],
-    existing_names: Dict[str, str],
-) -> str:
-    raw = normalize_space(fs_name)
-    if not raw:
-        return ""
-
-    candidates: List[str] = []
-
-    for ctx in payload_contexts:
-        for key in ("sourceA", "sourceB"):
-            val = str(ctx.get(key) or "").strip()
-            if val and same_player(val, raw):
-                candidates.append(val)
-
-    for val in existing_names.values():
-        if val and same_player(val, raw):
-            candidates.append(val)
-
-    for key in live_points.keys():
-        # live_points keys sont normalisées; on les remet en Title Case si nécessaire.
-        if key and same_player(key, raw):
-            candidates.append(" ".join(part.capitalize() for part in key.split()))
-
-    # Déduplique en gardant l'ordre.
-    seen = set()
-    unique: List[str] = []
-    for c in candidates:
-        nk = norm_name(c)
-        if nk and nk not in seen:
-            seen.add(nk)
-            unique.append(c)
-
-    if len(unique) == 1:
-        return unique[0]
-
-    # Si plusieurs candidats, choisir celui qui contient le plus de tokens du nom Flashscore.
-    fs_tokens = set(name_tokens(raw, keep_short=False))
-    if unique and fs_tokens:
-        unique.sort(key=lambda x: len(fs_tokens.intersection(set(name_tokens(x, keep_short=False)))), reverse=True)
-        return unique[0]
-
-    return raw
-
-
-def points_rank_for_player(
-    player_name: str,
-    ctx: Optional[Dict[str, Any]],
-    live_points: Dict[str, int],
-    existing_points: Dict[str, int],
-    existing_rank: Dict[str, int],
-) -> Tuple[int, int]:
-    key = norm_name(player_name)
-
-    if ctx:
-        pbn = ctx.get("pointsByName") or {}
-        rbn = ctx.get("rankByName") or {}
-        if isinstance(pbn, dict):
-            for k, v in pbn.items():
-                if same_player(str(k), player_name):
-                    pts = safe_int(v, 0)
-                    if pts > 0:
-                        rank = 0
-                        if isinstance(rbn, dict):
-                            for rk, rv in rbn.items():
-                                if same_player(str(rk), player_name):
-                                    rank = safe_int(rv, 0)
-                                    break
-                        return pts, rank
-
-    if key in live_points and live_points[key] > 0:
-        # Rang approximé par ordre des points live. Suffisant pour garder le format; Elo utilise surtout points + SWE.
-        sorted_pts = sorted(set(live_points.values()), reverse=True)
-        rank = sorted_pts.index(live_points[key]) + 1 if live_points[key] in sorted_pts else 0
-        return live_points[key], rank
-
-    # matching souple dans live_points
-    matches = [k for k in live_points if same_player(k, player_name)]
-    if len(matches) == 1:
-        pts = live_points[matches[0]]
-        sorted_pts = sorted(set(live_points.values()), reverse=True)
-        rank = sorted_pts.index(pts) + 1 if pts in sorted_pts else 0
-        return pts, rank
-
-    if key in existing_points:
-        return existing_points.get(key, 0), existing_rank.get(key, 0)
-
-    matches = [k for k in existing_points if same_player(k, player_name)]
-    if len(matches) == 1:
-        k = matches[0]
-        return existing_points.get(k, 0), existing_rank.get(k, 0)
-
-    return 1, 0
-
-
-def find_payload_context_for_completed(completed_row: Dict[str, Any], payload_contexts: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
-    fs_a = str(completed_row.get("playerA") or "")
-    fs_b = str(completed_row.get("playerB") or "")
-    for ctx in payload_contexts:
-        source_a = str(ctx.get("sourceA") or "")
-        source_b = str(ctx.get("sourceB") or "")
-        if not source_a or not source_b:
-            continue
-        if (same_player(source_a, fs_a) and same_player(source_b, fs_b)) or (same_player(source_a, fs_b) and same_player(source_b, fs_a)):
-            return ctx
-    return None
-
-
-def make_history_row_from_completed_all_atp(
-    fieldnames: List[str],
-    completed_row: Dict[str, Any],
-    target_day: date,
-    match_num: int,
-    payload_contexts: List[Dict[str, Any]],
-    live_points: Dict[str, int],
-    existing_names: Dict[str, str],
-    existing_points: Dict[str, int],
-    existing_rank: Dict[str, int],
-) -> Dict[str, Any]:
-    ctx = find_payload_context_for_completed(completed_row, payload_contexts)
-
-    fs_a = str(completed_row.get("playerA") or "").strip()
-    fs_b = str(completed_row.get("playerB") or "").strip()
-    fs_winner = str(completed_row.get("winner") or "").strip()
-
-    full_a = resolve_full_name(fs_a, payload_contexts, live_points, existing_names)
-    full_b = resolve_full_name(fs_b, payload_contexts, live_points, existing_names)
-
-    if same_player(fs_winner, fs_a):
-        winner = full_a
-        loser = full_b
-    elif same_player(fs_winner, fs_b):
-        winner = full_b
-        loser = full_a
-    else:
-        winner = resolve_full_name(fs_winner, payload_contexts, live_points, existing_names)
-        loser = full_b if same_player(winner, full_a) else full_a
-
-    w_points, w_rank = points_rank_for_player(winner, ctx, live_points, existing_points, existing_rank)
-    l_points, l_rank = points_rank_for_player(loser, ctx, live_points, existing_points, existing_rank)
-
-    base: Dict[str, Any] = {key: "" for key in fieldnames}
-    score = score_from_completed_row(completed_row, fs_winner) or str(completed_row.get("score") or "")
-
-    values = {
-        "tourney_id": f"{target_day.year}-TM-{target_day.strftime('%m%d')}",
-        "tourney_name": header_tourney_name(str(completed_row.get("header") or "")),
-        "surface": surface_from_completed_or_ctx(completed_row, ctx),
-        "draw_size": "",
-        "tourney_level": "A",
-        "tourney_date": str(ymd_int(target_day)),
-        "match_num": str(match_num),
-        "winner_id": "",
-        "winner_seed": "",
-        "winner_entry": "",
-        "winner_name": winner,
-        "winner_hand": "",
-        "winner_ht": "",
-        "winner_ioc": "",
-        "winner_age": "",
-        "loser_id": "",
-        "loser_seed": "",
-        "loser_entry": "",
-        "loser_name": loser,
-        "loser_hand": "",
-        "loser_ht": "",
-        "loser_ioc": "",
-        "loser_age": "",
-        "score": score,
-        "best_of": "3",
-        "round": "R128",
-        "minutes": "",
-        "w_ace": "0",
-        "w_df": "0",
-        "w_svpt": "0",
-        "w_1stIn": "0",
-        "w_1stWon": "0",
-        "w_2ndWon": "0",
-        "w_SvGms": "0",
-        "w_bpSaved": "0",
-        "w_bpFaced": "0",
-        "l_ace": "0",
-        "l_df": "0",
-        "l_svpt": "0",
-        "l_1stIn": "0",
-        "l_1stWon": "0",
-        "l_2ndWon": "0",
-        "l_SvGms": "0",
-        "l_bpSaved": "0",
-        "l_bpFaced": "0",
-        "winner_rank": str(w_rank or ""),
-        "winner_rank_points": str(w_points or 1),
-        "loser_rank": str(l_rank or ""),
-        "loser_rank_points": str(l_points or 1),
-    }
-
-    for key, value in values.items():
-        if key in base:
-            base[key] = value
-    return base
 
 
 # ---------------------------------------------------------------------------
@@ -1645,6 +1818,7 @@ def settle_premium_history(completed_by_day: Dict[str, List[Dict[str, Any]]], au
 # Main
 # ---------------------------------------------------------------------------
 
+
 def main() -> int:
     _setup_stdout()
 
@@ -1654,60 +1828,90 @@ def main() -> int:
 
     target_day = resolve_target_day()
     audit.append(f"target_day={target_day.isoformat()}")
-    audit.append("source_policy=payload_daily_yesterday_plus_flashscore_completed")
+    audit.append("source_policy=tennisexplorer_atp_singles_results_primary")
+    audit.append("payload_policy=secondary_for_player_points_only")
     audit.append("jeff_sackmann=disabled")
     audit.append("non_completed_today_policy=reject")
 
+    fieldnames = read_history_fieldnames()
+    for col in STANDARD_COLUMNS:
+        if col not in fieldnames:
+            fieldnames.append(col)
+
+    existing_rows = read_existing_rows(fieldnames)
+    known_names = known_player_names_from_history(existing_rows)
+    player_info = latest_player_info_from_history(existing_rows)
+
     payload_matches = load_target_payload(target_day, audit)
+    add_payload_player_info(payload_matches, player_info)
 
-    if not payload_matches:
-        result = {
-            "status": "ok",
-            "targetDay": target_day.isoformat(),
-            "message": "Aucun payload Tennis Motor trouvé pour la veille. Rien ajouté à 2026.csv.",
-            "addedRows": 0,
-            "audit": audit,
-        }
-        AUDIT_PATH.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
-        print("✅ update_2026_history terminé sans ajout")
-        print("reason=no_payload_for_target_day")
-        print(f"target_day={target_day.isoformat()}")
-        print(f"audit={AUDIT_PATH}")
-        return 0
+    # Source principale pour Elo 2026 : résultats ATP singles terminés par date.
+    source_rows = fetch_tennis_explorer_atp_singles_results(target_day, audit, known_names=known_names)
+    source_name = "TennisExplorer"
 
-    completed_by_day: Dict[str, List[Dict[str, Any]]] = {}
+    # Fallback : si TennisExplorer est bloqué ou vide, on garde Flashscore pour ne pas casser le backend.
+    if not source_rows:
+        audit.append("tennisexplorer_empty_fallback_flashscore=on")
+        try:
+            flash_rows = fetch_flashscore_completed_results(target_day, audit)
+        except Exception as exc:
+            flash_rows = []
+            audit.append(f"flashscore_global_error={type(exc).__name__}: {exc}")
+        source_rows = []
+        for row in flash_rows:
+            tournament = str(row.get("header") or "ATP Daily Completed")
+            if not looks_like_atp_singles_header(tournament):
+                continue
+            winner = str(row.get("winner") or "").strip()
+            fs_a = str(row.get("playerA") or "").strip()
+            fs_b = str(row.get("playerB") or "").strip()
+            loser = fs_b if same_player(winner, fs_a) else fs_a
+            if not winner or not loser:
+                continue
+            source_rows.append({
+                "source": "Flashscore",
+                "playerA": winner,
+                "playerB": loser,
+                "winner": canonical_from_known_names(winner, known_names),
+                "loser": canonical_from_known_names(loser, known_names),
+                "score": str(row.get("score") or score_from_completed_row(row, winner) or ""),
+                "tournament": tournament if tournament else "ATP Daily Completed",
+                "surface": infer_surface_from_tournament(tournament, "Hard"),
+                "level": infer_level_from_tournament(tournament),
+                "header": tournament,
+                "raw": str(row.get("raw") or ""),
+            })
+        source_name = "FlashscoreFallback"
 
-    try:
-        completed_rows = fetch_flashscore_completed_results(target_day, audit)
-    except Exception as exc:
-        completed_rows = []
-        audit.append(f"flashscore_global_error={type(exc).__name__}: {exc}")
+    completed_by_day: Dict[str, List[Dict[str, Any]]] = {target_day.isoformat(): source_rows}
 
-    completed_by_day[target_day.isoformat()] = completed_rows
-
-    # L'historique Unity peut avoir des premiums pending depuis 1 à 14 jours.
-    # On corrige seulement premium_history.json, sans toucher au daily 10k.
+    # L'historique premium Unity reste réglé avec les résultats disponibles.
+    # Si la date pending n'est pas target_day, on relit TennisExplorer pour cette date.
     for pending_day in premium_pending_dates(target_day, audit, lookback_days=14):
         day_key = pending_day.isoformat()
         if day_key in completed_by_day:
             continue
-        try:
-            completed_by_day[day_key] = fetch_flashscore_completed_results(pending_day, audit)
-        except Exception as exc:
-            completed_by_day[day_key] = []
-            audit.append(f"flashscore_pending_day_error date={day_key} error={type(exc).__name__}: {exc}")
+        rows_for_pending = fetch_tennis_explorer_atp_singles_results(pending_day, audit, known_names=known_names)
+        if not rows_for_pending:
+            try:
+                rows_for_pending = fetch_flashscore_completed_results(pending_day, audit)
+            except Exception as exc:
+                rows_for_pending = []
+                audit.append(f"premium_pending_source_error date={day_key} error={type(exc).__name__}: {exc}")
+        completed_by_day[day_key] = rows_for_pending
 
     premium_settlement = settle_premium_history(completed_by_day, audit)
     dates_checked = sorted(completed_by_day.keys())
     audit.append("dates_checked=" + ",".join(dates_checked))
 
-    if not completed_rows:
+    if not source_rows:
         result = {
             "status": "ok",
             "targetDay": target_day.isoformat(),
-            "message": "Flashscore n'a donné aucun match terminé exploitable pour 2026.csv. Historique premium traité séparément.",
+            "message": "Aucune source ATP singles terminée exploitable pour 2026.csv.",
+            "source": source_name,
+            "sourceRows": 0,
             "payloadRows": len(payload_matches),
-            "completedRows": 0,
             "addedRows": 0,
             "premiumSettlement": premium_settlement,
             "datesChecked": dates_checked,
@@ -1715,60 +1919,37 @@ def main() -> int:
         }
         AUDIT_PATH.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
         print("✅ update_2026_history terminé sans ajout CSV")
-        print("reason=no_completed_flashscore_rows_for_target_day")
-        print(f"payload_rows={len(payload_matches)}")
+        print("reason=no_atp_singles_completed_source_rows")
+        print(f"target_day={target_day.isoformat()}")
         print(f"premium_history_settled={premium_settlement.get('settled', 0)}")
         print(f"dates_checked={','.join(dates_checked)}")
         print(f"audit={AUDIT_PATH}")
         return 0
 
-    fieldnames = read_history_fieldnames()
-
-    # Sécurité : s'assurer que les colonnes minimales existent.
-    for col in STANDARD_COLUMNS:
-        if col not in fieldnames:
-            fieldnames.append(col)
-
-    existing_rows = read_existing_rows(fieldnames)
-    existing_names, existing_points, existing_rank = build_existing_player_refs(existing_rows)
     seen_pair_day = {pair_day_key(row) for row in existing_rows}
-
-    payload_contexts = [payload_context(m) for m in payload_matches if isinstance(m, dict)]
-    live_points = fetch_live_points_map_for_update(audit)
-
     added_rows: List[Dict[str, Any]] = []
-    skipped_not_finished = 0
     skipped_duplicate = 0
-    skipped_not_found = 0
-    skipped_bad_payload = 0
+    skipped_bad_source = 0
 
     match_num = next_match_num(existing_rows, target_day)
 
-    # IMPORTANT : pour l'Elo, on ajoute TOUS les ATP simples terminés trouvés par Flashscore,
-    # pas seulement les premiums et pas seulement les lignes présentes dans le payload daily.
-    for found in completed_rows:
-        fs_a = str(found.get("playerA") or "").strip()
-        fs_b = str(found.get("playerB") or "").strip()
-        winner = str(found.get("winner") or "").strip()
+    for result_row in source_rows:
+        winner = str(result_row.get("winner") or "").strip()
+        loser = str(result_row.get("loser") or result_row.get("playerB") or "").strip()
+        score = str(result_row.get("score") or "").strip()
+        tournament = str(result_row.get("tournament") or "").strip()
 
-        if not fs_a or not fs_b or "/" in fs_a or "/" in fs_b:
-            skipped_bad_payload += 1
+        if not winner or not loser or not score or not tournament:
+            skipped_bad_source += 1
             continue
-        if not winner:
-            skipped_not_finished += 1
+        if "/" in winner or "/" in loser:
+            skipped_bad_source += 1
+            continue
+        if not tournament_is_allowed_atp_main(tournament):
+            skipped_bad_source += 1
             continue
 
-        temp_row = make_history_row_from_completed_all_atp(
-            fieldnames=fieldnames,
-            completed_row=found,
-            target_day=target_day,
-            match_num=match_num,
-            payload_contexts=payload_contexts,
-            live_points=live_points,
-            existing_names=existing_names,
-            existing_points=existing_points,
-            existing_rank=existing_rank,
-        )
+        temp_row = make_history_row_from_result(fieldnames, result_row, target_day, match_num, player_info)
         key = pair_day_key(temp_row)
 
         if key in seen_pair_day:
@@ -1778,10 +1959,6 @@ def main() -> int:
         seen_pair_day.add(key)
         added_rows.append(temp_row)
         match_num += 1
-
-    # Ancien compteur conservé dans l'audit : maintenant il indique les lignes payload non utilisées
-    # comme source CSV directe. Ce n'est plus une erreur si payloadRows > addedRows.
-    skipped_not_found = max(0, len(payload_matches) - len(added_rows) - skipped_duplicate)
 
     backup_path = ""
     if added_rows:
@@ -1793,18 +1970,18 @@ def main() -> int:
         "targetDay": target_day.isoformat(),
         "historyPath": str(HISTORY_PATH),
         "backupPath": backup_path,
+        "source": source_name,
+        "sourceRows": len(source_rows),
         "payloadRows": len(payload_matches),
-        "completedRows": len(completed_rows),
         "existingRowsBefore": len(existing_rows),
         "addedRows": len(added_rows),
         "premiumSettlement": premium_settlement,
-        "skippedNotFoundOnFlashscore": skipped_not_found,
-        "skippedNotFinished": skipped_not_finished,
         "skippedDuplicate": skipped_duplicate,
-        "skippedBadPayload": skipped_bad_payload,
+        "skippedBadSource": skipped_bad_source,
         "finalRows": len(existing_rows) + len(added_rows),
         "addedSample": [
             {
+                "tourney_name": row.get("tourney_name"),
                 "winner_name": row.get("winner_name"),
                 "loser_name": row.get("loser_name"),
                 "surface": row.get("surface"),
@@ -1812,7 +1989,7 @@ def main() -> int:
                 "winner_rank_points": row.get("winner_rank_points"),
                 "loser_rank_points": row.get("loser_rank_points"),
             }
-            for row in added_rows[:20]
+            for row in added_rows[:30]
         ],
         "audit": audit,
     }
@@ -1824,11 +2001,11 @@ def main() -> int:
     print(f"history={HISTORY_PATH}")
     if backup_path:
         print(f"backup={backup_path}")
+    print(f"source={source_name}")
+    print(f"source_rows={len(source_rows)}")
     print(f"payload_rows={len(payload_matches)}")
-    print(f"flashscore_completed_rows={len(completed_rows)}")
     print(f"added_rows={len(added_rows)}")
     print(f"premium_history_settled={premium_settlement.get('settled', 0)}")
-    print(f"skipped_not_found={skipped_not_found}")
     print(f"skipped_duplicate={skipped_duplicate}")
     print(f"audit={AUDIT_PATH}")
 
