@@ -232,7 +232,7 @@ def run_update_2026_history_if_needed(force: bool = False) -> Dict[str, Any]:
     # uniquement les picks avec vainqueur final fiable.
     marker_skip_disabled = True
 
-    if False and not force and UPDATE_2026_MARKER.exists():
+    if not force and UPDATE_2026_MARKER.exists():
         try:
             marker = json.loads(UPDATE_2026_MARKER.read_text(encoding="utf-8"))
             if marker.get("date") == today and marker.get("ok") is True:
@@ -250,13 +250,17 @@ def run_update_2026_history_if_needed(force: bool = False) -> Dict[str, Any]:
             pass
 
     if not _UPDATE_2026_LOCK.acquire(blocking=False):
+        # STABILITÉ UNITY / RAILWAY :
+        # si une mise à jour 2026 est déjà en cours, /daily ne doit pas être considéré
+        # comme une erreur. On continue l'analyse avec le dernier Elo chargé.
         return {
             "enabled": True,
             "ran": False,
-            "ok": False,
-            "status": "already_running",
+            "ok": True,
+            "status": "already_running_non_blocking",
             "date": today,
             "script": UPDATE_2026_SCRIPT.name,
+            "message": "update_2026_history.py tourne déjà ; analyse daily autorisée sans bloquer Unity.",
         }
 
     try:
@@ -2392,6 +2396,23 @@ def run_daily_fetch_sync(target_day: str) -> Dict[str, Any]:
             stderr_tail=stderr + "\n" + traceback.format_exc(),
             command=command_text,
         )
+
+    # STABILITÉ DAILY :
+    # Si le fetch vient d'écrire 0 match mais qu'un payload daté du même jour existe déjà,
+    # on ne casse pas Unity. On réutilise uniquement ce payload daté, jamais un payload
+    # d'une ancienne journée.
+    if not matches:
+        try:
+            dated_payload_path = OUTPUT_DIR / f"payload_{target_day}.json"
+            if dated_payload_path.exists():
+                cached_payload = json.loads(dated_payload_path.read_text(encoding="utf-8"))
+                cached_matches = _extract_matches_from_payload(cached_payload)
+                if cached_matches:
+                    matches = cached_matches
+                    payload_name = dated_payload_path.name
+                    stdout += "\n[STABILITY] reused dated payload because fresh fetch returned 0 matches."
+        except Exception:
+            pass
 
     result = calculate_from_matches(matches)
 
