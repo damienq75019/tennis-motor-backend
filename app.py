@@ -8,7 +8,7 @@ from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
 
-from fastapi import FastAPI, Query, Request
+from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 
 from motor import HISTORY_YEARS, calculate_match_prediction, get_state
@@ -25,7 +25,7 @@ PAYLOAD_DIR = OUTPUT_DIR / "payloads"
 # Règle utilisateur verrouillée : Jannik Sinner reste exclu de l'analyse.
 EXCLUDED_ANALYSIS_PLAYERS = ["Jannik Sinner"]
 
-app = FastAPI(title="Tennis Motor Backend Clean", version="step2.4-postgres-results2026")
+app = FastAPI(title="Tennis Motor Backend Clean", version="step2.4.1-postgres-results2026-yesterday")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -52,8 +52,16 @@ def normalize_day(day: str) -> str:
         return today.isoformat()
     if value == "tomorrow":
         return (today + timedelta(days=1)).isoformat()
+    if value in {"yesterday", "hier"}:
+        return (today - timedelta(days=1)).isoformat()
 
-    return date.fromisoformat(value).isoformat()
+    try:
+        return date.fromisoformat(value).isoformat()
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=400,
+            detail="Paramètre day invalide. Utilise today, tomorrow, yesterday, hier ou une date YYYY-MM-DD.",
+        ) from exc
 
 
 def _norm_name(value: str) -> str:
@@ -601,8 +609,8 @@ def root() -> Dict[str, Any]:
     return {
         "status": "ok",
         "service": "Tennis Motor Backend Clean",
-        "version": "step2.4-postgres-results2026",
-        "message": "Backend propre étape 2.4 : Sportradar + sync résultats 2026 persistant PostgreSQL.",
+        "version": "step2.4.1-postgres-results2026-yesterday",
+        "message": "Backend propre étape 2.4.1 : PostgreSQL + support day=yesterday pour cron résultats 2026.",
         "endpoints": ["/health", "/calculate", "/predictions", "/state", "/history", "/daily", "/sync/results2026/status", "/sync/results2026/run", "/sync/results2026/postgres/status", "/sync/results2026/postgres/export"],
         "excludedAnalysisPlayers": _excluded_analysis_names(),
     }
@@ -614,7 +622,7 @@ def health() -> Dict[str, Any]:
     return {
         "status": "ok",
         "service": "Tennis Motor Backend Clean",
-        "version": "step2.4-postgres-results2026",
+        "version": "step2.4.1-postgres-results2026-yesterday",
         "historyYears": list(HISTORY_YEARS),
         "historyRowsLoaded": state.get("history_rows_loaded", 0),
         "excludedAnalysisPlayers": _excluded_analysis_names(),
@@ -656,7 +664,7 @@ def daily(day: str = Query("today")) -> Dict[str, Any]:
         )
         response["daily"].update({
             "provider": "sportradar",
-            "step": "2.3",
+            "step": "2.4.1",
             "targetDay": target_day,
             "audit": built.get("audit", {}),
             "apiKeyConfigured": bool(os.environ.get("SPORTRADAR_API_KEY", "").strip()),
@@ -668,7 +676,7 @@ def daily(day: str = Query("today")) -> Dict[str, Any]:
     response.setdefault("daily", {})
     response["daily"].update({
         "provider": "sportradar",
-        "step": "2.3",
+        "step": "2.4.1",
         "targetDay": target_day,
         "payloadCount": len(source_matches),
         "audit": built.get("audit", {}),
@@ -728,7 +736,7 @@ def history() -> Dict[str, Any]:
 def sync_results2026_status() -> Dict[str, Any]:
     syncer = Results2026Syncer(client=SportradarClient(), base_dir=BASE_DIR)
     status = syncer.status()
-    status["serviceVersion"] = "step2.4-postgres-results2026"
+    status["serviceVersion"] = "step2.4.1-postgres-results2026-yesterday"
     return status
 
 
@@ -736,7 +744,7 @@ def sync_results2026_status() -> Dict[str, Any]:
 def sync_results2026_postgres_status() -> Dict[str, Any]:
     syncer = Results2026Syncer(client=SportradarClient(), base_dir=BASE_DIR)
     status = syncer.postgres_status()
-    status["serviceVersion"] = "step2.4-postgres-results2026"
+    status["serviceVersion"] = "step2.4.1-postgres-results2026-yesterday"
     return status
 
 
@@ -744,7 +752,7 @@ def sync_results2026_postgres_status() -> Dict[str, Any]:
 def sync_results2026_postgres_export() -> Dict[str, Any]:
     syncer = Results2026Syncer(client=SportradarClient(), base_dir=BASE_DIR)
     result = syncer.export_postgres_to_csv()
-    result["serviceVersion"] = "step2.4-postgres-results2026"
+    result["serviceVersion"] = "step2.4.1-postgres-results2026-yesterday"
 
     try:
         if result.get("status") == "ok":
@@ -765,7 +773,7 @@ def sync_results2026_run(day: str = Query("today"), dry_run: bool = Query(False)
     target_day = normalize_day(day)
     syncer = Results2026Syncer(client=SportradarClient(), base_dir=BASE_DIR)
     result = syncer.sync_day(target_day, dry_run=dry_run)
-    result["serviceVersion"] = "step2.4-postgres-results2026"
+    result["serviceVersion"] = "step2.4.1-postgres-results2026-yesterday"
 
     # Si data/2026.csv a été modifié, on force la reconstruction de l'état Elo/Form au prochain calcul.
     try:
