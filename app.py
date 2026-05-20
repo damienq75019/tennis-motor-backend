@@ -12,6 +12,8 @@ from fastapi import FastAPI, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 
 from motor import HISTORY_YEARS, calculate_match_prediction, get_state
+from sportradar_client import SportradarClient
+from sportradar_daily_builder import SportradarDailyBuilder
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -22,7 +24,7 @@ PAYLOAD_DIR = OUTPUT_DIR / "payloads"
 # Règle utilisateur verrouillée : Jannik Sinner reste exclu de l'analyse.
 EXCLUDED_ANALYSIS_PLAYERS = ["Jannik Sinner"]
 
-app = FastAPI(title="Tennis Motor Backend Clean", version="step1")
+app = FastAPI(title="Tennis Motor Backend Clean", version="step2-sportradar")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -495,8 +497,8 @@ def root() -> Dict[str, Any]:
     return {
         "status": "ok",
         "service": "Tennis Motor Backend Clean",
-        "version": "step1",
-        "message": "Backend propre étape 1 : /health et /calculate validés. /daily Sportradar arrive étape 2.",
+        "version": "step2-sportradar",
+        "message": "Backend propre étape 2 : /daily utilise Sportradar comme source principale.",
         "endpoints": ["/health", "/calculate", "/predictions", "/state", "/history", "/daily"],
         "excludedAnalysisPlayers": _excluded_analysis_names(),
     }
@@ -508,11 +510,13 @@ def health() -> Dict[str, Any]:
     return {
         "status": "ok",
         "service": "Tennis Motor Backend Clean",
-        "version": "step1",
+        "version": "step2-sportradar",
         "historyYears": list(HISTORY_YEARS),
         "historyRowsLoaded": state.get("history_rows_loaded", 0),
         "excludedAnalysisPlayers": _excluded_analysis_names(),
-        "dailyProvider": "not_enabled_in_step1_sportradar_next",
+        "dailyProvider": "sportradar",
+        "sportradarApiKeyConfigured": bool(os.environ.get("SPORTRADAR_API_KEY", "").strip()),
+        "sportradarAccessLevel": os.environ.get("SPORTRADAR_ACCESS_LEVEL", "trial"),
     }
 
 
@@ -533,15 +537,35 @@ async def predictions_post(request: Request) -> Dict[str, Any]:
 @app.get("/daily")
 def daily(day: str = Query("today")) -> Dict[str, Any]:
     target_day = normalize_day(day)
-    response = _empty_response(
-        status="daily_not_enabled_step1",
-        message="/daily Sportradar n'est pas encore activé dans l'étape 1. Utilise /calculate pour valider le backend moteur.",
-        target_day=target_day,
-    )
+
+    builder = SportradarDailyBuilder(audit_dir=AUDIT_DIR)
+    built = builder.build_matches_for_day(target_day)
+
+    if built.get("status") != "ok":
+        response = _empty_response(
+            status="sportradar_error",
+            message=str(built.get("error") or "Erreur Sportradar inconnue."),
+            target_day=target_day,
+        )
+        response["daily"].update({
+            "provider": "sportradar",
+            "step": "2",
+            "targetDay": target_day,
+            "audit": built.get("audit", {}),
+            "apiKeyConfigured": bool(os.environ.get("SPORTRADAR_API_KEY", "").strip()),
+        })
+        return response
+
+    source_matches = built.get("matches", [])
+    response = calculate_from_matches(source_matches)
+    response.setdefault("daily", {})
     response["daily"].update({
-        "provider": "sportradar_pending_step2",
-        "step": "1",
+        "provider": "sportradar",
+        "step": "2",
         "targetDay": target_day,
+        "payloadCount": len(source_matches),
+        "audit": built.get("audit", {}),
+        "manualReviewPolicy": "points absents, placeholders et qualifié B non fiable restent à vérifier; aucune donnée n'est inventée.",
     })
     return response
 
@@ -550,6 +574,18 @@ def daily(day: str = Query("today")) -> Dict[str, Any]:
 def predictions_get(day: str = Query("today")) -> Dict[str, Any]:
     return daily(day)
 
+
+@app.get("/sportradar/status")
+def sportradar_status() -> Dict[str, Any]:
+    client = SportradarClient()
+    return {
+        "status": "ok",
+        "provider": "sportradar",
+        "apiKeyConfigured": client.enabled,
+        "accessLevel": client.config.access_level,
+        "language": client.config.language,
+        "note": "La clé API n'est jamais renvoyée par le backend.",
+    }
 
 @app.get("/state")
 def state() -> Dict[str, Any]:
