@@ -24,7 +24,7 @@ PAYLOAD_DIR = OUTPUT_DIR / "payloads"
 # Règle utilisateur verrouillée : Jannik Sinner reste exclu de l'analyse.
 EXCLUDED_ANALYSIS_PLAYERS = ["Jannik Sinner"]
 
-app = FastAPI(title="Tennis Motor Backend Clean", version="step2-sportradar")
+app = FastAPI(title="Tennis Motor Backend Clean", version="step2.1-sportradar-points-guard")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -269,8 +269,13 @@ def _rebuild_summary_from_matches(matches: List[Dict[str, Any]]) -> Dict[str, An
     veto_count = 0
     jouables = 0
     refuses_sans_veto = 0
+    non_analyzed = 0
 
     for match in matches:
+        if match.get("nonAnalyzable") or match.get("analysisStatus") == "not_analyzed":
+            non_analyzed += 1
+            continue
+
         if match.get("error"):
             error_rows += 1
 
@@ -289,8 +294,10 @@ def _rebuild_summary_from_matches(matches: List[Dict[str, Any]]) -> Dict[str, An
 
     return {
         "totalRows": total,
-        "validRows": total - error_rows,
+        "validRows": total - error_rows - non_analyzed,
         "errorRows": error_rows,
+        "nonAnalyzed": non_analyzed,
+        "nonAnalyzable": non_analyzed,
         "over80": over80,
         "vetoCount": veto_count,
         "jouables": jouables,
@@ -417,11 +424,103 @@ def _empty_response(status: str, message: str = "", target_day: str = "") -> Dic
     }
 
 
+def _positive_points(value: Any) -> bool:
+    try:
+        if value is None:
+            return False
+        return float(str(value).replace(",", ".").strip()) > 0
+    except Exception:
+        return False
+
+
+def _is_placeholder_match(match: Dict[str, Any]) -> bool:
+    def is_placeholder_name(value: Any) -> bool:
+        name = str(value or "").strip()
+        if not name:
+            return True
+        return bool(re.fullmatch(r"(?i)(qf|sf|pf|qualifier|winner|loser|bye)\s*\d*", name))
+
+    player_a = _get_first_existing(match, ["playerA", "player_a"], "")
+    player_b = _get_first_existing(match, ["playerB", "player_b"], "")
+    return is_placeholder_name(player_a) or is_placeholder_name(player_b)
+
+
+def _not_analyzed_row(source_match: Dict[str, Any], reason_code: str, reason_text: str) -> Dict[str, Any]:
+    player_a = str(_get_first_existing(source_match, ["playerA", "player_a"], "") or "")
+    player_b = str(_get_first_existing(source_match, ["playerB", "player_b"], "") or "")
+    points_a = _get_first_existing(source_match, ["playerAPoints", "player_a_points"], 0)
+    points_b = _get_first_existing(source_match, ["playerBPoints", "player_b_points"], 0)
+
+    row = dict(source_match)
+    row.update({
+        "playerA": player_a,
+        "playerB": player_b,
+        "playerAPoints": points_a if points_a is not None else 0,
+        "playerBPoints": points_b if points_b is not None else 0,
+        "premium": 0.0,
+        "premiumPct": 0.0,
+        "veto": "non",
+        "decision": "❌ Non analysé",
+        "nonAnalyzable": True,
+        "analysisStatus": "not_analyzed",
+        "analysisBlockedReason": reason_code,
+        "reason": reason_text,
+        "error": reason_text,
+        "manualRequired": False,
+        "manualReviewRequired": bool(source_match.get("manualReviewRequired", False)),
+        "engineOrientation": "not_analyzed",
+        "engineComparedOriginalPct": 0.0,
+        "engineComparedReversedPct": 0.0,
+        "sourcePlayerA": player_a,
+        "sourcePlayerB": player_b,
+        "sourceOriginalPair": f"{player_a} vs {player_b}",
+    })
+    reasons = list(row.get("manualReviewReasons") or [])
+    if reason_code not in reasons:
+        reasons.append(reason_code)
+    row["manualReviewReasons"] = reasons
+    return row
+
+
+def _split_analyzable_matches(matches: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """Règle verrouillée : aucun calcul moteur si points ATP absents ou à 0."""
+    analyzable: List[Dict[str, Any]] = []
+    not_analyzed: List[Dict[str, Any]] = []
+
+    for match in matches or []:
+        points_a = _get_first_existing(match, ["playerAPoints", "player_a_points"], None)
+        points_b = _get_first_existing(match, ["playerBPoints", "player_b_points"], None)
+
+        if not _positive_points(points_a) or not _positive_points(points_b):
+            not_analyzed.append(_not_analyzed_row(match, "points_atp_missing", "points ATP manquants"))
+            continue
+
+        if _is_placeholder_match(match):
+            row = _not_analyzed_row(match, "placeholder_player", "joueur non connu / placeholder")
+            row["manualRequired"] = True
+            row["manualReviewRequired"] = True
+            not_analyzed.append(row)
+            continue
+
+        analyzable.append(match)
+
+    return analyzable, not_analyzed
+
+
+def _rebuild_not_analyzed_reasons(rows: List[Dict[str, Any]]) -> Dict[str, int]:
+    counts: Dict[str, int] = {}
+    for row in rows or []:
+        reason = str(row.get("analysisBlockedReason") or "unknown")
+        counts[reason] = counts.get(reason, 0) + 1
+    return counts
+
+
 def calculate_from_matches(matches: List[Dict[str, Any]]) -> Dict[str, Any]:
     original_match_count = len(matches or [])
     matches, excluded_removed = _filter_excluded_analysis_matches(matches or [])
+    matches, not_analyzed_matches = _split_analyzable_matches(matches)
 
-    if not matches:
+    if not matches and not not_analyzed_matches:
         response = _empty_response(
             status="empty_payload_after_exclusion" if excluded_removed else "empty_payload",
             message="Aucun match exploitable après exclusion joueur." if excluded_removed else "Aucun match exploitable dans le payload.",
@@ -429,6 +528,7 @@ def calculate_from_matches(matches: List[Dict[str, Any]]) -> Dict[str, Any]:
         response["daily"]["excludedMatches"] = len(excluded_removed)
         response["daily"]["excludedSample"] = excluded_removed[:10]
         response["daily"]["originalPayloadMatches"] = original_match_count
+        response["daily"]["notAnalyzedMatches"] = 0
         return response
 
     state = get_state()
@@ -465,10 +565,11 @@ def calculate_from_matches(matches: List[Dict[str, Any]]) -> Dict[str, Any]:
     final_matches, excluded_removed_after_engine = _filter_excluded_analysis_matches(final_matches)
     excluded_removed.extend(excluded_removed_after_engine)
     final_matches.sort(key=lambda row: row.get("premium", -1), reverse=True)
+    all_matches = final_matches + not_analyzed_matches
 
     return {
-        "matches": final_matches,
-        "summary": _rebuild_summary_from_matches(final_matches),
+        "matches": all_matches,
+        "summary": _rebuild_summary_from_matches(all_matches),
         "engine": {
             "name": "Tennis Motor V7",
             "version": "Bayesian Shrinkage",
@@ -483,10 +584,12 @@ def calculate_from_matches(matches: List[Dict[str, Any]]) -> Dict[str, Any]:
             "doubleSideMode": "pairwise_best_premium_no_zip_after_sort",
             "doubleSideMatches": len(final_matches),
             "doubleSideReversedChosen": reversed_chosen,
-            "contextPropagation": "clean_step1_preserved",
+            "contextPropagation": "clean_step2_1_preserved",
             "excludedPlayers": _excluded_analysis_names(),
             "excludedMatches": len(excluded_removed),
             "excludedSample": excluded_removed[:10],
+            "notAnalyzedMatches": len(not_analyzed_matches),
+            "notAnalyzedReasons": _rebuild_not_analyzed_reasons(not_analyzed_matches),
             "originalPayloadMatches": original_match_count,
         },
     }
@@ -497,8 +600,8 @@ def root() -> Dict[str, Any]:
     return {
         "status": "ok",
         "service": "Tennis Motor Backend Clean",
-        "version": "step2-sportradar",
-        "message": "Backend propre étape 2 : /daily utilise Sportradar comme source principale.",
+        "version": "step2.1-sportradar-points-guard",
+        "message": "Backend propre étape 2.1 : /daily utilise Sportradar et bloque tout match sans points ATP.",
         "endpoints": ["/health", "/calculate", "/predictions", "/state", "/history", "/daily"],
         "excludedAnalysisPlayers": _excluded_analysis_names(),
     }
@@ -510,7 +613,7 @@ def health() -> Dict[str, Any]:
     return {
         "status": "ok",
         "service": "Tennis Motor Backend Clean",
-        "version": "step2-sportradar",
+        "version": "step2.1-sportradar-points-guard",
         "historyYears": list(HISTORY_YEARS),
         "historyRowsLoaded": state.get("history_rows_loaded", 0),
         "excludedAnalysisPlayers": _excluded_analysis_names(),
@@ -549,7 +652,7 @@ def daily(day: str = Query("today")) -> Dict[str, Any]:
         )
         response["daily"].update({
             "provider": "sportradar",
-            "step": "2",
+            "step": "2.1",
             "targetDay": target_day,
             "audit": built.get("audit", {}),
             "apiKeyConfigured": bool(os.environ.get("SPORTRADAR_API_KEY", "").strip()),
@@ -561,11 +664,11 @@ def daily(day: str = Query("today")) -> Dict[str, Any]:
     response.setdefault("daily", {})
     response["daily"].update({
         "provider": "sportradar",
-        "step": "2",
+        "step": "2.1",
         "targetDay": target_day,
         "payloadCount": len(source_matches),
         "audit": built.get("audit", {}),
-        "manualReviewPolicy": "points absents, placeholders et qualifié B non fiable restent à vérifier; aucune donnée n'est inventée.",
+        "manualReviewPolicy": "points ATP absents ou à 0 = non analysé; placeholders à vérifier; qualifié B non fiable reste à vérifier; aucune donnée n'est inventée.",
     })
     return response
 
