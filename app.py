@@ -24,7 +24,7 @@ PAYLOAD_DIR = OUTPUT_DIR / "payloads"
 # Règle utilisateur verrouillée : Jannik Sinner reste exclu de l'analyse.
 EXCLUDED_ANALYSIS_PLAYERS = ["Jannik Sinner"]
 
-app = FastAPI(title="Tennis Motor Backend Clean", version="step2.1-sportradar-points-guard")
+app = FastAPI(title="Tennis Motor Backend Clean", version="step2.2-tournament-wins-strict")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -584,7 +584,7 @@ def calculate_from_matches(matches: List[Dict[str, Any]]) -> Dict[str, Any]:
             "doubleSideMode": "pairwise_best_premium_no_zip_after_sort",
             "doubleSideMatches": len(final_matches),
             "doubleSideReversedChosen": reversed_chosen,
-            "contextPropagation": "clean_step2_1_preserved",
+            "contextPropagation": "clean_step2_2_preserved",
             "excludedPlayers": _excluded_analysis_names(),
             "excludedMatches": len(excluded_removed),
             "excludedSample": excluded_removed[:10],
@@ -600,8 +600,8 @@ def root() -> Dict[str, Any]:
     return {
         "status": "ok",
         "service": "Tennis Motor Backend Clean",
-        "version": "step2.1-sportradar-points-guard",
-        "message": "Backend propre étape 2.1 : /daily utilise Sportradar et bloque tout match sans points ATP.",
+        "version": "step2.2-tournament-wins-strict",
+        "message": "Backend propre étape 2.2 : Sportradar + blocage points ATP + tournament_wins strictement avant le match.",
         "endpoints": ["/health", "/calculate", "/predictions", "/state", "/history", "/daily"],
         "excludedAnalysisPlayers": _excluded_analysis_names(),
     }
@@ -613,7 +613,7 @@ def health() -> Dict[str, Any]:
     return {
         "status": "ok",
         "service": "Tennis Motor Backend Clean",
-        "version": "step2.1-sportradar-points-guard",
+        "version": "step2.2-tournament-wins-strict",
         "historyYears": list(HISTORY_YEARS),
         "historyRowsLoaded": state.get("history_rows_loaded", 0),
         "excludedAnalysisPlayers": _excluded_analysis_names(),
@@ -652,7 +652,7 @@ def daily(day: str = Query("today")) -> Dict[str, Any]:
         )
         response["daily"].update({
             "provider": "sportradar",
-            "step": "2.1",
+            "step": "2.2",
             "targetDay": target_day,
             "audit": built.get("audit", {}),
             "apiKeyConfigured": bool(os.environ.get("SPORTRADAR_API_KEY", "").strip()),
@@ -664,11 +664,11 @@ def daily(day: str = Query("today")) -> Dict[str, Any]:
     response.setdefault("daily", {})
     response["daily"].update({
         "provider": "sportradar",
-        "step": "2.1",
+        "step": "2.2",
         "targetDay": target_day,
         "payloadCount": len(source_matches),
         "audit": built.get("audit", {}),
-        "manualReviewPolicy": "points ATP absents ou à 0 = non analysé; placeholders à vérifier; qualifié B non fiable reste à vérifier; aucune donnée n'est inventée.",
+        "manualReviewPolicy": "points ATP absents ou à 0 = non analysé; tournament_wins = matchs terminés strictement avant le match courant et gagnés par le joueur; placeholders à vérifier; qualifié B non fiable reste à vérifier; aucune donnée n'est inventée.",
     })
     return response
 
