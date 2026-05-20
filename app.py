@@ -14,6 +14,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from motor import HISTORY_YEARS, calculate_match_prediction, get_state
 from sportradar_client import SportradarClient
 from sportradar_daily_builder import SportradarDailyBuilder
+from sportradar_2026_results_sync import Results2026Syncer
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -24,7 +25,7 @@ PAYLOAD_DIR = OUTPUT_DIR / "payloads"
 # Règle utilisateur verrouillée : Jannik Sinner reste exclu de l'analyse.
 EXCLUDED_ANALYSIS_PLAYERS = ["Jannik Sinner"]
 
-app = FastAPI(title="Tennis Motor Backend Clean", version="step2.2-tournament-wins-strict")
+app = FastAPI(title="Tennis Motor Backend Clean", version="step2.3-results2026-sync")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -584,7 +585,7 @@ def calculate_from_matches(matches: List[Dict[str, Any]]) -> Dict[str, Any]:
             "doubleSideMode": "pairwise_best_premium_no_zip_after_sort",
             "doubleSideMatches": len(final_matches),
             "doubleSideReversedChosen": reversed_chosen,
-            "contextPropagation": "clean_step2_2_preserved",
+            "contextPropagation": "clean_step2_3_preserved",
             "excludedPlayers": _excluded_analysis_names(),
             "excludedMatches": len(excluded_removed),
             "excludedSample": excluded_removed[:10],
@@ -600,8 +601,8 @@ def root() -> Dict[str, Any]:
     return {
         "status": "ok",
         "service": "Tennis Motor Backend Clean",
-        "version": "step2.2-tournament-wins-strict",
-        "message": "Backend propre étape 2.2 : Sportradar + blocage points ATP + tournament_wins strictement avant le match.",
+        "version": "step2.3-results2026-sync",
+        "message": "Backend propre étape 2.3 : Sportradar + points ATP guard + tournament_wins strict + sync résultats 2026 séparé du Premium.",
         "endpoints": ["/health", "/calculate", "/predictions", "/state", "/history", "/daily"],
         "excludedAnalysisPlayers": _excluded_analysis_names(),
     }
@@ -613,11 +614,12 @@ def health() -> Dict[str, Any]:
     return {
         "status": "ok",
         "service": "Tennis Motor Backend Clean",
-        "version": "step2.2-tournament-wins-strict",
+        "version": "step2.3-results2026-sync",
         "historyYears": list(HISTORY_YEARS),
         "historyRowsLoaded": state.get("history_rows_loaded", 0),
         "excludedAnalysisPlayers": _excluded_analysis_names(),
         "dailyProvider": "sportradar",
+        "results2026Sync": "enabled",
         "sportradarApiKeyConfigured": bool(os.environ.get("SPORTRADAR_API_KEY", "").strip()),
         "sportradarAccessLevel": os.environ.get("SPORTRADAR_ACCESS_LEVEL", "trial"),
     }
@@ -652,7 +654,7 @@ def daily(day: str = Query("today")) -> Dict[str, Any]:
         )
         response["daily"].update({
             "provider": "sportradar",
-            "step": "2.2",
+            "step": "2.3",
             "targetDay": target_day,
             "audit": built.get("audit", {}),
             "apiKeyConfigured": bool(os.environ.get("SPORTRADAR_API_KEY", "").strip()),
@@ -664,7 +666,7 @@ def daily(day: str = Query("today")) -> Dict[str, Any]:
     response.setdefault("daily", {})
     response["daily"].update({
         "provider": "sportradar",
-        "step": "2.2",
+        "step": "2.3",
         "targetDay": target_day,
         "payloadCount": len(source_matches),
         "audit": built.get("audit", {}),
@@ -718,6 +720,36 @@ def history() -> Dict[str, Any]:
             "chart": {},
             "rows": [],
         }
+
+
+@app.get("/sync/results2026/status")
+def sync_results2026_status() -> Dict[str, Any]:
+    syncer = Results2026Syncer(client=SportradarClient(), base_dir=BASE_DIR)
+    status = syncer.status()
+    status["serviceVersion"] = "step2.3-results2026-sync"
+    return status
+
+
+@app.get("/sync/results2026/run")
+def sync_results2026_run(day: str = Query("today"), dry_run: bool = Query(False)) -> Dict[str, Any]:
+    target_day = normalize_day(day)
+    syncer = Results2026Syncer(client=SportradarClient(), base_dir=BASE_DIR)
+    result = syncer.sync_day(target_day, dry_run=dry_run)
+    result["serviceVersion"] = "step2.3-results2026-sync"
+
+    # Si data/2026.csv a été modifié, on force la reconstruction de l'état Elo/Form au prochain calcul.
+    try:
+        if not dry_run and int((result.get("counts") or {}).get("rows_added") or 0) > 0:
+            import motor as motor_module
+            motor_module._STATE = None
+            result["motorStateReset"] = True
+        else:
+            result["motorStateReset"] = False
+    except Exception as exc:
+        result["motorStateReset"] = False
+        result.setdefault("warnings", []).append(f"motor state reset failed: {type(exc).__name__}: {exc}")
+
+    return result
 
 
 if __name__ == "__main__":
