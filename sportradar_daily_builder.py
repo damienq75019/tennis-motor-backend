@@ -215,20 +215,41 @@ def _count_wins_before(
     current_event_id: str,
     current_start: Optional[dt.datetime],
 ) -> int:
-    if not competitor_id:
+    """Compte strictement les victoires acquises AVANT le match courant.
+
+    Règle verrouillée Tennis Motor :
+    - le match courant n'est jamais compté ;
+    - une ligne non terminée n'est jamais comptée ;
+    - une défaite n'est jamais comptée : winner_id doit être exactement le joueur ;
+    - le match compté doit avoir une heure de début strictement antérieure au match courant.
+
+    Si l'heure du match courant ou d'un match candidat est absente, on ne compte pas le candidat.
+    C'est volontairement prudent : pas d'invention et pas de comptage approximatif.
+    """
+    if not competitor_id or current_start is None:
         return 0
+
     wins = 0
     for summary in season_summaries:
-        if _event_id(summary) == current_event_id:
+        candidate_event_id = _event_id(summary)
+        if candidate_event_id == current_event_id:
             continue
+
         if not _is_finished(summary):
             continue
+
         if _winner_id(summary) != competitor_id:
             continue
-        start = _event_start(summary)
-        if current_start is not None and start is not None and start >= current_start:
+
+        candidate_start = _event_start(summary)
+        if candidate_start is None:
             continue
+
+        if candidate_start >= current_start:
+            continue
+
         wins += 1
+
     return wins
 
 
@@ -296,6 +317,7 @@ class SportradarDailyBuilder:
             "errors": [],
             "warnings": [],
             "counts": {},
+            "tournamentWinsPolicy": "strict_before_start_finished_winner_only_no_current_match",
         }
 
         try:
@@ -411,6 +433,7 @@ class SportradarDailyBuilder:
                     "winnerId": _s(status.get("winner_id")),
                     "score": _score_string(status),
                     "source": "sportradar",
+                    "tournamentWinsPolicy": "strict_before_start_finished_winner_only_no_current_match",
                 }
 
                 if placeholder_a or placeholder_b:
