@@ -17,7 +17,7 @@ from sportradar_daily_builder import SportradarDailyBuilder
 from sportradar_2026_results_sync import Results2026Syncer
 from postgres_premium_store import PostgresPremiumStore
 from sportradar_premium_sync import PremiumHistorySyncer
-from sportytrader_odds import SportyTraderOddsProvider
+from flashscore_odds import FlashscoreOddsProvider
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -28,7 +28,7 @@ PAYLOAD_DIR = OUTPUT_DIR / "payloads"
 # Règle utilisateur verrouillée : Jannik Sinner reste exclu de l'analyse.
 EXCLUDED_ANALYSIS_PLAYERS = ["Jannik Sinner"]
 
-app = FastAPI(title="Tennis Motor Backend Clean", version="step2.6-sportytrader-odds")
+app = FastAPI(title="Tennis Motor Backend Clean", version="step2.7-flashscore-odds")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -642,8 +642,8 @@ def root() -> Dict[str, Any]:
     return {
         "status": "ok",
         "service": "Tennis Motor Backend Clean",
-        "version": "step2.6-sportytrader-odds",
-        "message": "Backend propre étape 2.6 : Sportradar + PostgreSQL + cotes SportyTrader en affichage uniquement.",
+        "version": "step2.7-flashscore-odds",
+        "message": "Backend propre étape 2.7 : Sportradar + PostgreSQL + cotes Flashscore en affichage uniquement.",
         "endpoints": ["/health", "/calculate", "/predictions", "/state", "/history", "/daily", "/odds/status", "/sync/results2026/status", "/sync/results2026/run", "/sync/results2026/postgres/status", "/sync/results2026/postgres/export", "/sync/premium/status", "/sync/premium/run"],
         "excludedAnalysisPlayers": _excluded_analysis_names(),
     }
@@ -655,12 +655,12 @@ def health() -> Dict[str, Any]:
     return {
         "status": "ok",
         "service": "Tennis Motor Backend Clean",
-        "version": "step2.6-sportytrader-odds",
+        "version": "step2.7-flashscore-odds",
         "historyYears": list(HISTORY_YEARS),
         "historyRowsLoaded": state.get("history_rows_loaded", 0),
         "excludedAnalysisPlayers": _excluded_analysis_names(),
         "dailyProvider": "sportradar",
-        "oddsProvider": "sportytrader",
+        "oddsProvider": "flashscore",
         "oddsUsage": "display_only_not_used_by_engine",
         "results2026Sync": "enabled",
         "results2026Storage": "postgres" if os.environ.get("DATABASE_URL", "").strip() else "csv",
@@ -710,10 +710,10 @@ def daily(day: str = Query("today")) -> Dict[str, Any]:
     source_matches = built.get("matches", [])
     response = calculate_from_matches(source_matches)
 
-    # Step 2.6 : cotes uniquement pour affichage Unity.
+    # Step 2.7 : cotes Flashscore uniquement pour affichage Unity.
     # Le moteur ne lit jamais ces champs et ne les utilise pas dans la décision.
     try:
-        odds_provider = SportyTraderOddsProvider()
+        odds_provider = FlashscoreOddsProvider()
         odds_result = odds_provider.enrich_daily_response(response, target_day=target_day)
         response.setdefault("daily", {})
         response["daily"]["odds"] = odds_result.get("audit", {})
@@ -721,7 +721,7 @@ def daily(day: str = Query("today")) -> Dict[str, Any]:
         response.setdefault("daily", {})
         response["daily"]["odds"] = {
             "status": "error",
-            "provider": "sportytrader",
+            "provider": "flashscore",
             "error": f"{type(exc).__name__}: {exc}",
             "policy": "odds_display_only_engine_ignored",
         }
@@ -729,12 +729,12 @@ def daily(day: str = Query("today")) -> Dict[str, Any]:
     response.setdefault("daily", {})
     response["daily"].update({
         "provider": "sportradar",
-        "step": "2.6",
+        "step": "2.7",
         "targetDay": target_day,
         "payloadCount": len(source_matches),
         "audit": built.get("audit", {}),
         "manualReviewPolicy": "points ATP absents ou à 0 = non analysé; tournament_wins = matchs terminés strictement avant le match courant et gagnés par le joueur; placeholders à vérifier; qualifié B non fiable reste à vérifier; aucune donnée n'est inventée.",
-        "oddsPolicy": "SportyTrader odds are display-only and never used by the Tennis Motor decision.",
+        "oddsPolicy": "Flashscore odds are display-only and never used by the Tennis Motor decision.",
     })
     return response
 
@@ -746,17 +746,17 @@ def predictions_get(day: str = Query("today")) -> Dict[str, Any]:
 
 @app.get("/odds/status")
 def odds_status() -> Dict[str, Any]:
-    provider = SportyTraderOddsProvider()
+    provider = FlashscoreOddsProvider()
     audit = provider.fetch_odds_audit()
     return {
         "status": "ok" if audit.get("status") in {"ok", "partial"} else audit.get("status", "unknown"),
-        "provider": "sportytrader",
+        "provider": "flashscore",
         "usage": "display_only_not_used_by_engine",
         "urls": audit.get("urls", []),
         "records": audit.get("records", 0),
         "errors": audit.get("errors", []),
         "warnings": audit.get("warnings", []),
-        "serviceVersion": "step2.6-sportytrader-odds",
+        "serviceVersion": "step2.7-flashscore-odds",
     }
 
 
@@ -833,7 +833,7 @@ def history() -> Dict[str, Any]:
 def sync_results2026_status() -> Dict[str, Any]:
     syncer = Results2026Syncer(client=SportradarClient(), base_dir=BASE_DIR)
     status = syncer.status()
-    status["serviceVersion"] = "step2.6-sportytrader-odds"
+    status["serviceVersion"] = "step2.7-flashscore-odds"
     return status
 
 
@@ -841,7 +841,7 @@ def sync_results2026_status() -> Dict[str, Any]:
 def sync_results2026_postgres_status() -> Dict[str, Any]:
     syncer = Results2026Syncer(client=SportradarClient(), base_dir=BASE_DIR)
     status = syncer.postgres_status()
-    status["serviceVersion"] = "step2.6-sportytrader-odds"
+    status["serviceVersion"] = "step2.7-flashscore-odds"
     return status
 
 
@@ -849,7 +849,7 @@ def sync_results2026_postgres_status() -> Dict[str, Any]:
 def sync_results2026_postgres_export() -> Dict[str, Any]:
     syncer = Results2026Syncer(client=SportradarClient(), base_dir=BASE_DIR)
     result = syncer.export_postgres_to_csv()
-    result["serviceVersion"] = "step2.6-sportytrader-odds"
+    result["serviceVersion"] = "step2.7-flashscore-odds"
 
     try:
         if result.get("status") == "ok":
@@ -870,7 +870,7 @@ def sync_results2026_run(day: str = Query("today"), dry_run: bool = Query(False)
     target_day = normalize_day(day)
     syncer = Results2026Syncer(client=SportradarClient(), base_dir=BASE_DIR)
     result = syncer.sync_day(target_day, dry_run=dry_run)
-    result["serviceVersion"] = "step2.6-sportytrader-odds"
+    result["serviceVersion"] = "step2.7-flashscore-odds"
 
     # Si data/2026.csv a été modifié, on force la reconstruction de l'état Elo/Form au prochain calcul.
     try:
@@ -891,7 +891,7 @@ def sync_results2026_run(day: str = Query("today"), dry_run: bool = Query(False)
 def sync_premium_status() -> Dict[str, Any]:
     syncer = PremiumHistorySyncer(store=PostgresPremiumStore())
     status = syncer.status()
-    status["serviceVersion"] = "step2.6-sportytrader-odds"
+    status["serviceVersion"] = "step2.7-flashscore-odds"
     return status
 
 
@@ -901,7 +901,7 @@ def sync_premium_run(day: str = Query("today"), dry_run: bool = Query(False)) ->
     daily_result = daily(target_day)
     syncer = PremiumHistorySyncer(store=PostgresPremiumStore())
     result = syncer.sync_daily_result(daily_result, target_day, dry_run=dry_run)
-    result["serviceVersion"] = "step2.6-sportytrader-odds"
+    result["serviceVersion"] = "step2.7-flashscore-odds"
     return result
 
 
