@@ -2,9 +2,176 @@ from __future__ import annotations
 
 import re
 import unicodedata
+from datetime import date, datetime
 from typing import Any, Dict, List, Tuple
 
 FLASHSCORE_TENNIS_URL = "https://www.flashscore.fr/tennis/"
+
+def _paris_today() -> date:
+    try:
+        from zoneinfo import ZoneInfo
+        return datetime.now(ZoneInfo("Europe/Paris")).date()
+    except Exception:
+        return date.today()
+
+def _target_day_offset(target_day: str) -> int:
+    """
+    Retourne l'écart en jours entre target_day et aujourd'hui Paris.
+    Utilisé uniquement pour positionner le calendrier Flashscore.
+    """
+    value = (target_day or "").strip()
+    if not value:
+        return 0
+
+    try:
+        target = date.fromisoformat(value)
+    except Exception:
+        return 0
+
+    offset = (target - _paris_today()).days
+
+    # Sécurité : on ne clique jamais des dizaines de fois.
+    if offset > 7:
+        return 7
+    if offset < -7:
+        return -7
+    return offset
+
+def _flashscore_click_date_offset(page, target_day: str, audit: List[str]) -> None:
+    """
+    Positionne le calendrier Flashscore sur target_day.
+
+    Pourquoi :
+    - /daily?day=today scanne naturellement la bonne date.
+    - /daily?day=tomorrow doit cliquer une fois sur le jour suivant.
+    Sinon Flashscore retourne les cotes du jour courant et aucun match de demain ne matche.
+
+    La fonction reste prudente : si le clic échoue, on continue sans bloquer le moteur.
+    Les cotes restent affichage uniquement.
+    """
+    offset = _target_day_offset(target_day)
+    audit.append(f"date_target={target_day or 'default'} offset={offset}")
+
+    if offset == 0:
+        return
+
+    direction = "next" if offset > 0 else "prev"
+    steps = abs(offset)
+
+    next_selectors = [
+        ".calendar__navigation--tomorrow",
+        "button.calendar__navigation--tomorrow",
+        "[class*='calendar__navigation--tomorrow']",
+        "[aria-label*='jour suivant' i]",
+        "[aria-label*='suivant' i]",
+        "[aria-label*='next' i]",
+        "[title*='jour suivant' i]",
+        "[title*='suivant' i]",
+        "[title*='next' i]",
+    ]
+
+    prev_selectors = [
+        ".calendar__navigation--yesterday",
+        "button.calendar__navigation--yesterday",
+        "[class*='calendar__navigation--yesterday']",
+        "[aria-label*='jour précédent' i]",
+        "[aria-label*='précédent' i]",
+        "[aria-label*='previous' i]",
+        "[title*='jour précédent' i]",
+        "[title*='précédent' i]",
+        "[title*='previous' i]",
+    ]
+
+    selectors = next_selectors if direction == "next" else prev_selectors
+
+    for step in range(steps):
+        clicked = False
+
+        for selector in selectors:
+            try:
+                locator = page.locator(selector)
+                if locator.count() > 0:
+                    locator.first.click(timeout=3500)
+                    clicked = True
+                    audit.append(f"date_click_step={step + 1}/{steps} direction={direction} selector={selector}")
+                    break
+            except Exception as exc:
+                audit.append(f"date_click_selector_failed={selector}:{type(exc).__name__}")
+
+        if not clicked:
+            try:
+                clicked = bool(page.evaluate(
+                    """
+                    (direction) => {
+                        const all = Array.from(document.querySelectorAll('button, [role="button"], a, div'));
+                        const isVisible = (el) => {
+                            const r = el.getBoundingClientRect();
+                            const s = window.getComputedStyle(el);
+                            return r.width > 0 && r.height > 0 && s.visibility !== 'hidden' && s.display !== 'none';
+                        };
+
+                        const candidates = all.filter(el => {
+                            if (!isVisible(el)) return false;
+                            const cls = (el.className || '').toString().toLowerCase();
+                            const aria = (el.getAttribute('aria-label') || '').toLowerCase();
+                            const title = (el.getAttribute('title') || '').toLowerCase();
+                            const txt = (el.innerText || '').trim().toLowerCase();
+
+                            if (direction === 'next') {
+                                return cls.includes('tomorrow') || cls.includes('next') ||
+                                       aria.includes('suivant') || aria.includes('next') ||
+                                       title.includes('suivant') || title.includes('next') ||
+                                       txt === '>' || txt === '›' || txt === '»';
+                            }
+
+                            return cls.includes('yesterday') || cls.includes('prev') || cls.includes('previous') ||
+                                   aria.includes('précédent') || aria.includes('precedent') || aria.includes('previous') ||
+                                   title.includes('précédent') || title.includes('precedent') || title.includes('previous') ||
+                                   txt === '<' || txt === '‹' || txt === '«';
+                        });
+
+                        if (!candidates.length) return false;
+
+                        // Flashscore place généralement les flèches de calendrier vers le centre-haut de la zone matches.
+                        candidates.sort((a, b) => {
+                            const ra = a.getBoundingClientRect();
+                            const rb = b.getBoundingClientRect();
+                            const scoreA = Math.abs(ra.top - 575) + Math.abs(ra.left - 920);
+                            const scoreB = Math.abs(rb.top - 575) + Math.abs(rb.left - 920);
+                            return scoreA - scoreB;
+                        });
+
+                        candidates[0].click();
+                        return true;
+                    }
+                    """,
+                    direction,
+                ))
+                if clicked:
+                    audit.append(f"date_click_step={step + 1}/{steps} direction={direction} selector=js_fallback")
+            except Exception as exc:
+                audit.append(f"date_click_js_failed={type(exc).__name__}: {exc}")
+
+        if not clicked:
+            audit.append(f"date_click_failed_step={step + 1}/{steps} direction={direction}")
+            return
+
+        try:
+            page.wait_for_timeout(2500)
+            page.wait_for_load_state("networkidle", timeout=8000)
+        except Exception:
+            pass
+
+    # Audit lisible de la date visible après clic, sans bloquer.
+    try:
+        body_text = page.locator("body").inner_text(timeout=8000)
+        m = re.search(r"\b\d{1,2}/\d{2}\s+[A-ZÉ]{2,3}\b", body_text)
+        if m:
+            audit.append(f"date_visible_after_click={m.group(0)}")
+    except Exception:
+        pass
+
+
 
 def _norm_name(value: str) -> str:
     value = value or ""
@@ -614,7 +781,7 @@ def _flashscore_scroll_until_stable(page, audit: List[str], max_rounds: int = 22
     except Exception:
         pass
 
-def fetch_flashscore_tennis_odds() -> Tuple[List[Dict[str, str]], str]:
+def fetch_flashscore_tennis_odds(target_day: str = "") -> Tuple[List[Dict[str, str]], str]:
     audit: List[str] = []
 
     try:
@@ -658,6 +825,10 @@ def fetch_flashscore_tennis_odds() -> Tuple[List[Dict[str, str]], str]:
                 page.wait_for_load_state("networkidle", timeout=15000)
             except Exception:
                 pass
+
+            # Step 2.7.2 :
+            # positionner Flashscore sur target_day avant de scanner les onglets.
+            _flashscore_click_date_offset(page, target_day, audit)
 
             # V4 :
             # Scanner plusieurs onglets au lieu de seulement COTES.
@@ -969,7 +1140,7 @@ def enrich_result_with_flashscore_odds(result: Dict[str, Any], target_day: str) 
         return result
 
     try:
-        flash_rows, flash_audit = fetch_flashscore_tennis_odds()
+        flash_rows, flash_audit = fetch_flashscore_tennis_odds(target_day)
     except Exception as exc:
         flash_rows = []
         flash_audit = f"global_error={type(exc).__name__}: {exc}"
