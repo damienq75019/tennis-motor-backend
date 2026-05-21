@@ -367,57 +367,174 @@ def _flashscore_tokens_keep_initials(name: str) -> List[str]:
 def _normalize_flashscore_initial_name(name: str) -> List[str]:
     return _flashscore_tokens_keep_initials(name)
 
+
+def _split_flashscore_short_name(name: str) -> Tuple[List[str], List[str]]:
+    """
+    Sépare un nom court Flashscore.
+
+    Exemples :
+    - "Svrcina D." -> (["svrcina"], ["d"])
+    - "Prado Angelo J. C." -> (["prado", "angelo"], ["j", "c"])
+    - "de Minaur A." -> (["de", "minaur"], ["a"])
+    """
+    tokens = _flashscore_tokens_keep_initials(name)
+    initials: List[str] = []
+
+    while tokens and len(tokens[-1]) == 1:
+        initials.insert(0, tokens[-1])
+        tokens = tokens[:-1]
+
+    return tokens, initials
+
+
+def _full_name_profile(name: str) -> Dict[str, Any]:
+    """
+    Profil robuste pour comparer Sportradar ↔ Flashscore.
+
+    Sportradar renvoie très souvent :
+    - "Svrcina, Dalibor"
+    - "Prado Angelo, Juan Carlos"
+    - "de Minaur, Alex"
+
+    Flashscore renvoie plutôt :
+    - "Svrcina D."
+    - "Prado Angelo J. C."
+    - "de Minaur A."
+
+    L'ancien matching lisait "Svrcina, Dalibor" comme si "Dalibor" était le nom
+    de famille. C'est ce qui donnait 0 match alors que Flashscore avait bien
+    les lignes et les cotes.
+    """
+    raw = (name or "").strip()
+
+    if "," in raw:
+        left, right = raw.split(",", 1)
+        surname_tokens = _flashscore_tokens_keep_initials(left)
+        given_tokens = _flashscore_tokens_keep_initials(right)
+        ordered_tokens = given_tokens + surname_tokens
+        original_tokens = surname_tokens + given_tokens
+    else:
+        original_tokens = _flashscore_tokens_keep_initials(raw)
+        ordered_tokens = list(original_tokens)
+        if len(original_tokens) >= 2:
+            given_tokens = original_tokens[:-1]
+            surname_tokens = [original_tokens[-1]]
+        else:
+            given_tokens = []
+            surname_tokens = list(original_tokens)
+
+    surname_candidates: List[str] = []
+
+    def add_candidate(tokens: List[str]) -> None:
+        txt = " ".join([t for t in tokens if t]).strip()
+        if txt and txt not in surname_candidates:
+            surname_candidates.append(txt)
+
+    if surname_tokens:
+        # Nom complet à gauche de la virgule : "prado angelo", "de minaur".
+        add_candidate(surname_tokens)
+        # Suffixes utiles : "angelo", "minaur", "carabelli".
+        for size in range(1, min(4, len(surname_tokens)) + 1):
+            add_candidate(surname_tokens[-size:])
+
+    if not surname_candidates and ordered_tokens:
+        for size in range(1, min(4, len(ordered_tokens)) + 1):
+            add_candidate(ordered_tokens[-size:])
+
+    given_initials = [t[0] for t in given_tokens if t]
+    first_initial = given_initials[0] if given_initials else (ordered_tokens[0][0] if ordered_tokens else "")
+
+    full_variants: List[str] = []
+    for tokens in (ordered_tokens, original_tokens):
+        txt = " ".join(tokens).strip()
+        if txt and txt not in full_variants:
+            full_variants.append(txt)
+
+    return {
+        "ordered_tokens": ordered_tokens,
+        "original_tokens": original_tokens,
+        "given_tokens": given_tokens,
+        "surname_tokens": surname_tokens,
+        "surname_candidates": surname_candidates,
+        "given_initials": given_initials,
+        "first_initial": first_initial,
+        "full_variants": full_variants,
+    }
+
+
+def _initials_match(flash_initials: List[str], profile: Dict[str, Any]) -> bool:
+    if not flash_initials:
+        return True
+
+    given_initials = list(profile.get("given_initials") or [])
+    first_initial = str(profile.get("first_initial") or "")
+
+    if not given_initials:
+        return bool(first_initial and flash_initials[0] == first_initial)
+
+    # "D." ↔ Dalibor ; "J. C." ↔ Juan Carlos.
+    if flash_initials == given_initials[:len(flash_initials)]:
+        return True
+
+    # Tolérance minimale : une seule initiale doit correspondre au prénom principal.
+    if len(flash_initials) == 1 and flash_initials[0] == given_initials[0]:
+        return True
+
+    return False
+
+
 def _same_player_flashscore(full_name: str, flash_name: str) -> bool:
     """
     Matching robuste ATP full name <-> Flashscore.
-    Corrige le bug principal :
-    _name_tokens supprimait les initiales d'une lettre, donc "Cilic M."
-    devenait seulement ["cilic"] et les cas nom composé + initiale étaient mal reconnus.
+
+    Corrige le bug vu en production step2.7 :
+    Flashscore trouvait bien des lignes comme "Svrcina D. - Faurel T. = 1.23/4.00",
+    mais le backend ne matchait rien contre "Svrcina, Dalibor" parce que le format
+    Sportradar est souvent "Nom, Prénom".
     """
     if _same_player(full_name, flash_name):
         return True
 
-    full = _flashscore_tokens_keep_initials(full_name)
-    flash = _flashscore_tokens_keep_initials(flash_name)
+    full = _full_name_profile(full_name)
+    flash_tokens = _flashscore_tokens_keep_initials(flash_name)
 
-    if not full or not flash:
+    if not full.get("ordered_tokens") or not flash_tokens:
         return False
 
-    full_first_initial = full[0][0] if full[0] else ""
-    full_last = full[-1]
-    full_tail_2 = " ".join(full[-2:]) if len(full) >= 2 else full_last
-    full_tail_3 = " ".join(full[-3:]) if len(full) >= 3 else full_tail_2
+    full_variants = set(full.get("full_variants") or [])
+    flash_join = " ".join(flash_tokens)
 
-    # Cas exact après normalisation.
-    if " ".join(full) == " ".join(flash):
+    if flash_join in full_variants:
         return True
 
-    # Flashscore : "Cilic M.", "Norrie C.", "Auger Aliassime F."
-    if len(flash) >= 2 and len(flash[-1]) == 1:
-        initial = flash[-1]
-        surname_parts = flash[:-1]
-        surname = " ".join(surname_parts)
+    flash_surname_tokens, flash_initials = _split_flashscore_short_name(flash_name)
+    flash_surname = " ".join(flash_surname_tokens).strip()
 
-        if initial == full_first_initial:
-            # Nom composé complet : Felix Auger Aliassime <-> Auger Aliassime F.
-            if surname == full_tail_2 or surname == full_tail_3:
-                return True
+    surname_candidates = set(full.get("surname_candidates") or [])
 
-            # Sécurité nom de famille simple : Marin Cilic <-> Cilic M.
-            if surname_parts and surname_parts[-1] == full_last:
-                return True
-
-    # Flashscore peut parfois afficher nom de famille seul.
-    if len(flash) == 1 and len(flash[0]) >= 4:
-        if flash[0] == full_last:
-            return True
-        if flash[0] in full:
+    # Cas principal Flashscore : "Svrcina D." ↔ "Svrcina, Dalibor".
+    if flash_surname and flash_initials:
+        if flash_surname in surname_candidates and _initials_match(flash_initials, full):
             return True
 
-    # Cas sans initiale mais nom composé partiel.
-    flash_join = " ".join(flash)
-    if len(flash) >= 2:
-        if flash_join == full_tail_2 or flash_join == full_tail_3:
+        # Tolérance nom composé : tous les morceaux du nom Flashscore sont contenus
+        # dans le nom de famille Sportradar et les initiales correspondent.
+        for candidate in surname_candidates:
+            cand_tokens = candidate.split()
+            if flash_surname_tokens and all(tok in cand_tokens for tok in flash_surname_tokens):
+                if _initials_match(flash_initials, full):
+                    return True
+
+    # Cas nom de famille seul ou nom composé sans initiale.
+    if flash_surname and not flash_initials:
+        if flash_surname in surname_candidates:
+            return True
+        if len(flash_surname_tokens) == 1 and flash_surname_tokens[0] in surname_candidates:
+            return True
+
+    # Dernière tolérance : token du nom de famille suffisamment long.
+    if len(flash_tokens) == 1 and len(flash_tokens[0]) >= 4:
+        if flash_tokens[0] in surname_candidates:
             return True
 
     return False
