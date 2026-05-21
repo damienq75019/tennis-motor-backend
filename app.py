@@ -28,7 +28,7 @@ PAYLOAD_DIR = OUTPUT_DIR / "payloads"
 # Règle utilisateur verrouillée : Jannik Sinner reste exclu de l'analyse.
 EXCLUDED_ANALYSIS_PLAYERS = ["Jannik Sinner"]
 
-app = FastAPI(title="Tennis Motor Backend Clean", version="step2.8.1-no-forced-veto-preserve-sportradar-ids")
+app = FastAPI(title="Tennis Motor Backend Clean", version="step2.9-qualifier-detector-audit-only")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -376,6 +376,30 @@ def _copy_daily_context_to_prediction(source_match: Dict[str, Any], prediction: 
     if "player_b_qualifier_source" in source_match:
         prediction["player_b_qualifier_source"] = source_match.get("player_b_qualifier_source")
 
+    # Step 2.9 : détection qualifié en audit only.
+    # Ces champs suivent l'orientation affichée, mais ne modifient pas le veto moteur.
+    def _copy_qualifier_detection(display_prefix: str, source_prefix: str) -> None:
+        for suffix in [
+            "is_qualifier_detected",
+            "qualifier_detection_confidence",
+            "qualifier_detection_source",
+            "qualifier_detection_reason",
+        ]:
+            src_key = f"{source_prefix}_{suffix}"
+            dst_key = f"{display_prefix}_{suffix}"
+            if src_key in source_match:
+                prediction[dst_key] = source_match.get(src_key)
+
+    if orientation == "reversed":
+        _copy_qualifier_detection("player_a", "player_b")
+        _copy_qualifier_detection("player_b", "player_a")
+    else:
+        _copy_qualifier_detection("player_a", "player_a")
+        _copy_qualifier_detection("player_b", "player_b")
+
+    if "qualifierDetectorPolicy" in source_match:
+        prediction["qualifierDetectorPolicy"] = source_match.get("qualifierDetectorPolicy")
+
     # Métadonnées Sportradar conservées pour l'historique Premium et le règlement officiel.
     for key in [
         "sportradarSportEventId",
@@ -626,7 +650,7 @@ def calculate_from_matches(matches: List[Dict[str, Any]]) -> Dict[str, Any]:
             "doubleSideMode": "pairwise_best_premium_no_zip_after_sort",
             "doubleSideMatches": len(final_matches),
             "doubleSideReversedChosen": reversed_chosen,
-            "contextPropagation": "clean_step2_8_no_forced_veto_context",
+            "contextPropagation": "clean_step2_9_qualifier_detector_audit_only",
             "excludedPlayers": _excluded_analysis_names(),
             "excludedMatches": len(excluded_removed),
             "excludedSample": excluded_removed[:10],
@@ -642,8 +666,8 @@ def root() -> Dict[str, Any]:
     return {
         "status": "ok",
         "service": "Tennis Motor Backend Clean",
-        "version": "step2.8.1-no-forced-veto-preserve-sportradar-ids",
-        "message": "Backend propre étape 2.7.4 : Sportradar + PostgreSQL + cotes Flashscore avec date target day corrigée + noms composés, affichage uniquement.",
+        "version": "step2.9-qualifier-detector-audit-only",
+        "message": "Backend propre étape 2.9 : Sportradar + PostgreSQL + cotes Flashscore + veto non forcé + détecteur qualifié audit only.",
         "endpoints": ["/health", "/calculate", "/predictions", "/state", "/history", "/daily", "/odds/status", "/sync/results2026/status", "/sync/results2026/run", "/sync/results2026/postgres/status", "/sync/results2026/postgres/export", "/sync/premium/status", "/sync/premium/run"],
         "excludedAnalysisPlayers": _excluded_analysis_names(),
     }
@@ -655,7 +679,7 @@ def health() -> Dict[str, Any]:
     return {
         "status": "ok",
         "service": "Tennis Motor Backend Clean",
-        "version": "step2.8.1-no-forced-veto-preserve-sportradar-ids",
+        "version": "step2.9-qualifier-detector-audit-only",
         "historyYears": list(HISTORY_YEARS),
         "historyRowsLoaded": state.get("history_rows_loaded", 0),
         "excludedAnalysisPlayers": _excluded_analysis_names(),
@@ -668,6 +692,8 @@ def health() -> Dict[str, Any]:
         "databaseUrlConfigured": bool(os.environ.get("DATABASE_URL", "").strip()),
         "sportradarApiKeyConfigured": bool(os.environ.get("SPORTRADAR_API_KEY", "").strip()),
         "sportradarAccessLevel": os.environ.get("SPORTRADAR_ACCESS_LEVEL", "trial"),
+        "qualifierDetector": "sportradar_season_links_audit_only",
+        "qualifierDetectorActivation": "audit_only_no_engine_veto",
     }
 
 
@@ -729,11 +755,11 @@ def daily(day: str = Query("today")) -> Dict[str, Any]:
     response.setdefault("daily", {})
     response["daily"].update({
         "provider": "sportradar",
-        "step": "2.8.1",
+        "step": "2.9",
         "targetDay": target_day,
         "payloadCount": len(source_matches),
         "audit": built.get("audit", {}),
-        "manualReviewPolicy": "points ATP absents ou à 0 = non analysé; veto non forcé : les victoires tournoi calculées par Sportradar sont conservées en raw/audit mais ne forcent plus player_b_tournament_wins moteur; qualifié B uniquement si preuve fiable; aucune donnée n'est inventée.",
+        "manualReviewPolicy": "points ATP absents ou à 0 = non analysé; veto non forcé : les victoires tournoi calculées par Sportradar sont conservées en raw/audit mais ne forcent plus player_b_tournament_wins moteur; qualifié B non activé automatiquement; détecteur Sportradar Season Links en audit only; aucune donnée n'est inventée.",
         "oddsPolicy": "Flashscore odds are display-only and never used by the Tennis Motor decision.",
     })
     return response
@@ -756,7 +782,7 @@ def odds_status() -> Dict[str, Any]:
         "records": audit.get("records", 0),
         "errors": audit.get("errors", []),
         "warnings": audit.get("warnings", []),
-        "serviceVersion": "step2.8.1-no-forced-veto-preserve-sportradar-ids",
+        "serviceVersion": "step2.9-qualifier-detector-audit-only",
     }
 
 
@@ -833,7 +859,7 @@ def history() -> Dict[str, Any]:
 def sync_results2026_status() -> Dict[str, Any]:
     syncer = Results2026Syncer(client=SportradarClient(), base_dir=BASE_DIR)
     status = syncer.status()
-    status["serviceVersion"] = "step2.8.1-no-forced-veto-preserve-sportradar-ids"
+    status["serviceVersion"] = "step2.9-qualifier-detector-audit-only"
     return status
 
 
@@ -841,7 +867,7 @@ def sync_results2026_status() -> Dict[str, Any]:
 def sync_results2026_postgres_status() -> Dict[str, Any]:
     syncer = Results2026Syncer(client=SportradarClient(), base_dir=BASE_DIR)
     status = syncer.postgres_status()
-    status["serviceVersion"] = "step2.8.1-no-forced-veto-preserve-sportradar-ids"
+    status["serviceVersion"] = "step2.9-qualifier-detector-audit-only"
     return status
 
 
@@ -849,7 +875,7 @@ def sync_results2026_postgres_status() -> Dict[str, Any]:
 def sync_results2026_postgres_export() -> Dict[str, Any]:
     syncer = Results2026Syncer(client=SportradarClient(), base_dir=BASE_DIR)
     result = syncer.export_postgres_to_csv()
-    result["serviceVersion"] = "step2.8.1-no-forced-veto-preserve-sportradar-ids"
+    result["serviceVersion"] = "step2.9-qualifier-detector-audit-only"
 
     try:
         if result.get("status") == "ok":
@@ -870,7 +896,7 @@ def sync_results2026_run(day: str = Query("today"), dry_run: bool = Query(False)
     target_day = normalize_day(day)
     syncer = Results2026Syncer(client=SportradarClient(), base_dir=BASE_DIR)
     result = syncer.sync_day(target_day, dry_run=dry_run)
-    result["serviceVersion"] = "step2.8.1-no-forced-veto-preserve-sportradar-ids"
+    result["serviceVersion"] = "step2.9-qualifier-detector-audit-only"
 
     # Si data/2026.csv a été modifié, on force la reconstruction de l'état Elo/Form au prochain calcul.
     try:
@@ -891,7 +917,7 @@ def sync_results2026_run(day: str = Query("today"), dry_run: bool = Query(False)
 def sync_premium_status() -> Dict[str, Any]:
     syncer = PremiumHistorySyncer(store=PostgresPremiumStore())
     status = syncer.status()
-    status["serviceVersion"] = "step2.8.1-no-forced-veto-preserve-sportradar-ids"
+    status["serviceVersion"] = "step2.9-qualifier-detector-audit-only"
     return status
 
 
@@ -901,7 +927,7 @@ def sync_premium_run(day: str = Query("today"), dry_run: bool = Query(False)) ->
     daily_result = daily(target_day)
     syncer = PremiumHistorySyncer(store=PostgresPremiumStore())
     result = syncer.sync_daily_result(daily_result, target_day, dry_run=dry_run)
-    result["serviceVersion"] = "step2.8.1-no-forced-veto-preserve-sportradar-ids"
+    result["serviceVersion"] = "step2.9-qualifier-detector-audit-only"
     return result
 
 
