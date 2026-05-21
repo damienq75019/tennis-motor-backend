@@ -215,41 +215,20 @@ def _count_wins_before(
     current_event_id: str,
     current_start: Optional[dt.datetime],
 ) -> int:
-    """Compte strictement les victoires acquises AVANT le match courant.
-
-    Règle verrouillée Tennis Motor :
-    - le match courant n'est jamais compté ;
-    - une ligne non terminée n'est jamais comptée ;
-    - une défaite n'est jamais comptée : winner_id doit être exactement le joueur ;
-    - le match compté doit avoir une heure de début strictement antérieure au match courant.
-
-    Si l'heure du match courant ou d'un match candidat est absente, on ne compte pas le candidat.
-    C'est volontairement prudent : pas d'invention et pas de comptage approximatif.
-    """
-    if not competitor_id or current_start is None:
+    if not competitor_id:
         return 0
-
     wins = 0
     for summary in season_summaries:
-        candidate_event_id = _event_id(summary)
-        if candidate_event_id == current_event_id:
+        if _event_id(summary) == current_event_id:
             continue
-
         if not _is_finished(summary):
             continue
-
         if _winner_id(summary) != competitor_id:
             continue
-
-        candidate_start = _event_start(summary)
-        if candidate_start is None:
+        start = _event_start(summary)
+        if current_start is not None and start is not None and start >= current_start:
             continue
-
-        if candidate_start >= current_start:
-            continue
-
         wins += 1
-
     return wins
 
 
@@ -317,7 +296,6 @@ class SportradarDailyBuilder:
             "errors": [],
             "warnings": [],
             "counts": {},
-            "tournamentWinsPolicy": "strict_before_start_finished_winner_only_no_current_match",
         }
 
         try:
@@ -403,6 +381,16 @@ class SportradarDailyBuilder:
                 if b_qual_conf == "manual_required":
                     qualifier_manual_required += 1
 
+                # NO FORCED VETO POLICY (step2.8)
+                # Sportradar donne bien des victoires déjà obtenues dans le tournoi,
+                # mais les utiliser directement dans player_b_tournament_wins force le veto
+                # sur presque tous les matchs de terre battue avancés (QF/SF/qualifs finales).
+                # Comme dans l'ancien fetch_day_lines_v6_10k_no_forced_veto, on conserve
+                # les victoires calculées en champs *_raw / audit, mais on ne les injecte plus
+                # dans les champs moteur qui déclenchent le veto.
+                raw_a_wins = _count_wins_before(season_summaries, a["id"], event_id, current_start)
+                raw_b_wins = _count_wins_before(season_summaries, b["id"], event_id, current_start)
+
                 match = {
                     "playerA": a["name"],
                     "playerB": b["name"],
@@ -411,8 +399,13 @@ class SportradarDailyBuilder:
                     "playerBPoints": points_b,
                     "player_a_is_qualifier": a_qual,
                     "player_b_is_qualifier": b_qual,
-                    "player_a_tournament_wins": _count_wins_before(season_summaries, a["id"], event_id, current_start),
-                    "player_b_tournament_wins": _count_wins_before(season_summaries, b["id"], event_id, current_start),
+                    "player_a_tournament_wins": 0,
+                    "player_b_tournament_wins": 0,
+                    "player_a_tournament_wins_raw": raw_a_wins,
+                    "player_b_tournament_wins_raw": raw_b_wins,
+                    "player_a_tournament_wins_for_veto": 0,
+                    "player_b_tournament_wins_for_veto": 0,
+                    "vetoContextPolicy": "no_forced_veto_raw_wins_preserved_not_used_by_engine",
                     "player_a_qualifier_confidence": a_qual_conf,
                     "player_b_qualifier_confidence": b_qual_conf,
                     "player_a_qualifier_source": a_qual_source,
@@ -424,8 +417,6 @@ class SportradarDailyBuilder:
                     "sportradarSportEventId": event_id,
                     "sportradarSeasonId": season_id,
                     "sportradarCompetitionId": _s(competition.get("id")),
-                    "sportradarPlayerAId": a["id"],
-                    "sportradarPlayerBId": b["id"],
                     "tournament": _s(competition.get("name")),
                     "seasonName": _s(season.get("name")),
                     "round": _s(round_info.get("name") or round_info.get("type")),
@@ -435,7 +426,6 @@ class SportradarDailyBuilder:
                     "winnerId": _s(status.get("winner_id")),
                     "score": _score_string(status),
                     "source": "sportradar",
-                    "tournamentWinsPolicy": "strict_before_start_finished_winner_only_no_current_match",
                 }
 
                 if placeholder_a or placeholder_b:
@@ -459,6 +449,8 @@ class SportradarDailyBuilder:
                 "player_b_qualifier_manual_required": qualifier_manual_required,
                 "surfaces_missing": surfaces_missing,
             })
+            audit["tournamentWinsPolicy"] = "no_forced_veto_raw_wins_preserved_not_used_by_engine"
+            audit["vetoContextPolicy"] = "player_b_tournament_wins moteur forcé à 0; raw wins conservés en player_b_tournament_wins_raw; qualifier fiable reste utilisable"
             audit["status"] = "ok"
 
             if self.audit_dir:
