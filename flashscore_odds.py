@@ -537,38 +537,60 @@ def _normalize_flashscore_initial_name(name: str) -> List[str]:
 
 def _split_flashscore_short_name(name: str) -> Tuple[List[str], List[str]]:
     """
-    Sépare un nom court Flashscore.
+    Sépare un nom court Flashscore sans confondre nom composé et prénom abrégé.
 
-    Exemples :
+    Exemples validés :
     - "Svrcina D." -> (["svrcina"], ["d"])
     - "Prado Angelo J. C." -> (["prado", "angelo"], ["j", "c"])
     - "de Minaur A." -> (["de", "minaur"], ["a"])
     - "Blanch Dar." -> (["blanch"], ["dar"])
+    - "Llamas Ruiz P." -> (["llamas", "ruiz"], ["p"])
 
-    Flashscore n'utilise pas toujours une seule lettre pour le prénom.
-    Exemple vu en production :
-    - Sportradar : "Blanch, Darwin"
-    - Flashscore : "Blanch Dar."
-    On traite donc aussi les petits suffixes alphabétiques de 2-4 lettres
-    comme des abréviations de prénom.
+    Correction 2.7.4 :
+    l'ancienne logique traitait parfois le dernier token du nom composé comme une
+    abréviation de prénom parce qu'il avait 2 à 4 lettres.
+    Exemple cassé : "Llamas Ruiz P." devenait surname=["llamas"], initials=["ruiz", "p"].
+    Maintenant, un token de 2 à 4 lettres n'est considéré comme prénom abrégé que
+    s'il portait réellement un point dans le texte Flashscore : "Dar.".
     """
-    tokens = _flashscore_tokens_keep_initials(name)
+    raw = (name or "").strip()
+
+    # Tokens bruts conservant l'information du point final.
+    # "Herbert P.H." -> ["Herbert", "P", "H"]
+    # "Blanch Dar." -> ["Blanch", "Dar"] avec Dar marqué comme pointé.
+    parts: List[Tuple[str, bool]] = []
+    for m in re.finditer(r"[A-Za-zÀ-ÿ]+\.?", raw):
+        token_raw = m.group(0)
+        has_dot = token_raw.endswith(".")
+        token = _norm_name(token_raw)
+        if token:
+            parts.append((token, has_dot))
+
+    if not parts:
+        tokens = _flashscore_tokens_keep_initials(name)
+        return tokens, []
+
+    tokens = [token for token, _ in parts]
+    dotted = [has_dot for _, has_dot in parts]
     initials: List[str] = []
 
     while tokens:
         last = tokens[-1]
+        last_had_dot = dotted[-1]
 
         # Initiale classique : "D.", "P.", "H.".
         if len(last) == 1:
             initials.insert(0, last)
             tokens = tokens[:-1]
+            dotted = dotted[:-1]
             continue
 
         # Abréviation courte du prénom : "Dar." pour Darwin.
-        # On ne le fait que s'il reste au moins un token pour le nom de famille.
-        if len(tokens) >= 2 and 2 <= len(last) <= 4:
+        # Point obligatoire pour ne pas casser les noms composés : "Llamas Ruiz P.".
+        if len(tokens) >= 2 and last_had_dot and 2 <= len(last) <= 4:
             initials.insert(0, last)
             tokens = tokens[:-1]
+            dotted = dotted[:-1]
             continue
 
         break
