@@ -543,13 +543,35 @@ def _split_flashscore_short_name(name: str) -> Tuple[List[str], List[str]]:
     - "Svrcina D." -> (["svrcina"], ["d"])
     - "Prado Angelo J. C." -> (["prado", "angelo"], ["j", "c"])
     - "de Minaur A." -> (["de", "minaur"], ["a"])
+    - "Blanch Dar." -> (["blanch"], ["dar"])
+
+    Flashscore n'utilise pas toujours une seule lettre pour le prénom.
+    Exemple vu en production :
+    - Sportradar : "Blanch, Darwin"
+    - Flashscore : "Blanch Dar."
+    On traite donc aussi les petits suffixes alphabétiques de 2-4 lettres
+    comme des abréviations de prénom.
     """
     tokens = _flashscore_tokens_keep_initials(name)
     initials: List[str] = []
 
-    while tokens and len(tokens[-1]) == 1:
-        initials.insert(0, tokens[-1])
-        tokens = tokens[:-1]
+    while tokens:
+        last = tokens[-1]
+
+        # Initiale classique : "D.", "P.", "H.".
+        if len(last) == 1:
+            initials.insert(0, last)
+            tokens = tokens[:-1]
+            continue
+
+        # Abréviation courte du prénom : "Dar." pour Darwin.
+        # On ne le fait que s'il reste au moins un token pour le nom de famille.
+        if len(tokens) >= 2 and 2 <= len(last) <= 4:
+            initials.insert(0, last)
+            tokens = tokens[:-1]
+            continue
+
+        break
 
     return tokens, initials
 
@@ -633,19 +655,44 @@ def _initials_match(flash_initials: List[str], profile: Dict[str, Any]) -> bool:
     if not flash_initials:
         return True
 
+    given_tokens = list(profile.get("given_tokens") or [])
     given_initials = list(profile.get("given_initials") or [])
     first_initial = str(profile.get("first_initial") or "")
 
-    if not given_initials:
-        return bool(first_initial and flash_initials[0] == first_initial)
+    if not given_tokens and not given_initials:
+        return bool(first_initial and flash_initials[0][0] == first_initial)
 
-    # "D." ↔ Dalibor ; "J. C." ↔ Juan Carlos.
-    if flash_initials == given_initials[:len(flash_initials)]:
-        return True
+    def part_matches(part: str, given_token: str) -> bool:
+        part = (part or "").strip()
+        given_token = (given_token or "").strip()
 
-    # Tolérance minimale : une seule initiale doit correspondre au prénom principal.
-    if len(flash_initials) == 1 and flash_initials[0] == given_initials[0]:
-        return True
+        if not part or not given_token:
+            return False
+
+        # Cas classique : "D." ↔ Dalibor.
+        if len(part) == 1:
+            return part == given_token[0]
+
+        # Cas Flashscore : "Dar." ↔ Darwin.
+        return given_token.startswith(part) or part.startswith(given_token)
+
+    # "D." ↔ Dalibor ; "J. C." ↔ Juan Carlos ; "Dar." ↔ Darwin.
+    if given_tokens and len(flash_initials) <= len(given_tokens):
+        ok = True
+        for index, part in enumerate(flash_initials):
+            if not part_matches(part, given_tokens[index]):
+                ok = False
+                break
+        if ok:
+            return True
+
+    # Ancien comportement conservé pour les initiales simples.
+    if given_initials:
+        if [p[0] for p in flash_initials] == given_initials[:len(flash_initials)]:
+            return True
+
+        if len(flash_initials) == 1 and flash_initials[0][0] == given_initials[0]:
+            return True
 
     return False
 
