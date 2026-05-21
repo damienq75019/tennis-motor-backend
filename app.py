@@ -808,7 +808,7 @@ def sync_results2026_postgres_status() -> Dict[str, Any]:
     return status
 
 
-@app.get("/sync/results2026/postgres/export", "/sync/premium/status", "/sync/premium/run")
+@app.get("/sync/results2026/postgres/export")
 def sync_results2026_postgres_export() -> Dict[str, Any]:
     syncer = Results2026Syncer(client=SportradarClient(), base_dir=BASE_DIR)
     result = syncer.export_postgres_to_csv()
