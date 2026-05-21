@@ -15,6 +15,8 @@ from motor import HISTORY_YEARS, calculate_match_prediction, get_state
 from sportradar_client import SportradarClient
 from sportradar_daily_builder import SportradarDailyBuilder
 from sportradar_2026_results_sync import Results2026Syncer
+from postgres_premium_store import PostgresPremiumStore
+from sportradar_premium_sync import PremiumHistorySyncer
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -25,7 +27,7 @@ PAYLOAD_DIR = OUTPUT_DIR / "payloads"
 # Règle utilisateur verrouillée : Jannik Sinner reste exclu de l'analyse.
 EXCLUDED_ANALYSIS_PLAYERS = ["Jannik Sinner"]
 
-app = FastAPI(title="Tennis Motor Backend Clean", version="step2.4.1-postgres-results2026-yesterday")
+app = FastAPI(title="Tennis Motor Backend Clean", version="step2.5-postgres-premium-history")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -373,6 +375,36 @@ def _copy_daily_context_to_prediction(source_match: Dict[str, Any], prediction: 
     if "player_b_qualifier_source" in source_match:
         prediction["player_b_qualifier_source"] = source_match.get("player_b_qualifier_source")
 
+    # Métadonnées Sportradar conservées pour l'historique Premium et le règlement officiel.
+    for key in [
+        "sportradarSportEventId",
+        "sportradarSeasonId",
+        "sportradarCompetitionId",
+        "tournament",
+        "seasonName",
+        "round",
+        "startTime",
+        "status",
+        "matchStatus",
+        "winnerId",
+        "score",
+        "source",
+        "tournamentWinsPolicy",
+    ]:
+        if key in source_match:
+            prediction[key] = source_match.get(key)
+
+    source_id_a = str(source_match.get("sportradarPlayerAId") or "")
+    source_id_b = str(source_match.get("sportradarPlayerBId") or "")
+    prediction["sportradarSourcePlayerAId"] = source_id_a
+    prediction["sportradarSourcePlayerBId"] = source_id_b
+    if orientation == "reversed":
+        prediction["sportradarPlayerAId"] = source_id_b
+        prediction["sportradarPlayerBId"] = source_id_a
+    else:
+        prediction["sportradarPlayerAId"] = source_id_a
+        prediction["sportradarPlayerBId"] = source_id_b
+
     return prediction
 
 
@@ -593,7 +625,7 @@ def calculate_from_matches(matches: List[Dict[str, Any]]) -> Dict[str, Any]:
             "doubleSideMode": "pairwise_best_premium_no_zip_after_sort",
             "doubleSideMatches": len(final_matches),
             "doubleSideReversedChosen": reversed_chosen,
-            "contextPropagation": "clean_step2_4_preserved",
+            "contextPropagation": "clean_step2_5_preserved",
             "excludedPlayers": _excluded_analysis_names(),
             "excludedMatches": len(excluded_removed),
             "excludedSample": excluded_removed[:10],
@@ -609,9 +641,9 @@ def root() -> Dict[str, Any]:
     return {
         "status": "ok",
         "service": "Tennis Motor Backend Clean",
-        "version": "step2.4.1-postgres-results2026-yesterday",
-        "message": "Backend propre étape 2.4.1 : PostgreSQL + support day=yesterday pour cron résultats 2026.",
-        "endpoints": ["/health", "/calculate", "/predictions", "/state", "/history", "/daily", "/sync/results2026/status", "/sync/results2026/run", "/sync/results2026/postgres/status", "/sync/results2026/postgres/export"],
+        "version": "step2.5-postgres-premium-history",
+        "message": "Backend propre étape 2.5 : PostgreSQL results2026 + historique Premium séparé PostgreSQL.",
+        "endpoints": ["/health", "/calculate", "/predictions", "/state", "/history", "/daily", "/sync/results2026/status", "/sync/results2026/run", "/sync/results2026/postgres/status", "/sync/results2026/postgres/export", "/sync/premium/status", "/sync/premium/run"],
         "excludedAnalysisPlayers": _excluded_analysis_names(),
     }
 
@@ -622,13 +654,14 @@ def health() -> Dict[str, Any]:
     return {
         "status": "ok",
         "service": "Tennis Motor Backend Clean",
-        "version": "step2.4.1-postgres-results2026-yesterday",
+        "version": "step2.5-postgres-premium-history",
         "historyYears": list(HISTORY_YEARS),
         "historyRowsLoaded": state.get("history_rows_loaded", 0),
         "excludedAnalysisPlayers": _excluded_analysis_names(),
         "dailyProvider": "sportradar",
         "results2026Sync": "enabled",
         "results2026Storage": "postgres" if os.environ.get("DATABASE_URL", "").strip() else "csv",
+        "premiumHistoryStorage": "postgres" if os.environ.get("DATABASE_URL", "").strip() else "unavailable",
         "databaseUrlConfigured": bool(os.environ.get("DATABASE_URL", "").strip()),
         "sportradarApiKeyConfigured": bool(os.environ.get("SPORTRADAR_API_KEY", "").strip()),
         "sportradarAccessLevel": os.environ.get("SPORTRADAR_ACCESS_LEVEL", "trial"),
@@ -664,7 +697,7 @@ def daily(day: str = Query("today")) -> Dict[str, Any]:
         )
         response["daily"].update({
             "provider": "sportradar",
-            "step": "2.4.1",
+            "step": "2.5",
             "targetDay": target_day,
             "audit": built.get("audit", {}),
             "apiKeyConfigured": bool(os.environ.get("SPORTRADAR_API_KEY", "").strip()),
@@ -676,7 +709,7 @@ def daily(day: str = Query("today")) -> Dict[str, Any]:
     response.setdefault("daily", {})
     response["daily"].update({
         "provider": "sportradar",
-        "step": "2.4.1",
+        "step": "2.5",
         "targetDay": target_day,
         "payloadCount": len(source_matches),
         "audit": built.get("audit", {}),
@@ -709,6 +742,32 @@ def state() -> Dict[str, Any]:
 
 @app.get("/history")
 def history() -> Dict[str, Any]:
+    """Historique Premium séparé.
+
+    Step 2.5 : PostgreSQL est prioritaire. Le fallback premium_history.json reste seulement
+    pour compatibilité si DATABASE_URL est absent.
+    """
+    store = PostgresPremiumStore()
+    if store.enabled:
+        try:
+            summary = store.summary()
+            return {
+                "status": "ok",
+                "storage": "postgres",
+                "summary": summary.get("summary", summary),
+                "chart": summary.get("chart", {}),
+                "rows": summary.get("rows", []),
+            }
+        except Exception as exc:
+            return {
+                "status": "error",
+                "storage": "postgres",
+                "error": f"{type(exc).__name__}: {exc}",
+                "summary": {},
+                "chart": {},
+                "rows": [],
+            }
+
     try:
         import premium_history
 
@@ -716,6 +775,7 @@ def history() -> Dict[str, Any]:
         rows = premium_history.load_history()
         return {
             "status": "ok",
+            "storage": "json_fallback",
             "historyPath": str(premium_history.HISTORY_PATH),
             "summaryPath": str(premium_history.SUMMARY_PATH),
             "summary": summary.get("summary", summary),
@@ -736,7 +796,7 @@ def history() -> Dict[str, Any]:
 def sync_results2026_status() -> Dict[str, Any]:
     syncer = Results2026Syncer(client=SportradarClient(), base_dir=BASE_DIR)
     status = syncer.status()
-    status["serviceVersion"] = "step2.4.1-postgres-results2026-yesterday"
+    status["serviceVersion"] = "step2.5-postgres-premium-history"
     return status
 
 
@@ -744,15 +804,15 @@ def sync_results2026_status() -> Dict[str, Any]:
 def sync_results2026_postgres_status() -> Dict[str, Any]:
     syncer = Results2026Syncer(client=SportradarClient(), base_dir=BASE_DIR)
     status = syncer.postgres_status()
-    status["serviceVersion"] = "step2.4.1-postgres-results2026-yesterday"
+    status["serviceVersion"] = "step2.5-postgres-premium-history"
     return status
 
 
-@app.get("/sync/results2026/postgres/export")
+@app.get("/sync/results2026/postgres/export", "/sync/premium/status", "/sync/premium/run")
 def sync_results2026_postgres_export() -> Dict[str, Any]:
     syncer = Results2026Syncer(client=SportradarClient(), base_dir=BASE_DIR)
     result = syncer.export_postgres_to_csv()
-    result["serviceVersion"] = "step2.4.1-postgres-results2026-yesterday"
+    result["serviceVersion"] = "step2.5-postgres-premium-history"
 
     try:
         if result.get("status") == "ok":
@@ -773,7 +833,7 @@ def sync_results2026_run(day: str = Query("today"), dry_run: bool = Query(False)
     target_day = normalize_day(day)
     syncer = Results2026Syncer(client=SportradarClient(), base_dir=BASE_DIR)
     result = syncer.sync_day(target_day, dry_run=dry_run)
-    result["serviceVersion"] = "step2.4.1-postgres-results2026-yesterday"
+    result["serviceVersion"] = "step2.5-postgres-premium-history"
 
     # Si data/2026.csv a été modifié, on force la reconstruction de l'état Elo/Form au prochain calcul.
     try:
@@ -787,6 +847,24 @@ def sync_results2026_run(day: str = Query("today"), dry_run: bool = Query(False)
         result["motorStateReset"] = False
         result.setdefault("warnings", []).append(f"motor state reset failed: {type(exc).__name__}: {exc}")
 
+    return result
+
+
+@app.get("/sync/premium/status")
+def sync_premium_status() -> Dict[str, Any]:
+    syncer = PremiumHistorySyncer(store=PostgresPremiumStore())
+    status = syncer.status()
+    status["serviceVersion"] = "step2.5-postgres-premium-history"
+    return status
+
+
+@app.get("/sync/premium/run")
+def sync_premium_run(day: str = Query("today"), dry_run: bool = Query(False)) -> Dict[str, Any]:
+    target_day = normalize_day(day)
+    daily_result = daily(target_day)
+    syncer = PremiumHistorySyncer(store=PostgresPremiumStore())
+    result = syncer.sync_daily_result(daily_result, target_day, dry_run=dry_run)
+    result["serviceVersion"] = "step2.5-postgres-premium-history"
     return result
 
 
