@@ -424,6 +424,8 @@ class SportradarDailyBuilder:
                     "sportradarSportEventId": event_id,
                     "sportradarSeasonId": season_id,
                     "sportradarCompetitionId": _s(competition.get("id")),
+                    "sportradarPlayerAId": a["id"],
+                    "sportradarPlayerBId": b["id"],
                     "tournament": _s(competition.get("name")),
                     "seasonName": _s(season.get("name")),
                     "round": _s(round_info.get("name") or round_info.get("type")),
