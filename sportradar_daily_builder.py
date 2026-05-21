@@ -252,6 +252,197 @@ def _count_wins_before(
     return wins
 
 
+
+def _qualification_round_number(name: str) -> int:
+    text = _lower(name)
+    if not text or "qualification" not in text:
+        return 0
+    if "final" in text:
+        return 99
+    match = re.search(r"qualification[_\s-]*round[_\s-]*(\d+)", text)
+    if match:
+        return _safe_int(match.group(1), 0) or 0
+    return 1
+
+
+def _stage_phase(summary: Dict[str, Any]) -> str:
+    ctx = (_get_event(summary).get("sport_event_context") or {})
+    stage = ctx.get("stage") or {}
+    return _lower(stage.get("phase"))
+
+
+def _round_name(summary: Dict[str, Any]) -> str:
+    ctx = (_get_event(summary).get("sport_event_context") or {})
+    round_info = ctx.get("round") or {}
+    return _lower(round_info.get("name") or round_info.get("type"))
+
+
+def _collect_main_draw_competitor_ids(season_summaries: List[Dict[str, Any]]) -> List[str]:
+    """IDs vus dans le tableau principal, hors phase/tours de qualification."""
+    out: List[str] = []
+    for summary in season_summaries or []:
+        phase = _stage_phase(summary)
+        round_name = _round_name(summary)
+        if phase == "qualification" or "qualification" in round_name:
+            continue
+        for competitor in _extract_competitors(_get_event(summary)):
+            cid = _s(competitor.get("id"))
+            if cid and cid not in out:
+                out.append(cid)
+    return out
+
+
+def _iter_season_link_cup_rounds(links_payload: Dict[str, Any]) -> Iterable[Dict[str, Any]]:
+    """Parcourt les cup_rounds réels du feed Season Links avec leur phase de stage."""
+    stages = links_payload.get("stages") or []
+    if not isinstance(stages, list):
+        return
+    for stage in stages:
+        if not isinstance(stage, dict):
+            continue
+        phase = _lower(stage.get("phase"))
+        stage_type = _lower(stage.get("type"))
+        groups = stage.get("groups") or []
+        if not isinstance(groups, list):
+            continue
+        for group in groups:
+            if not isinstance(group, dict):
+                continue
+            group_name = _s(group.get("group_name") or group.get("name"))
+            cup_rounds = group.get("cup_rounds") or []
+            if not isinstance(cup_rounds, list):
+                continue
+            for cup_round in cup_rounds:
+                if not isinstance(cup_round, dict):
+                    continue
+                item = dict(cup_round)
+                item["_stage_phase"] = phase
+                item["_stage_type"] = stage_type
+                item["_group_name"] = group_name
+                yield item
+
+
+def _build_qualifier_audit_from_sportradar(
+    season_id: str,
+    links_payload: Dict[str, Any],
+    season_summaries: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """Détection qualifié AUDIT ONLY.
+
+    Règle stricte : un joueur est seulement marqué détecté si :
+    1) il est winner_id du dernier tour de qualification dans Season Links ;
+    2) il est aussi vu dans le tableau principal via Season Summaries.
+
+    Ce résultat ne change pas player_*_is_qualifier et ne déclenche aucun veto.
+    """
+    main_draw_ids = _collect_main_draw_competitor_ids(season_summaries)
+    qualification_rounds: List[Dict[str, Any]] = []
+    parent_to_main_draw_winners: List[str] = []
+
+    for cup_round in _iter_season_link_cup_rounds(links_payload) or []:
+        name = _s(cup_round.get("name"))
+        phase = _lower(cup_round.get("_stage_phase"))
+        winner_id = _s(cup_round.get("winner_id"))
+        if phase != "qualification" and "qualification" not in _lower(name):
+            continue
+        if not winner_id:
+            continue
+
+        linked = cup_round.get("linked_cup_rounds") or []
+        linked_to_main_draw = False
+        if isinstance(linked, list):
+            for parent in linked:
+                if not isinstance(parent, dict):
+                    continue
+                parent_name = _lower(parent.get("name"))
+                if parent_name and "qualification" not in parent_name:
+                    linked_to_main_draw = True
+                    break
+
+        qualification_rounds.append({
+            "name": name,
+            "winner_id": winner_id,
+            "round_number": _qualification_round_number(name),
+            "linked_to_main_draw": linked_to_main_draw,
+        })
+        if linked_to_main_draw and winner_id not in parent_to_main_draw_winners:
+            parent_to_main_draw_winners.append(winner_id)
+
+    max_round = max([int(x.get("round_number") or 0) for x in qualification_rounds], default=0)
+    final_round_winners: List[str] = []
+
+    # Priorité : lien direct vers un tour principal. Fallback : round qualification le plus haut.
+    if parent_to_main_draw_winners:
+        final_round_winners = list(parent_to_main_draw_winners)
+    elif max_round > 0:
+        for item in qualification_rounds:
+            if int(item.get("round_number") or 0) == max_round:
+                wid = _s(item.get("winner_id"))
+                if wid and wid not in final_round_winners:
+                    final_round_winners.append(wid)
+
+    detected_ids = [cid for cid in final_round_winners if cid in set(main_draw_ids)]
+
+    by_competitor: Dict[str, Dict[str, Any]] = {}
+    all_ids = set(main_draw_ids) | set(final_round_winners)
+    for cid in sorted(all_ids):
+        if cid in detected_ids:
+            by_competitor[cid] = {
+                "detected": True,
+                "confidence": "audit_candidate",
+                "source": "sportradar_season_links_audit_only",
+                "reason": "winner_of_final_qualification_round_and_seen_in_main_draw",
+            }
+        elif cid in final_round_winners:
+            by_competitor[cid] = {
+                "detected": False,
+                "confidence": "not_confirmed",
+                "source": "sportradar_season_links_audit_only",
+                "reason": "winner_of_final_qualification_round_but_not_seen_in_main_draw",
+            }
+        else:
+            by_competitor[cid] = {
+                "detected": False,
+                "confidence": "not_detected",
+                "source": "sportradar_season_links_audit_only",
+                "reason": "seen_in_main_draw_without_final_qualification_win",
+            }
+
+    return {
+        "status": "ok",
+        "seasonId": season_id,
+        "source": "sportradar_season_links_audit_only",
+        "activation": "audit_only_no_engine_veto",
+        "qualificationRoundsWithWinner": len(qualification_rounds),
+        "qualificationMaxRoundNumber": max_round,
+        "finalQualificationWinnerIds": final_round_winners,
+        "mainDrawCompetitorIdsCount": len(main_draw_ids),
+        "detectedQualifierIds": detected_ids,
+        "detectedQualifierCount": len(detected_ids),
+        "byCompetitor": by_competitor,
+    }
+
+
+def _empty_qualifier_detection(reason: str = "not_detected") -> Dict[str, Any]:
+    return {
+        "detected": False,
+        "confidence": "not_detected" if reason == "not_detected" else "unavailable",
+        "source": "sportradar_season_links_audit_only",
+        "reason": reason,
+    }
+
+
+def _qualifier_detection_for(detector_by_season: Dict[str, Any], season_id: str, competitor_id: str) -> Dict[str, Any]:
+    season_detector = detector_by_season.get(season_id) or {}
+    if not season_detector:
+        return _empty_qualifier_detection("season_detector_unavailable")
+    if season_detector.get("status") != "ok":
+        return _empty_qualifier_detection(str(season_detector.get("reason") or "season_detector_error"))
+    by_comp = season_detector.get("byCompetitor") or {}
+    if not competitor_id:
+        return _empty_qualifier_detection("missing_competitor_id")
+    return by_comp.get(competitor_id) or _empty_qualifier_detection("not_detected")
+
 def _reliable_player_qualifier_status(competitor: Dict[str, Any], summary: Dict[str, Any]) -> Tuple[bool, str, str]:
     """Retourne uniquement une preuve fiable.
 
@@ -338,6 +529,7 @@ class SportradarDailyBuilder:
 
             surface_by_season: Dict[str, str] = {}
             summaries_by_season: Dict[str, List[Dict[str, Any]]] = {}
+            qualifier_detector_by_season: Dict[str, Any] = {}
 
             for sid in season_ids:
                 try:
@@ -353,6 +545,30 @@ class SportradarDailyBuilder:
                 except Exception as exc:
                     audit["warnings"].append(f"season_summaries_failed {sid}: {type(exc).__name__}: {exc}")
                     summaries_by_season[sid] = []
+
+                # Step 2.9 : détecteur qualifié AUDIT ONLY via Season Links.
+                # Endpoint officiel : /seasons/{season_id}/stages_groups_cup_rounds.json
+                # Ne déclenche aucun veto tant qu'il n'est pas validé manuellement sur plusieurs tournois.
+                try:
+                    links_payload = self.client.get(f"/seasons/{sid}/stages_groups_cup_rounds.json")
+                    qualifier_detector_by_season[sid] = _build_qualifier_audit_from_sportradar(
+                        sid,
+                        links_payload,
+                        summaries_by_season.get(sid, []),
+                    )
+                except Exception as exc:
+                    msg = f"season_links_failed {sid}: {type(exc).__name__}: {exc}"
+                    audit["warnings"].append(msg)
+                    qualifier_detector_by_season[sid] = {
+                        "status": "unavailable",
+                        "seasonId": sid,
+                        "source": "sportradar_season_links_audit_only",
+                        "activation": "audit_only_no_engine_veto",
+                        "reason": msg,
+                        "detectedQualifierIds": [],
+                        "detectedQualifierCount": 0,
+                        "byCompetitor": {},
+                    }
 
             matches: List[Dict[str, Any]] = []
             manual_points_required = 0
@@ -401,6 +617,9 @@ class SportradarDailyBuilder:
                 if b_qual_conf == "manual_required":
                     qualifier_manual_required += 1
 
+                a_qual_detect = _qualifier_detection_for(qualifier_detector_by_season, season_id, a["id"])
+                b_qual_detect = _qualifier_detection_for(qualifier_detector_by_season, season_id, b["id"])
+
                 # NO FORCED VETO POLICY (step2.8)
                 # Sportradar donne bien des victoires déjà obtenues dans le tournoi,
                 # mais les utiliser directement dans player_b_tournament_wins force le veto
@@ -430,6 +649,15 @@ class SportradarDailyBuilder:
                     "player_b_qualifier_confidence": b_qual_conf,
                     "player_a_qualifier_source": a_qual_source,
                     "player_b_qualifier_source": b_qual_source,
+                    "player_a_is_qualifier_detected": bool(a_qual_detect.get("detected", False)),
+                    "player_b_is_qualifier_detected": bool(b_qual_detect.get("detected", False)),
+                    "player_a_qualifier_detection_confidence": _s(a_qual_detect.get("confidence")),
+                    "player_b_qualifier_detection_confidence": _s(b_qual_detect.get("confidence")),
+                    "player_a_qualifier_detection_source": _s(a_qual_detect.get("source")),
+                    "player_b_qualifier_detection_source": _s(b_qual_detect.get("source")),
+                    "player_a_qualifier_detection_reason": _s(a_qual_detect.get("reason")),
+                    "player_b_qualifier_detection_reason": _s(b_qual_detect.get("reason")),
+                    "qualifierDetectorPolicy": "audit_only_no_engine_veto",
                     "manualReviewRequired": bool(
                         placeholder_a or placeholder_b or points_a is None or points_b is None or b_qual_conf == "manual_required"
                     ),
@@ -474,6 +702,13 @@ class SportradarDailyBuilder:
             })
             audit["tournamentWinsPolicy"] = "no_forced_veto_raw_wins_preserved_not_used_by_engine"
             audit["vetoContextPolicy"] = "player_b_tournament_wins moteur forcé à 0; raw wins conservés en player_b_tournament_wins_raw; qualifier fiable reste utilisable"
+            audit["qualifierDetectorPolicy"] = "sportradar_season_links_audit_only_no_engine_veto"
+            audit["qualifierDetectorBySeason"] = qualifier_detector_by_season
+            audit["counts"]["qualifier_detected_audit_only_total"] = sum(
+                int((detector or {}).get("detectedQualifierCount") or 0)
+                for detector in qualifier_detector_by_season.values()
+                if isinstance(detector, dict)
+            )
             audit["status"] = "ok"
 
             if self.audit_dir:
