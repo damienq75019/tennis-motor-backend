@@ -28,7 +28,7 @@ PAYLOAD_DIR = OUTPUT_DIR / "payloads"
 # Règle utilisateur verrouillée : Jannik Sinner reste exclu de l'analyse.
 EXCLUDED_ANALYSIS_PLAYERS = ["Jannik Sinner"]
 
-app = FastAPI(title="Tennis Motor Backend Clean", version="step2.7.3-flashscore-name-abbrev-fix")
+app = FastAPI(title="Tennis Motor Backend Clean", version="step2.8-no-forced-veto-context")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -626,7 +626,7 @@ def calculate_from_matches(matches: List[Dict[str, Any]]) -> Dict[str, Any]:
             "doubleSideMode": "pairwise_best_premium_no_zip_after_sort",
             "doubleSideMatches": len(final_matches),
             "doubleSideReversedChosen": reversed_chosen,
-            "contextPropagation": "clean_step2_5_preserved",
+            "contextPropagation": "clean_step2_8_no_forced_veto_context",
             "excludedPlayers": _excluded_analysis_names(),
             "excludedMatches": len(excluded_removed),
             "excludedSample": excluded_removed[:10],
@@ -642,8 +642,8 @@ def root() -> Dict[str, Any]:
     return {
         "status": "ok",
         "service": "Tennis Motor Backend Clean",
-        "version": "step2.7.3-flashscore-name-abbrev-fix",
-        "message": "Backend propre étape 2.7.3 : Sportradar + PostgreSQL + cotes Flashscore avec date target day corrigée, affichage uniquement.",
+        "version": "step2.8-no-forced-veto-context",
+        "message": "Backend propre étape 2.7.4 : Sportradar + PostgreSQL + cotes Flashscore avec date target day corrigée + noms composés, affichage uniquement.",
         "endpoints": ["/health", "/calculate", "/predictions", "/state", "/history", "/daily", "/odds/status", "/sync/results2026/status", "/sync/results2026/run", "/sync/results2026/postgres/status", "/sync/results2026/postgres/export", "/sync/premium/status", "/sync/premium/run"],
         "excludedAnalysisPlayers": _excluded_analysis_names(),
     }
@@ -655,7 +655,7 @@ def health() -> Dict[str, Any]:
     return {
         "status": "ok",
         "service": "Tennis Motor Backend Clean",
-        "version": "step2.7.3-flashscore-name-abbrev-fix",
+        "version": "step2.8-no-forced-veto-context",
         "historyYears": list(HISTORY_YEARS),
         "historyRowsLoaded": state.get("history_rows_loaded", 0),
         "excludedAnalysisPlayers": _excluded_analysis_names(),
@@ -710,7 +710,7 @@ def daily(day: str = Query("today")) -> Dict[str, Any]:
     source_matches = built.get("matches", [])
     response = calculate_from_matches(source_matches)
 
-    # Step 2.7.2 : cotes Flashscore uniquement pour affichage Unity.
+    # Step 2.7.4 : cotes Flashscore uniquement pour affichage Unity.
     # Le moteur ne lit jamais ces champs et ne les utilise pas dans la décision.
     try:
         odds_provider = FlashscoreOddsProvider()
@@ -729,11 +729,11 @@ def daily(day: str = Query("today")) -> Dict[str, Any]:
     response.setdefault("daily", {})
     response["daily"].update({
         "provider": "sportradar",
-        "step": "2.7.2",
+        "step": "2.7.4",
         "targetDay": target_day,
         "payloadCount": len(source_matches),
         "audit": built.get("audit", {}),
-        "manualReviewPolicy": "points ATP absents ou à 0 = non analysé; tournament_wins = matchs terminés strictement avant le match courant et gagnés par le joueur; placeholders à vérifier; qualifié B non fiable reste à vérifier; aucune donnée n'est inventée.",
+        "manualReviewPolicy": "points ATP absents ou à 0 = non analysé; veto non forcé : les victoires tournoi calculées par Sportradar sont conservées en raw/audit mais ne forcent plus player_b_tournament_wins moteur; qualifié B uniquement si preuve fiable; aucune donnée n'est inventée.",
         "oddsPolicy": "Flashscore odds are display-only and never used by the Tennis Motor decision.",
     })
     return response
@@ -756,7 +756,7 @@ def odds_status() -> Dict[str, Any]:
         "records": audit.get("records", 0),
         "errors": audit.get("errors", []),
         "warnings": audit.get("warnings", []),
-        "serviceVersion": "step2.7.3-flashscore-name-abbrev-fix",
+        "serviceVersion": "step2.8-no-forced-veto-context",
     }
 
 
@@ -833,7 +833,7 @@ def history() -> Dict[str, Any]:
 def sync_results2026_status() -> Dict[str, Any]:
     syncer = Results2026Syncer(client=SportradarClient(), base_dir=BASE_DIR)
     status = syncer.status()
-    status["serviceVersion"] = "step2.7.3-flashscore-name-abbrev-fix"
+    status["serviceVersion"] = "step2.8-no-forced-veto-context"
     return status
 
 
@@ -841,7 +841,7 @@ def sync_results2026_status() -> Dict[str, Any]:
 def sync_results2026_postgres_status() -> Dict[str, Any]:
     syncer = Results2026Syncer(client=SportradarClient(), base_dir=BASE_DIR)
     status = syncer.postgres_status()
-    status["serviceVersion"] = "step2.7.3-flashscore-name-abbrev-fix"
+    status["serviceVersion"] = "step2.8-no-forced-veto-context"
     return status
 
 
@@ -849,7 +849,7 @@ def sync_results2026_postgres_status() -> Dict[str, Any]:
 def sync_results2026_postgres_export() -> Dict[str, Any]:
     syncer = Results2026Syncer(client=SportradarClient(), base_dir=BASE_DIR)
     result = syncer.export_postgres_to_csv()
-    result["serviceVersion"] = "step2.7.3-flashscore-name-abbrev-fix"
+    result["serviceVersion"] = "step2.8-no-forced-veto-context"
 
     try:
         if result.get("status") == "ok":
@@ -870,7 +870,7 @@ def sync_results2026_run(day: str = Query("today"), dry_run: bool = Query(False)
     target_day = normalize_day(day)
     syncer = Results2026Syncer(client=SportradarClient(), base_dir=BASE_DIR)
     result = syncer.sync_day(target_day, dry_run=dry_run)
-    result["serviceVersion"] = "step2.7.3-flashscore-name-abbrev-fix"
+    result["serviceVersion"] = "step2.8-no-forced-veto-context"
 
     # Si data/2026.csv a été modifié, on force la reconstruction de l'état Elo/Form au prochain calcul.
     try:
@@ -891,7 +891,7 @@ def sync_results2026_run(day: str = Query("today"), dry_run: bool = Query(False)
 def sync_premium_status() -> Dict[str, Any]:
     syncer = PremiumHistorySyncer(store=PostgresPremiumStore())
     status = syncer.status()
-    status["serviceVersion"] = "step2.7.3-flashscore-name-abbrev-fix"
+    status["serviceVersion"] = "step2.8-no-forced-veto-context"
     return status
 
 
@@ -901,7 +901,7 @@ def sync_premium_run(day: str = Query("today"), dry_run: bool = Query(False)) ->
     daily_result = daily(target_day)
     syncer = PremiumHistorySyncer(store=PostgresPremiumStore())
     result = syncer.sync_daily_result(daily_result, target_day, dry_run=dry_run)
-    result["serviceVersion"] = "step2.7.3-flashscore-name-abbrev-fix"
+    result["serviceVersion"] = "step2.8-no-forced-veto-context"
     return result
 
 
