@@ -5,7 +5,7 @@ import re
 import unicodedata
 from bisect import bisect_left
 from collections import defaultdict, deque
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.path.join(BASE_DIR, "data")
@@ -55,8 +55,25 @@ def normalize_bool(value: Any) -> bool:
     return text in {"true", "1", "oui", "yes", "y"}
 
 
+def display_name_for_history(name: str) -> str:
+    """Return a stable display name matching Jeff Sackmann style when possible.
+
+    Sportradar commonly provides names as "Surname, Firstname" while the
+    historical CSVs use "Firstname Surname". The engine history keys must not
+    treat those as two different players.
+    """
+    value = re.sub(r"\s+", " ", (name or "").strip())
+    if "," in value:
+        left, right = value.split(",", 1)
+        left = re.sub(r"\s+", " ", left.strip())
+        right = re.sub(r"\s+", " ", right.strip())
+        if left and right:
+            return f"{right} {left}"
+    return value
+
+
 def canonical_name(name: str) -> str:
-    value = (name or "").strip().lower()
+    value = display_name_for_history(name).strip().lower()
     value = unicodedata.normalize("NFKD", value)
     value = "".join(ch for ch in value if not unicodedata.combining(ch))
     value = re.sub(r"[^a-z0-9\s\-']", " ", value)
@@ -276,30 +293,90 @@ def hold_proxy(
     return max(0.0, min(1.0, score))
 
 
-def dominance_score_from_row(prefix_a: str, prefix_b: str, row: Dict[str, Any]) -> float:
-    own = hold_proxy(
-        safe_int(row.get(f"{prefix_a}_ace", 0)),
-        safe_int(row.get(f"{prefix_a}_df", 0)),
-        safe_int(row.get(f"{prefix_a}_svpt", 0)),
-        safe_int(row.get(f"{prefix_a}_1stIn", 0)),
-        safe_int(row.get(f"{prefix_a}_1stWon", 0)),
-        safe_int(row.get(f"{prefix_a}_2ndWon", 0)),
-        safe_int(row.get(f"{prefix_a}_bpSaved", 0)),
-        safe_int(row.get(f"{prefix_a}_bpFaced", 0)),
-    )
+def _has_service_stats(prefix: str, row: Dict[str, Any]) -> bool:
+    return safe_int(row.get(f"{prefix}_svpt", 0)) > 0
 
-    opp = hold_proxy(
-        safe_int(row.get(f"{prefix_b}_ace", 0)),
-        safe_int(row.get(f"{prefix_b}_df", 0)),
-        safe_int(row.get(f"{prefix_b}_svpt", 0)),
-        safe_int(row.get(f"{prefix_b}_1stIn", 0)),
-        safe_int(row.get(f"{prefix_b}_1stWon", 0)),
-        safe_int(row.get(f"{prefix_b}_2ndWon", 0)),
-        safe_int(row.get(f"{prefix_b}_bpSaved", 0)),
-        safe_int(row.get(f"{prefix_b}_bpFaced", 0)),
-    )
 
-    return own - opp
+def _parse_score_sets(score: str) -> List[Tuple[int, int]]:
+    """Parse tennis score tokens from winner perspective.
+
+    The historical CSV score is winner-first, e.g. "6-4 6-7 6-3".
+    Tiebreak annotations are ignored safely.
+    """
+    sets: List[Tuple[int, int]] = []
+    for token in re.split(r"\s+", (score or "").strip()):
+        token = token.strip()
+        if not token or any(x in token.upper() for x in INVALID_SCORE_TOKENS):
+            continue
+        token = re.sub(r"\([^)]*\)", "", token)
+        m = re.match(r"^(\d{1,2})-(\d{1,2})$", token)
+        if not m:
+            continue
+        w = safe_int(m.group(1), -1)
+        l = safe_int(m.group(2), -1)
+        if w < 0 or l < 0:
+            continue
+        # Ignore impossible/non-set fragments.
+        if max(w, l) > 7 and not (w >= 10 and l >= 8):
+            continue
+        sets.append((w, l))
+    return sets
+
+
+def score_dominance_from_score(score: str) -> Optional[float]:
+    """Return a moderate dominance signal from the set score.
+
+    Output is centered around 0 from the winner perspective. It is intentionally
+    softer than a betting/market signal and only replaces missing service stats.
+    """
+    sets = _parse_score_sets(score)
+    if not sets:
+        return None
+
+    games_won = sum(w for w, _ in sets)
+    games_lost = sum(l for _, l in sets)
+    total_games = games_won + games_lost
+    if total_games <= 0:
+        return None
+
+    set_wins = sum(1 for w, l in sets if w > l)
+    set_losses = sum(1 for w, l in sets if l > w)
+    set_total = max(1, set_wins + set_losses)
+
+    game_component = (games_won - games_lost) / total_games
+    set_component = (set_wins - set_losses) / set_total
+
+    # Typical straight-set win around +0.06/+0.10, blowout capped below +0.25.
+    value = 0.18 * game_component + 0.04 * set_component
+    return max(-0.25, min(0.25, value))
+
+
+def dominance_score_from_row(prefix_a: str, prefix_b: str, row: Dict[str, Any]) -> Optional[float]:
+    if _has_service_stats(prefix_a, row) and _has_service_stats(prefix_b, row):
+        own = hold_proxy(
+            safe_int(row.get(f"{prefix_a}_ace", 0)),
+            safe_int(row.get(f"{prefix_a}_df", 0)),
+            safe_int(row.get(f"{prefix_a}_svpt", 0)),
+            safe_int(row.get(f"{prefix_a}_1stIn", 0)),
+            safe_int(row.get(f"{prefix_a}_1stWon", 0)),
+            safe_int(row.get(f"{prefix_a}_2ndWon", 0)),
+            safe_int(row.get(f"{prefix_a}_bpSaved", 0)),
+            safe_int(row.get(f"{prefix_a}_bpFaced", 0)),
+        )
+
+        opp = hold_proxy(
+            safe_int(row.get(f"{prefix_b}_ace", 0)),
+            safe_int(row.get(f"{prefix_b}_df", 0)),
+            safe_int(row.get(f"{prefix_b}_svpt", 0)),
+            safe_int(row.get(f"{prefix_b}_1stIn", 0)),
+            safe_int(row.get(f"{prefix_b}_1stWon", 0)),
+            safe_int(row.get(f"{prefix_b}_2ndWon", 0)),
+            safe_int(row.get(f"{prefix_b}_bpSaved", 0)),
+            safe_int(row.get(f"{prefix_b}_bpFaced", 0)),
+        )
+        return own - opp
+
+    return score_dominance_from_score(str(row.get("score") or ""))
 
 
 def build_state() -> Dict[str, Any]:
@@ -367,8 +444,9 @@ def build_state() -> Dict[str, Any]:
         recent_surface5[loser_key][surface].append(0.0)
 
         dom_w = dominance_score_from_row("w", "l", row)
-        recent_dominance5[winner_key].append(dom_w)
-        recent_dominance5[loser_key].append(-dom_w)
+        if dom_w is not None:
+            recent_dominance5[winner_key].append(dom_w)
+            recent_dominance5[loser_key].append(-dom_w)
 
     rank_reference_points, rank_reference_ranks = build_rank_reference(
         latest_rank_by_player=latest_rank_by_player,
@@ -443,6 +521,39 @@ def get_dominance5_rate(player_name: str, state: Dict[str, Any]) -> float:
         return 0.0
     return sum(values) / len(values)
 
+
+
+def get_player_history_audit(player_name: str, surface: str, state: Dict[str, Any]) -> Dict[str, Any]:
+    key = canonical_name(player_name)
+    surface = normalize_surface(surface)
+    global_matches = int(state["global_count"].get(key, 0))
+    surface_matches = int(state["surface_count"].get(key, {}).get(surface, 0))
+    form5_n = len(state["recent_results5"].get(key, []))
+    form10_n = len(state["recent_results10"].get(key, []))
+    surface_form5_n = len(state["recent_surface5"].get(key, {}).get(surface, []))
+    dominance_n = len(state["recent_dominance5"].get(key, []))
+
+    if global_matches <= 0:
+        swe_source = "default_1500_no_history"
+    elif surface_matches <= 0:
+        swe_source = "computed_global_history_surface_default"
+    else:
+        swe_source = "computed_surface_and_global_history"
+
+    return {
+        "historyKey": key,
+        "historyMatches": global_matches,
+        "surfaceHistoryMatches": surface_matches,
+        "form5Matches": form5_n,
+        "form10Matches": form10_n,
+        "surfaceForm5Matches": surface_form5_n,
+        "dominanceMatches": dominance_n,
+        "sweSource": swe_source,
+        "form5Source": "computed_history" if form5_n > 0 else "default_0_5_no_history",
+        "form10Source": "computed_history" if form10_n > 0 else "default_0_5_no_history",
+        "surfaceForm5Source": "computed_surface_history" if surface_form5_n > 0 else ("fallback_global_form5" if form5_n > 0 else "default_0_5_no_history"),
+        "dominanceSource": "computed_stats_or_score_history" if dominance_n > 0 else "default_0_5_no_history",
+    }
 
 def apply_clay_veto(
     surface: str,
