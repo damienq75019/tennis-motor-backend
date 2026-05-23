@@ -369,6 +369,40 @@ class PostgresPremiumStore:
             conn.commit()
         return changed > 0
 
+
+    def reset_all(self) -> Dict[str, Any]:
+        """Delete all Premium history rows from PostgreSQL.
+
+        This is intentionally separate from tennis_results_2026 and only affects
+        the tennis_premium_history table.
+        """
+        if not self.enabled:
+            return {
+                "status": "error",
+                "databaseConfigured": False,
+                "databaseStatus": "not_configured",
+                "table": self.TABLE,
+                "error": "DATABASE_URL absente dans le service web.",
+            }
+        self.ensure_schema()
+        before = self.counts()
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(f"DELETE FROM {self.TABLE}")
+                deleted = int(cur.rowcount or 0)
+            conn.commit()
+        after = self.counts()
+        return {
+            "status": "ok",
+            "databaseConfigured": True,
+            "databaseStatus": "ok",
+            "table": self.TABLE,
+            "deletedRows": deleted,
+            "countsBefore": before,
+            "countsAfter": after,
+            "policy": "Reset Premium uniquement : tennis_results_2026 / Elo ne sont pas touchés.",
+        }
+
     def summary(self) -> Dict[str, Any]:
         rows = self.fetch_rows(limit=None)
         return build_premium_summary(rows)
