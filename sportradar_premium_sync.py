@@ -53,11 +53,24 @@ def is_proche_jouable(match: Dict[str, Any]) -> bool:
 
 
 def tracked_category(match: Dict[str, Any]) -> str:
+    """Catégorie historique moteur.
+
+    PREMIUM : score >= 80, jouable, sans veto.
+    PROCHE  : 75 <= score < 80, sans veto.
+    VETO    : match analysé mais bloqué par veto moteur.
+    REFUSE  : match analysé, sans veto, sous 75 ou refusé sans veto.
+    """
+    if not isinstance(match, dict):
+        return ""
+    if _is_not_analyzable(match):
+        return ""
+    if _is_veto(match):
+        return "VETO"
     if is_premium_jouable(match):
         return "PREMIUM"
     if is_proche_jouable(match):
         return "PROCHE"
-    return ""
+    return "REFUSE"
 
 
 def _is_finished(match: Dict[str, Any]) -> bool:
@@ -267,7 +280,7 @@ class PremiumHistorySyncer:
                 "provider": "sportradar",
                 "targetDay": target_day,
                 "dryRun": dry_run,
-                "errors": ["DATABASE_URL absente : historique Premium/Proche PostgreSQL indisponible."],
+                "errors": ["DATABASE_URL absente : historique moteur PostgreSQL indisponible."],
                 "counts": counts,
             }
 
@@ -428,7 +441,7 @@ class PremiumHistorySyncer:
                 "status": "error",
                 "provider": "sportradar",
                 "dryRun": dry_run,
-                "errors": ["DATABASE_URL absente : historique Premium/Proche PostgreSQL indisponible."],
+                "errors": ["DATABASE_URL absente : historique moteur PostgreSQL indisponible."],
                 "counts": counts,
                 "results": results,
             }
@@ -478,6 +491,8 @@ class PremiumHistorySyncer:
             "daily_matches": len(matches),
             "premium_candidates": 0,
             "proche_candidates": 0,
+            "veto_candidates": 0,
+            "refuse_candidates": 0,
             "tracked_candidates": 0,
             "rows_prepared": 0,
             "rows_added": 0,
@@ -497,7 +512,7 @@ class PremiumHistorySyncer:
                 "provider": "sportradar",
                 "targetDay": target_day,
                 "dryRun": dry_run,
-                "errors": ["DATABASE_URL absente : historique Premium/Proche PostgreSQL indisponible."],
+                "errors": ["DATABASE_URL absente : historique moteur PostgreSQL indisponible."],
                 "counts": counts,
             }
 
@@ -513,7 +528,7 @@ class PremiumHistorySyncer:
                 "counts": counts,
             }
 
-        # 1) Record Premium + Proches.
+        # 1) Record all categorized engine outputs: Premium + Proches + Veto + Refusés.
         for match in matches:
             if not isinstance(match, dict):
                 counts["ignored_not_tracked"] += 1
@@ -528,6 +543,10 @@ class PremiumHistorySyncer:
                 counts["premium_candidates"] += 1
             elif category == "PROCHE":
                 counts["proche_candidates"] += 1
+            elif category == "VETO":
+                counts["veto_candidates"] += 1
+            elif category == "REFUSE":
+                counts["refuse_candidates"] += 1
             counts["tracked_candidates"] += 1
 
             row = _build_history_row(match, target_day, category)
@@ -610,5 +629,5 @@ class PremiumHistorySyncer:
                 "step": (daily_result.get("daily") or {}).get("step"),
                 "summary": daily_result.get("summary", {}),
             },
-            "policy": "Historique séparé : Premium >= 80 et Proches 75-79.99 enregistrés; règlement via winner_id Sportradar.",
+            "policy": "Historique moteur catégorisé : Premium, Proches, Veto et Refusés enregistrés séparément; règlement via winner_id Sportradar.",
         }
