@@ -71,14 +71,57 @@ def parse_date(value: Any) -> Optional[date]:
         return None
 
 
-class PostgresPremiumStore:
-    """Persistent premium-pick history for Tennis Motor.
+VALID_HISTORY_CATEGORIES = {"PREMIUM", "PROCHE", "VETO", "REFUSE"}
 
-    This store is separate from tennis_results_2026. It tracks Premium and Proche jouable picks,
-    and settles them from Sportradar winner_id when the match is closed.
+
+def normalize_category(value: Any, default: str = "PREMIUM") -> str:
+    raw = _s(value).upper()
+    raw = raw.replace("É", "E").replace("È", "E").replace("Ê", "E")
+    raw = raw.replace(" ", "_").replace("-", "_")
+    if raw in {"PREMIUM", "PREM"}:
+        return "PREMIUM"
+    if raw in {"PROCHE", "PROCHES"}:
+        return "PROCHE"
+    if raw in {"VETO", "VETOES"}:
+        return "VETO"
+    if raw in {"REFUSE", "REFUS", "REFUSES", "REFUSED", "REFUSE_SANS_VETO", "REFUSES_SANS_VETO"}:
+        return "REFUSE"
+    if raw in {"ALL", "TOUT", "*"}:
+        return "ALL"
+    return default
+
+
+def category_where(category: Any, column: str = "status") -> Tuple[str, List[Any]]:
+    cat = normalize_category(category, default="ALL")
+    if cat == "ALL":
+        return "", []
+    return f" AND UPPER(COALESCE({column}, 'PREMIUM')) = %s", [cat]
+
+
+def row_category(row: Dict[str, Any]) -> str:
+    return normalize_category(row.get("status") or row.get("category"), default="PREMIUM")
+
+
+def category_label(category: Any) -> str:
+    cat = normalize_category(category)
+    labels = {
+        "PREMIUM": "Premium",
+        "PROCHE": "Proches",
+        "VETO": "Veto",
+        "REFUSE": "Refusés",
+        "ALL": "Toutes catégories",
+    }
+    return labels.get(cat, cat)
+
+
+class PostgresPremiumStore:
+    """Persistent categorized pick history for Tennis Motor.
+
+    Physical table kept as tennis_premium_history for zero data loss.
+    Logical STEP25 model: PREMIUM / PROCHE / VETO / REFUSE categories.
     """
 
-    TABLE = "tennis_premium_history"
+    TABLE = os.environ.get("TENNIS_MOTOR_HISTORY_TABLE", "tennis_premium_history")
 
     def __init__(self, database_url: Optional[str] = None) -> None:
         self.database_url = (database_url or os.environ.get("DATABASE_URL") or "").strip()
@@ -151,6 +194,11 @@ class PostgresPremiumStore:
                     CREATE INDEX IF NOT EXISTS idx_{self.TABLE}_sport_event_id ON {self.TABLE}(sport_event_id)
                     """
                 )
+                cur.execute(
+                    f"""
+                    CREATE INDEX IF NOT EXISTS idx_{self.TABLE}_status ON {self.TABLE}(status)
+                    """
+                )
             conn.commit()
 
     def status(self) -> Dict[str, Any]:
@@ -181,33 +229,44 @@ class PostgresPremiumStore:
                 "error": f"{type(exc).__name__}: {exc}",
             }
 
-    def counts(self) -> Dict[str, int]:
+    def counts(self, category: Optional[str] = None) -> Dict[str, Any]:
         self.ensure_schema()
+        where, params = category_where(category)
         with self._connect() as conn:
             with conn.cursor() as cur:
-                cur.execute(f"SELECT COUNT(*) FROM {self.TABLE}")
+                cur.execute(f"SELECT COUNT(*) FROM {self.TABLE} WHERE 1=1{where}", tuple(params))
                 total = int(cur.fetchone()[0] or 0)
-                cur.execute(f"SELECT COUNT(*) FROM {self.TABLE} WHERE result = 'pending'")
+                cur.execute(f"SELECT COUNT(*) FROM {self.TABLE} WHERE result = 'pending'{where}", tuple(params))
                 pending = int(cur.fetchone()[0] or 0)
-                cur.execute(f"SELECT COUNT(*) FROM {self.TABLE} WHERE result = 'win'")
+                cur.execute(f"SELECT COUNT(*) FROM {self.TABLE} WHERE result = 'win'{where}", tuple(params))
                 wins = int(cur.fetchone()[0] or 0)
-                cur.execute(f"SELECT COUNT(*) FROM {self.TABLE} WHERE result = 'loss'")
+                cur.execute(f"SELECT COUNT(*) FROM {self.TABLE} WHERE result = 'loss'{where}", tuple(params))
                 losses = int(cur.fetchone()[0] or 0)
+
                 cur.execute(f"SELECT UPPER(COALESCE(status, 'PREMIUM')), COUNT(*) FROM {self.TABLE} GROUP BY UPPER(COALESCE(status, 'PREMIUM'))")
-                by_status = {str(k or "PREMIUM").upper(): int(v or 0) for k, v in cur.fetchall()}
-        premium = int(by_status.get("PREMIUM", 0))
-        proches = int(by_status.get("PROCHE", 0))
+                by_status_all = {str(k or "PREMIUM").upper(): int(v or 0) for k, v in cur.fetchall()}
+
+                cur.execute(f"SELECT UPPER(COALESCE(status, 'PREMIUM')), COUNT(*) FROM {self.TABLE} WHERE 1=1{where} GROUP BY UPPER(COALESCE(status, 'PREMIUM'))", tuple(params))
+                by_status_selected = {str(k or "PREMIUM").upper(): int(v or 0) for k, v in cur.fetchall()}
+
+        selected_cat = normalize_category(category, default="ALL")
         return {
+            "category": selected_cat,
             "total": total,
-            "premium": premium,
-            "proches": proches,
+            "premium": int(by_status_selected.get("PREMIUM", 0)) if selected_cat != "ALL" else int(by_status_all.get("PREMIUM", 0)),
+            "proches": int(by_status_selected.get("PROCHE", 0)) if selected_cat != "ALL" else int(by_status_all.get("PROCHE", 0)),
+            "veto": int(by_status_selected.get("VETO", 0)) if selected_cat != "ALL" else int(by_status_all.get("VETO", 0)),
+            "refuse": int(by_status_selected.get("REFUSE", 0)) if selected_cat != "ALL" else int(by_status_all.get("REFUSE", 0)),
+            "byStatus": by_status_selected,
+            "byStatusAll": by_status_all,
             "pending": pending,
             "wins": wins,
             "losses": losses,
             "settled": wins + losses,
         }
 
-    def fetch_rows(self, limit: Optional[int] = None) -> List[Dict[str, Any]]:
+
+    def fetch_rows(self, limit: Optional[int] = None, category: Optional[str] = None) -> List[Dict[str, Any]]:
         self.ensure_schema()
         sql = f"""
             SELECT id, date, sport_event_id, source_player_a, source_player_b,
@@ -217,12 +276,15 @@ class PostgresPremiumStore:
                    round, start_time, score, winner_id, sportradar_player_a_id,
                    sportradar_player_b_id, raw_json
             FROM {self.TABLE}
-            ORDER BY date DESC, created_at DESC
+            WHERE 1=1
         """
-        params: Tuple[Any, ...] = ()
+        where, params_list = category_where(category)
+        sql += where
+        sql += " ORDER BY date DESC, created_at DESC"
         if limit is not None:
             sql += " LIMIT %s"
-            params = (int(limit),)
+            params_list.append(int(limit))
+        params: Tuple[Any, ...] = tuple(params_list)
         out: List[Dict[str, Any]] = []
         with self._connect() as conn:
             with conn.cursor() as cur:
@@ -346,7 +408,7 @@ class PostgresPremiumStore:
             conn.commit()
         return "updated" if existing else "inserted"
 
-    def fetch_pending_rows(self, day: Optional[str] = None, limit: Optional[int] = None) -> List[Dict[str, Any]]:
+    def fetch_pending_rows(self, day: Optional[str] = None, limit: Optional[int] = None, category: Optional[str] = None) -> List[Dict[str, Any]]:
         self.ensure_schema()
         sql = f"""
             SELECT id, date, sport_event_id, source_player_a, source_player_b,
@@ -360,6 +422,9 @@ class PostgresPremiumStore:
         if day:
             sql += " AND date = %s"
             params.append(_s(day))
+        where, cat_params = category_where(category)
+        sql += where
+        params.extend(cat_params)
         sql += " ORDER BY date ASC, created_at ASC"
         if limit is not None:
             sql += " LIMIT %s"
@@ -384,10 +449,14 @@ class PostgresPremiumStore:
                     out.append(row)
         return out
 
-    def pending_dates(self, days_back: int = 7, limit: int = 30) -> List[str]:
+    def pending_dates(self, days_back: int = 7, limit: int = 30, category: Optional[str] = None) -> List[str]:
         self.ensure_schema()
         days_back = max(1, min(int(days_back or 7), 60))
         since = today_paris() - timedelta(days=days_back - 1)
+        where, cat_params = category_where(category)
+        params: List[Any] = [since.isoformat()]
+        params.extend(cat_params)
+        params.append(int(limit))
         with self._connect() as conn:
             with conn.cursor() as cur:
                 cur.execute(
@@ -395,11 +464,11 @@ class PostgresPremiumStore:
                     SELECT DISTINCT date
                     FROM {self.TABLE}
                     WHERE result = 'pending'
-                      AND date >= %s
+                      AND date >= %s{where}
                     ORDER BY date ASC
                     LIMIT %s
                     """,
-                    (since.isoformat(), int(limit)),
+                    tuple(params),
                 )
                 return [_s(row[0]) for row in cur.fetchall() if _s(row[0])]
 
@@ -469,11 +538,45 @@ class PostgresPremiumStore:
         return changed
 
 
+    def reset_category(self, category: str) -> Dict[str, Any]:
+        """Delete history rows for one category only."""
+        if not self.enabled:
+            return {
+                "status": "error",
+                "databaseConfigured": False,
+                "databaseStatus": "not_configured",
+                "table": self.TABLE,
+                "error": "DATABASE_URL absente dans le service web.",
+            }
+        cat = normalize_category(category)
+        if cat == "ALL":
+            return self.reset_all()
+        self.ensure_schema()
+        before = self.counts(category=cat)
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(f"DELETE FROM {self.TABLE} WHERE UPPER(COALESCE(status, 'PREMIUM')) = %s", (cat,))
+                deleted = int(cur.rowcount or 0)
+            conn.commit()
+        after = self.counts(category=cat)
+        return {
+            "status": "ok",
+            "databaseConfigured": True,
+            "databaseStatus": "ok",
+            "table": self.TABLE,
+            "category": cat,
+            "deletedRows": deleted,
+            "countsBefore": before,
+            "countsAfter": after,
+            "policy": "Reset par catégorie uniquement : tennis_results_2026 / Elo ne sont pas touchés.",
+        }
+
+
     def reset_all(self) -> Dict[str, Any]:
         """Delete all Premium history rows from PostgreSQL.
 
         This is intentionally separate from tennis_results_2026 and only affects
-        the tennis_premium_history table.
+        the historique moteur.
         """
         if not self.enabled:
             return {
@@ -499,19 +602,21 @@ class PostgresPremiumStore:
             "deletedRows": deleted,
             "countsBefore": before,
             "countsAfter": after,
-            "policy": "Reset Premium uniquement : tennis_results_2026 / Elo ne sont pas touchés.",
+            "policy": "Reset global historique moteur : tennis_results_2026 / Elo ne sont pas touchés.",
         }
 
-    def summary(self) -> Dict[str, Any]:
-        rows = self.fetch_rows(limit=None)
-        return build_premium_summary(rows)
+    def summary(self, category: Optional[str] = "PREMIUM") -> Dict[str, Any]:
+        cat = normalize_category(category)
+        rows = self.fetch_rows(limit=None, category=cat)
+        return build_premium_summary(rows, category=cat)
 
 
-def stats_for_period(rows: List[Dict[str, Any]], period_days: Optional[int]) -> Dict[str, Any]:
+def stats_for_period(rows: List[Dict[str, Any]], period_days: Optional[int], category: Optional[str] = "PREMIUM") -> Dict[str, Any]:
     today = today_paris()
     selected: List[Dict[str, Any]] = []
+    cat = normalize_category(category)
     for row in rows:
-        if row.get("status") != "PREMIUM":
+        if cat != "ALL" and row_category(row) != cat:
             continue
         d = parse_date(row.get("date"))
         if d is None:
@@ -539,6 +644,8 @@ def stats_for_period(rows: List[Dict[str, Any]], period_days: Optional[int]) -> 
     roi = round((profit_units / odds_used) * 100.0, 2) if odds_used else 0.0
     return {
         "trackedPremium": len(selected),
+        "trackedCategory": len(selected),
+        "category": normalize_category(category),
         "settled": total,
         "wins": wins,
         "losses": losses,
@@ -550,10 +657,11 @@ def stats_for_period(rows: List[Dict[str, Any]], period_days: Optional[int]) -> 
     }
 
 
-def build_premium_summary(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
+def build_premium_summary(rows: List[Dict[str, Any]], category: Optional[str] = "PREMIUM") -> Dict[str, Any]:
+    cat = normalize_category(category)
     by_day: Dict[str, Dict[str, Any]] = {}
     for row in rows:
-        if row.get("status") != "PREMIUM":
+        if cat != "ALL" and row_category(row) != cat:
             continue
         d = _s(row.get("date"))
         if not d:
@@ -568,6 +676,7 @@ def build_premium_summary(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
             "profitEur": 0.0,
             "hadPremiumToday": True,
             "hadPremiumSettledToday": False,
+            "category": cat,
         })
         odd = _f(row.get("oddPredicted"), 0.0)
         result = row.get("result")
@@ -615,22 +724,27 @@ def build_premium_summary(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
             "pendingThatDay": int(bucket.get("pending") or 0),
             "hadPremiumToday": bool(bucket.get("hadPremiumToday", False)),
             "hadPremiumSettledToday": bool(bucket.get("hadPremiumSettledToday", False)),
+            "category": cat,
         })
 
     return {
         "status": "ok",
         "storage": {"mode": "postgres", "table": PostgresPremiumStore.TABLE},
         "summary": {
-            "day": stats_for_period(rows, 1),
-            "week": stats_for_period(rows, 7),
-            "month": stats_for_period(rows, 30),
-            "year": stats_for_period(rows, 365),
-            "all": stats_for_period(rows, None),
+            "category": cat,
+            "label": category_label(cat),
+            "day": stats_for_period(rows, 1, cat),
+            "week": stats_for_period(rows, 7, cat),
+            "month": stats_for_period(rows, 30, cat),
+            "year": stats_for_period(rows, 365, cat),
+            "all": stats_for_period(rows, None, cat),
         },
         "chart": {
             "days": days,
             "cumulativeDays": cumulative_days,
-            "description": "Historique Premium séparé, stocké dans PostgreSQL.",
+            "category": cat,
+            "label": category_label(cat),
+            "description": f"Historique {category_label(cat)} séparé, stocké dans PostgreSQL.",
             "stakeEur": STAKE_EUR,
             "euroAxisMin": -2000.0,
             "euroAxisMax": 2000.0,
