@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 from postgres_premium_store import PostgresPremiumStore, premium_history_key
 
@@ -25,40 +25,38 @@ def _is_veto(match: Dict[str, Any]) -> bool:
     return _s(match.get("veto")).lower() in {"oui", "yes", "true", "1"}
 
 
-def _decision_blocks_history(match: Dict[str, Any]) -> bool:
-    decision = _s(match.get("decision")).lower()
-    return "pas jouable" in decision or "refus" in decision or "non analys" in decision
-
-
-def history_category(match: Dict[str, Any]) -> str:
-    """Return PREMIUM / PROCHE / '' for rows that should not be tracked.
-
-    Premium: score >= 80, no veto.
-    Proche: 75 <= score < 80, no veto.
-    Refusé/Veto/Non analysé: not tracked in premium history.
-    """
-    if not isinstance(match, dict):
-        return ""
-    if match.get("nonAnalyzable") or match.get("analysisStatus") == "not_analyzed":
-        return ""
-    if _is_veto(match):
-        return ""
-    if _decision_blocks_history(match):
-        return ""
-    pct = _premium_pct(match)
-    if pct >= 80.0:
-        return "PREMIUM"
-    if 75.0 <= pct < 80.0:
-        return "PROCHE"
-    return ""
+def _is_not_analyzable(match: Dict[str, Any]) -> bool:
+    return bool(match.get("nonAnalyzable")) or _s(match.get("analysisStatus")).lower() == "not_analyzed" or bool(match.get("error"))
 
 
 def is_premium_jouable(match: Dict[str, Any]) -> bool:
-    return history_category(match) == "PREMIUM"
+    if not isinstance(match, dict):
+        return False
+    if _is_not_analyzable(match) or _is_veto(match):
+        return False
+    if _premium_pct(match) < 80.0:
+        return False
+    decision = _s(match.get("decision")).lower()
+    if "pas jouable" in decision or "refus" in decision or "non analys" in decision:
+        return False
+    return True
 
 
-def is_history_trackable(match: Dict[str, Any]) -> bool:
-    return history_category(match) in {"PREMIUM", "PROCHE"}
+def is_proche_jouable(match: Dict[str, Any]) -> bool:
+    if not isinstance(match, dict):
+        return False
+    if _is_not_analyzable(match) or _is_veto(match):
+        return False
+    pct = _premium_pct(match)
+    return 75.0 <= pct < 80.0
+
+
+def tracked_category(match: Dict[str, Any]) -> str:
+    if is_premium_jouable(match):
+        return "PREMIUM"
+    if is_proche_jouable(match):
+        return "PROCHE"
+    return ""
 
 
 def _is_finished(match: Dict[str, Any]) -> bool:
@@ -67,7 +65,7 @@ def _is_finished(match: Dict[str, Any]) -> bool:
         return False
     status = _s(match.get("status") or match.get("sportradarStatus")).lower()
     match_status = _s(match.get("matchStatus") or match.get("sportradarMatchStatus")).lower()
-    return status in {"closed", "ended", "finished", "complete", "completed"} or match_status in {"ended", "finished", "complete", "completed"}
+    return status in {"closed", "ended", "finished", "complete", "completed"} or match_status in {"ended", "finished", "complete", "completed", "retired"}
 
 
 def _winner_name_from_match(match: Dict[str, Any]) -> str:
@@ -81,14 +79,13 @@ def _winner_name_from_match(match: Dict[str, Any]) -> str:
     return ""
 
 
-def _build_premium_row(match: Dict[str, Any], target_day: str) -> Dict[str, Any]:
+def _build_history_row(match: Dict[str, Any], target_day: str, category: str) -> Dict[str, Any]:
     predicted = _s(match.get("playerA"))
     opponent = _s(match.get("playerB"))
     source_a = _s(match.get("sourcePlayerA") or predicted)
     source_b = _s(match.get("sourcePlayerB") or opponent)
     event_id = _s(match.get("sportradarSportEventId"))
     row_id = premium_history_key(target_day, event_id, source_a, source_b, predicted)
-    category = history_category(match) or "PREMIUM"
 
     return {
         "id": row_id,
@@ -145,7 +142,7 @@ class PremiumHistorySyncer:
             "rows_added": 0,
             "rows_updated": 0,
             "rows_kept_settled": 0,
-            "ignored_non_tracked": 0,
+            "ignored_not_tracked": 0,
             "settled": 0,
             "unresolved_finished": 0,
         }
@@ -159,7 +156,7 @@ class PremiumHistorySyncer:
                 "provider": "sportradar",
                 "targetDay": target_day,
                 "dryRun": dry_run,
-                "errors": ["DATABASE_URL absente : historique Premium PostgreSQL indisponible."],
+                "errors": ["DATABASE_URL absente : historique Premium/Proche PostgreSQL indisponible."],
                 "counts": counts,
             }
 
@@ -175,34 +172,40 @@ class PremiumHistorySyncer:
                 "counts": counts,
             }
 
-        # 1) Record Premium + Proches trackables.
+        # 1) Record Premium + Proches.
         for match in matches:
             if not isinstance(match, dict):
-                counts["ignored_non_tracked"] += 1
+                counts["ignored_not_tracked"] += 1
                 continue
-            category = history_category(match)
+
+            category = tracked_category(match)
             if not category:
-                counts["ignored_non_tracked"] += 1
+                counts["ignored_not_tracked"] += 1
                 continue
+
             if category == "PREMIUM":
                 counts["premium_candidates"] += 1
             elif category == "PROCHE":
                 counts["proche_candidates"] += 1
             counts["tracked_candidates"] += 1
-            row = _build_premium_row(match, target_day)
+
+            row = _build_history_row(match, target_day, category)
             counts["rows_prepared"] += 1
+
             if len(added_sample) < 10:
                 added_sample.append({
                     "eventId": row.get("sportradarSportEventId"),
-                    "category": row.get("status"),
+                    "category": category,
                     "pick": row.get("predictedWinner"),
                     "opponent": row.get("opponent"),
                     "premiumPct": row.get("premiumPct"),
                     "tournament": row.get("tournament"),
                     "round": row.get("round"),
                 })
+
             if dry_run:
                 continue
+
             try:
                 action = self.store.upsert_premium_row(row)
                 if action == "inserted":
@@ -214,7 +217,7 @@ class PremiumHistorySyncer:
             except Exception as exc:
                 errors.append(f"upsert failed: {type(exc).__name__}: {exc}")
 
-        # 2) Settle pending Premiums using the same Sportradar daily payload.
+        # 2) Settle pending tracked rows using the same Sportradar daily payload.
         for match in matches:
             if not isinstance(match, dict) or not _is_finished(match):
                 continue
@@ -265,5 +268,5 @@ class PremiumHistorySyncer:
                 "step": (daily_result.get("daily") or {}).get("step"),
                 "summary": daily_result.get("summary", {}),
             },
-            "policy": "Historique Premium + Proches séparé : Premium >=80 et Proches 75-79.99 sont enregistrés; règlement uniquement via winner_id Sportradar.",
+            "policy": "Historique séparé : Premium >= 80 et Proches 75-79.99 enregistrés; règlement via winner_id Sportradar.",
         }
