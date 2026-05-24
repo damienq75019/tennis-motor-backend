@@ -74,7 +74,7 @@ def parse_date(value: Any) -> Optional[date]:
 class PostgresPremiumStore:
     """Persistent premium-pick history for Tennis Motor.
 
-    This store is separate from tennis_results_2026. It tracks only Premium jouable picks,
+    This store is separate from tennis_results_2026. It tracks Premium and Proche jouable picks,
     and settles them from Sportradar winner_id when the match is closed.
     """
 
@@ -346,10 +346,68 @@ class PostgresPremiumStore:
             conn.commit()
         return "updated" if existing else "inserted"
 
-    def settle_pending_by_event(self, sport_event_id: str, real_winner: str, score: str, winner_id: str) -> bool:
-        if not sport_event_id or not real_winner:
-            return False
+    def fetch_pending_rows(self, day: Optional[str] = None, limit: Optional[int] = None) -> List[Dict[str, Any]]:
         self.ensure_schema()
+        sql = f"""
+            SELECT id, date, sport_event_id, source_player_a, source_player_b,
+                   predicted_winner, opponent, surface, premium_pct, status, result,
+                   odd_predicted, odd_opponent, tournament, round, start_time,
+                   score, winner_id, sportradar_player_a_id, sportradar_player_b_id
+            FROM {self.TABLE}
+            WHERE result = 'pending'
+        """
+        params: List[Any] = []
+        if day:
+            sql += " AND date = %s"
+            params.append(_s(day))
+        sql += " ORDER BY date ASC, created_at ASC"
+        if limit is not None:
+            sql += " LIMIT %s"
+            params.append(int(limit))
+
+        out: List[Dict[str, Any]] = []
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(sql, tuple(params))
+                cols = [desc[0] for desc in cur.description]
+                for db_row in cur.fetchall():
+                    row = dict(zip(cols, db_row))
+                    row["sourcePlayerA"] = row.pop("source_player_a")
+                    row["sourcePlayerB"] = row.pop("source_player_b")
+                    row["predictedWinner"] = row.pop("predicted_winner")
+                    row["premiumPct"] = row.pop("premium_pct")
+                    row["oddPredicted"] = row.pop("odd_predicted")
+                    row["oddOpponent"] = row.pop("odd_opponent")
+                    row["sportradarSportEventId"] = row.pop("sport_event_id")
+                    row["sportradarPlayerAId"] = row.pop("sportradar_player_a_id")
+                    row["sportradarPlayerBId"] = row.pop("sportradar_player_b_id")
+                    out.append(row)
+        return out
+
+    def pending_dates(self, days_back: int = 7, limit: int = 30) -> List[str]:
+        self.ensure_schema()
+        days_back = max(1, min(int(days_back or 7), 60))
+        since = today_paris() - timedelta(days=days_back - 1)
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    f"""
+                    SELECT DISTINCT date
+                    FROM {self.TABLE}
+                    WHERE result = 'pending'
+                      AND date >= %s
+                    ORDER BY date ASC
+                    LIMIT %s
+                    """,
+                    (since.isoformat(), int(limit)),
+                )
+                return [_s(row[0]) for row in cur.fetchall() if _s(row[0])]
+
+    def settle_pending_by_event(self, sport_event_id: str, real_winner: str, score: str, winner_id: str, *, source: str = "sportradar") -> int:
+        if not sport_event_id or not real_winner:
+            return 0
+        self.ensure_schema()
+        changed = 0
         with self._connect() as conn:
             with conn.cursor() as cur:
                 cur.execute(
@@ -360,7 +418,6 @@ class PostgresPremiumStore:
                     (sport_event_id,),
                 )
                 rows = cur.fetchall()
-                changed = 0
                 for row_id, predicted in rows:
                     result = "win" if same_player(_s(predicted), real_winner) else "loss"
                     cur.execute(
@@ -369,17 +426,47 @@ class PostgresPremiumStore:
                         SET result = %s,
                             real_winner = %s,
                             settled_at = %s,
-                            settle_source = 'sportradar',
+                            settle_source = %s,
                             score = COALESCE(NULLIF(%s, ''), score),
                             winner_id = COALESCE(NULLIF(%s, ''), winner_id),
                             updated_at = NOW()
                         WHERE id = %s AND result = 'pending'
                         """,
-                        (result, real_winner, today_paris().isoformat(), score, winner_id, row_id),
+                        (result, real_winner, today_paris().isoformat(), _s(source) or "sportradar", score, winner_id, row_id),
                     )
-                    changed += cur.rowcount
+                    changed += int(cur.rowcount or 0)
             conn.commit()
-        return changed > 0
+        return changed
+
+    def settle_pending_by_id(self, row_id: str, real_winner: str, score: str, winner_id: str, *, source: str = "sportradar-name-fallback") -> int:
+        if not row_id or not real_winner:
+            return 0
+        self.ensure_schema()
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(f"SELECT predicted_winner FROM {self.TABLE} WHERE id = %s AND result = 'pending'", (row_id,))
+                row = cur.fetchone()
+                if not row:
+                    return 0
+                predicted = _s(row[0])
+                result = "win" if same_player(predicted, real_winner) else "loss"
+                cur.execute(
+                    f"""
+                    UPDATE {self.TABLE}
+                    SET result = %s,
+                        real_winner = %s,
+                        settled_at = %s,
+                        settle_source = %s,
+                        score = COALESCE(NULLIF(%s, ''), score),
+                        winner_id = COALESCE(NULLIF(%s, ''), winner_id),
+                        updated_at = NOW()
+                    WHERE id = %s AND result = 'pending'
+                    """,
+                    (result, real_winner, today_paris().isoformat(), _s(source) or "sportradar-name-fallback", score, winner_id, row_id),
+                )
+                changed = int(cur.rowcount or 0)
+            conn.commit()
+        return changed
 
 
     def reset_all(self) -> Dict[str, Any]:
