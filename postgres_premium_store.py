@@ -193,7 +193,19 @@ class PostgresPremiumStore:
                 wins = int(cur.fetchone()[0] or 0)
                 cur.execute(f"SELECT COUNT(*) FROM {self.TABLE} WHERE result = 'loss'")
                 losses = int(cur.fetchone()[0] or 0)
-        return {"total": total, "pending": pending, "wins": wins, "losses": losses, "settled": wins + losses}
+                cur.execute(f"SELECT UPPER(COALESCE(status, 'PREMIUM')), COUNT(*) FROM {self.TABLE} GROUP BY UPPER(COALESCE(status, 'PREMIUM'))")
+                by_status = {str(k or "PREMIUM").upper(): int(v or 0) for k, v in cur.fetchall()}
+        premium = int(by_status.get("PREMIUM", 0))
+        proches = int(by_status.get("PROCHE", 0))
+        return {
+            "total": total,
+            "premium": premium,
+            "proches": proches,
+            "pending": pending,
+            "wins": wins,
+            "losses": losses,
+            "settled": wins + losses,
+        }
 
     def fetch_rows(self, limit: Optional[int] = None) -> List[Dict[str, Any]]:
         self.ensure_schema()
