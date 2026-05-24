@@ -28,7 +28,7 @@ PAYLOAD_DIR = OUTPUT_DIR / "payloads"
 # Règle utilisateur verrouillée : Jannik Sinner reste exclu de l'analyse.
 EXCLUDED_ANALYSIS_PLAYERS = ["Jannik Sinner"]
 
-app = FastAPI(title="Tennis Motor Backend Clean", version="step2.12-premium-list-reset")
+app = FastAPI(title="Tennis Motor Backend Clean", version="step2.13-auto-history-premium-proches")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -741,7 +741,7 @@ def root() -> Dict[str, Any]:
     return {
         "status": "ok",
         "service": "Tennis Motor Backend Clean",
-        "version": "step2.12-premium-list-reset",
+        "version": "step2.13-auto-history-premium-proches",
         "message": "Backend propre étape 2.11 : Sportradar + PostgreSQL + cotes Flashscore + veto non forcé + détecteur qualifié audit only + placeholders masqués + vrais signaux historiques moteur.",
         "endpoints": ["/health", "/calculate", "/predictions", "/state", "/history", "/daily", "/odds/status", "/sync/results2026/status", "/sync/results2026/run", "/sync/results2026/postgres/status", "/sync/results2026/postgres/export", "/sync/premium/status", "/sync/premium/list", "/sync/premium/reset", "/sync/premium/run"],
         "excludedAnalysisPlayers": _excluded_analysis_names(),
@@ -754,7 +754,7 @@ def health() -> Dict[str, Any]:
     return {
         "status": "ok",
         "service": "Tennis Motor Backend Clean",
-        "version": "step2.12-premium-list-reset",
+        "version": "step2.13-auto-history-premium-proches",
         "historyYears": list(HISTORY_YEARS),
         "historyRowsLoaded": state.get("history_rows_loaded", 0),
         "excludedAnalysisPlayers": _excluded_analysis_names(),
@@ -789,7 +789,7 @@ async def predictions_post(request: Request) -> Dict[str, Any]:
 
 
 @app.get("/daily")
-def daily(day: str = Query("today")) -> Dict[str, Any]:
+def daily(day: str = Query("today"), auto_history: bool = Query(True)) -> Dict[str, Any]:
     target_day = normalize_day(day)
 
     builder = SportradarDailyBuilder(audit_dir=AUDIT_DIR)
@@ -832,13 +832,43 @@ def daily(day: str = Query("today")) -> Dict[str, Any]:
     response.setdefault("daily", {})
     response["daily"].update({
         "provider": "sportradar",
-        "step": "2.10",
+        "step": "2.13",
         "targetDay": target_day,
         "payloadCount": len(source_matches),
         "audit": built.get("audit", {}),
         "manualReviewPolicy": "points ATP absents ou à 0 = non analysé; placeholders Sportradar WSF/TBD/Winner masqués; noms Sportradar résolus vers historique; vrais signaux moteur quand historique disponible; veto non forcé : les victoires tournoi calculées par Sportradar sont conservées en raw/audit mais ne forcent plus player_b_tournament_wins moteur; qualifié B non activé automatiquement; détecteur Sportradar Season Links en audit only; aucune donnée n'est inventée.",
         "oddsPolicy": "Flashscore odds are display-only and never used by the Tennis Motor decision.",
     })
+
+    # Step 2.13 : sauvegarde automatique historique Premium + Proches.
+    # Les jours futurs ne sont jamais enregistrés pour éviter de polluer l'historique.
+    if auto_history:
+        try:
+            target_date = date.fromisoformat(target_day)
+            if target_date <= _paris_today():
+                syncer = PremiumHistorySyncer(store=PostgresPremiumStore())
+                sync_result = syncer.sync_daily_result(response, target_day, dry_run=False)
+                response["daily"]["premiumHistorySync"] = sync_result
+            else:
+                response["daily"]["premiumHistorySync"] = {
+                    "status": "skipped",
+                    "reason": "future_day_not_saved",
+                    "targetDay": target_day,
+                    "policy": "Aucun historique Premium/Proche n'est enregistré pour demain ou une date future.",
+                }
+        except Exception as exc:
+            response["daily"]["premiumHistorySync"] = {
+                "status": "error",
+                "targetDay": target_day,
+                "error": f"{type(exc).__name__}: {exc}",
+            }
+    else:
+        response["daily"]["premiumHistorySync"] = {
+            "status": "skipped",
+            "reason": "auto_history_disabled",
+            "targetDay": target_day,
+        }
+
     return response
 
 
@@ -859,7 +889,7 @@ def odds_status() -> Dict[str, Any]:
         "records": audit.get("records", 0),
         "errors": audit.get("errors", []),
         "warnings": audit.get("warnings", []),
-        "serviceVersion": "step2.12-premium-list-reset",
+        "serviceVersion": "step2.13-auto-history-premium-proches",
     }
 
 
@@ -936,7 +966,7 @@ def history() -> Dict[str, Any]:
 def sync_results2026_status() -> Dict[str, Any]:
     syncer = Results2026Syncer(client=SportradarClient(), base_dir=BASE_DIR)
     status = syncer.status()
-    status["serviceVersion"] = "step2.12-premium-list-reset"
+    status["serviceVersion"] = "step2.13-auto-history-premium-proches"
     return status
 
 
@@ -944,7 +974,7 @@ def sync_results2026_status() -> Dict[str, Any]:
 def sync_results2026_postgres_status() -> Dict[str, Any]:
     syncer = Results2026Syncer(client=SportradarClient(), base_dir=BASE_DIR)
     status = syncer.postgres_status()
-    status["serviceVersion"] = "step2.12-premium-list-reset"
+    status["serviceVersion"] = "step2.13-auto-history-premium-proches"
     return status
 
 
@@ -952,7 +982,7 @@ def sync_results2026_postgres_status() -> Dict[str, Any]:
 def sync_results2026_postgres_export() -> Dict[str, Any]:
     syncer = Results2026Syncer(client=SportradarClient(), base_dir=BASE_DIR)
     result = syncer.export_postgres_to_csv()
-    result["serviceVersion"] = "step2.12-premium-list-reset"
+    result["serviceVersion"] = "step2.13-auto-history-premium-proches"
 
     try:
         if result.get("status") == "ok":
@@ -973,7 +1003,7 @@ def sync_results2026_run(day: str = Query("today"), dry_run: bool = Query(False)
     target_day = normalize_day(day)
     syncer = Results2026Syncer(client=SportradarClient(), base_dir=BASE_DIR)
     result = syncer.sync_day(target_day, dry_run=dry_run)
-    result["serviceVersion"] = "step2.12-premium-list-reset"
+    result["serviceVersion"] = "step2.13-auto-history-premium-proches"
 
     # Si data/2026.csv a été modifié, on force la reconstruction de l'état Elo/Form au prochain calcul.
     try:
@@ -994,7 +1024,7 @@ def sync_results2026_run(day: str = Query("today"), dry_run: bool = Query(False)
 def sync_premium_status() -> Dict[str, Any]:
     syncer = PremiumHistorySyncer(store=PostgresPremiumStore())
     status = syncer.status()
-    status["serviceVersion"] = "step2.12-premium-list-reset"
+    status["serviceVersion"] = "step2.13-auto-history-premium-proches"
     return status
 
 
@@ -1017,7 +1047,7 @@ def sync_premium_list(limit: int = Query(100, ge=1, le=1000)) -> Dict[str, Any]:
             "error": "DATABASE_URL absente dans le service web.",
             "items": [],
             "rows": [],
-            "serviceVersion": "step2.12-premium-list-reset",
+            "serviceVersion": "step2.13-auto-history-premium-proches",
         }
 
     try:
@@ -1038,6 +1068,8 @@ def sync_premium_list(limit: int = Query(100, ge=1, le=1000)) -> Dict[str, Any]:
                 "predictedWinner": predicted,
                 "opponent": opponent,
                 "premiumPct": row.get("premiumPct"),
+                "status": row.get("status"),
+                "category": row.get("status"),
                 "result": row.get("result"),
                 "realWinner": row.get("realWinner"),
                 "score": row.get("score"),
@@ -1064,8 +1096,8 @@ def sync_premium_list(limit: int = Query(100, ge=1, le=1000)) -> Dict[str, Any]:
             "counts": counts,
             "items": items,
             "rows": rows,
-            "policy": "Liste audit Premium : noms, date, cotes, score, résultat et IDs Sportradar.",
-            "serviceVersion": "step2.12-premium-list-reset",
+            "policy": "Liste audit Premium + Proches : noms, date, cotes, score, résultat et IDs Sportradar.",
+            "serviceVersion": "step2.13-auto-history-premium-proches",
         }
     except Exception as exc:
         return {
@@ -1076,7 +1108,7 @@ def sync_premium_list(limit: int = Query(100, ge=1, le=1000)) -> Dict[str, Any]:
             "error": f"{type(exc).__name__}: {exc}",
             "items": [],
             "rows": [],
-            "serviceVersion": "step2.12-premium-list-reset",
+            "serviceVersion": "step2.13-auto-history-premium-proches",
         }
 
 
@@ -1094,11 +1126,11 @@ def sync_premium_reset(confirm: str = Query("")) -> Dict[str, Any]:
             "table": store.TABLE,
             "message": "Reset refusé : ajoute ?confirm=YES pour vider tennis_premium_history.",
             "example": "/sync/premium/reset?confirm=YES",
-            "serviceVersion": "step2.12-premium-list-reset",
+            "serviceVersion": "step2.13-auto-history-premium-proches",
         }
     try:
         result = store.reset_all()
-        result["serviceVersion"] = "step2.12-premium-list-reset"
+        result["serviceVersion"] = "step2.13-auto-history-premium-proches"
         return result
     except Exception as exc:
         return {
@@ -1106,17 +1138,17 @@ def sync_premium_reset(confirm: str = Query("")) -> Dict[str, Any]:
             "databaseConfigured": store.enabled,
             "table": store.TABLE,
             "error": f"{type(exc).__name__}: {exc}",
-            "serviceVersion": "step2.12-premium-list-reset",
+            "serviceVersion": "step2.13-auto-history-premium-proches",
         }
 
 
 @app.get("/sync/premium/run")
 def sync_premium_run(day: str = Query("today"), dry_run: bool = Query(False)) -> Dict[str, Any]:
     target_day = normalize_day(day)
-    daily_result = daily(target_day)
+    daily_result = daily(target_day, auto_history=False)
     syncer = PremiumHistorySyncer(store=PostgresPremiumStore())
     result = syncer.sync_daily_result(daily_result, target_day, dry_run=dry_run)
-    result["serviceVersion"] = "step2.12-premium-list-reset"
+    result["serviceVersion"] = "step2.13-auto-history-premium-proches"
     return result
 
 
