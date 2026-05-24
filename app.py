@@ -28,7 +28,7 @@ PAYLOAD_DIR = OUTPUT_DIR / "payloads"
 # Règle utilisateur verrouillée : Jannik Sinner reste exclu de l'analyse.
 EXCLUDED_ANALYSIS_PLAYERS = ["Jannik Sinner"]
 
-app = FastAPI(title="Tennis Motor Backend Clean", version="step2.14-auto-settle-premium-results")
+app = FastAPI(title="Tennis Motor Backend Clean", version="step25-motor-history-categories")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -741,9 +741,9 @@ def root() -> Dict[str, Any]:
     return {
         "status": "ok",
         "service": "Tennis Motor Backend Clean",
-        "version": "step2.14-auto-settle-premium-results",
+        "version": "step25-motor-history-categories",
         "message": "Backend propre étape 2.11 : Sportradar + PostgreSQL + cotes Flashscore + veto non forcé + détecteur qualifié audit only + placeholders masqués + vrais signaux historiques moteur.",
-        "endpoints": ["/health", "/calculate", "/predictions", "/state", "/history", "/daily", "/odds/status", "/sync/results2026/status", "/sync/results2026/run", "/sync/results2026/postgres/status", "/sync/results2026/postgres/export", "/sync/premium/status", "/sync/premium/list", "/sync/premium/reset", "/sync/premium/run", "/sync/premium/settle", "/sync/premium/settle-pending"],
+        "endpoints": ["/health", "/calculate", "/predictions", "/state", "/history", "/daily", "/odds/status", "/sync/results2026/status", "/sync/results2026/run", "/sync/results2026/postgres/status", "/sync/results2026/postgres/export", "/sync/premium/status", "/sync/premium/list", "/sync/premium/reset", "/sync/premium/run", "/sync/premium/settle", "/sync/premium/settle-pending", "/sync/history/list", "/sync/history/reset", "/sync/history/settle", "/sync/history/settle-pending"],
         "excludedAnalysisPlayers": _excluded_analysis_names(),
     }
 
@@ -754,7 +754,7 @@ def health() -> Dict[str, Any]:
     return {
         "status": "ok",
         "service": "Tennis Motor Backend Clean",
-        "version": "step2.14-auto-settle-premium-results",
+        "version": "step25-motor-history-categories",
         "historyYears": list(HISTORY_YEARS),
         "historyRowsLoaded": state.get("history_rows_loaded", 0),
         "excludedAnalysisPlayers": _excluded_analysis_names(),
@@ -832,7 +832,7 @@ def daily(day: str = Query("today"), auto_history: bool = Query(True)) -> Dict[s
     response.setdefault("daily", {})
     response["daily"].update({
         "provider": "sportradar",
-        "step": "2.13",
+        "step": "25",
         "targetDay": target_day,
         "payloadCount": len(source_matches),
         "audit": built.get("audit", {}),
@@ -840,7 +840,7 @@ def daily(day: str = Query("today"), auto_history: bool = Query(True)) -> Dict[s
         "oddsPolicy": "Flashscore odds are display-only and never used by the Tennis Motor decision.",
     })
 
-    # Step 2.13 : sauvegarde automatique historique Premium + Proches.
+    # STEP25 : sauvegarde automatique historique moteur catégorisé.
     # Les jours futurs ne sont jamais enregistrés pour éviter de polluer l'historique.
     if auto_history:
         try:
@@ -889,7 +889,7 @@ def odds_status() -> Dict[str, Any]:
         "records": audit.get("records", 0),
         "errors": audit.get("errors", []),
         "warnings": audit.get("warnings", []),
-        "serviceVersion": "step2.14-auto-settle-premium-results",
+        "serviceVersion": "step25-motor-history-categories",
     }
 
 
@@ -920,7 +920,7 @@ def history() -> Dict[str, Any]:
     store = PostgresPremiumStore()
     if store.enabled:
         try:
-            summary = store.summary()
+            summary = store.summary(category="PREMIUM")
             return {
                 "status": "ok",
                 "storage": "postgres",
@@ -966,7 +966,7 @@ def history() -> Dict[str, Any]:
 def sync_results2026_status() -> Dict[str, Any]:
     syncer = Results2026Syncer(client=SportradarClient(), base_dir=BASE_DIR)
     status = syncer.status()
-    status["serviceVersion"] = "step2.14-auto-settle-premium-results"
+    status["serviceVersion"] = "step25-motor-history-categories"
     return status
 
 
@@ -974,7 +974,7 @@ def sync_results2026_status() -> Dict[str, Any]:
 def sync_results2026_postgres_status() -> Dict[str, Any]:
     syncer = Results2026Syncer(client=SportradarClient(), base_dir=BASE_DIR)
     status = syncer.postgres_status()
-    status["serviceVersion"] = "step2.14-auto-settle-premium-results"
+    status["serviceVersion"] = "step25-motor-history-categories"
     return status
 
 
@@ -982,7 +982,7 @@ def sync_results2026_postgres_status() -> Dict[str, Any]:
 def sync_results2026_postgres_export() -> Dict[str, Any]:
     syncer = Results2026Syncer(client=SportradarClient(), base_dir=BASE_DIR)
     result = syncer.export_postgres_to_csv()
-    result["serviceVersion"] = "step2.14-auto-settle-premium-results"
+    result["serviceVersion"] = "step25-motor-history-categories"
 
     try:
         if result.get("status") == "ok":
@@ -1003,7 +1003,7 @@ def sync_results2026_run(day: str = Query("today"), dry_run: bool = Query(False)
     target_day = normalize_day(day)
     syncer = Results2026Syncer(client=SportradarClient(), base_dir=BASE_DIR)
     result = syncer.sync_day(target_day, dry_run=dry_run)
-    result["serviceVersion"] = "step2.14-auto-settle-premium-results"
+    result["serviceVersion"] = "step25-motor-history-categories"
 
     # Si data/2026.csv a été modifié, on force la reconstruction de l'état Elo/Form au prochain calcul.
     try:
@@ -1024,10 +1024,134 @@ def sync_results2026_run(day: str = Query("today"), dry_run: bool = Query(False)
 def sync_premium_status() -> Dict[str, Any]:
     syncer = PremiumHistorySyncer(store=PostgresPremiumStore())
     status = syncer.status()
-    status["serviceVersion"] = "step2.14-auto-settle-premium-results"
+    status["serviceVersion"] = "step25-motor-history-categories"
     return status
 
 
+
+
+
+def _normalize_history_category_for_api(category: str) -> str:
+    cat = str(category or "premium").strip().upper().replace("É", "E").replace("È", "E").replace("Ê", "E")
+    aliases = {
+        "PREMIUM": "PREMIUM",
+        "PROCHE": "PROCHE",
+        "PROCHES": "PROCHE",
+        "VETO": "VETO",
+        "REFUSE": "REFUSE",
+        "REFUS": "REFUSE",
+        "REFUSES": "REFUSE",
+    }
+    return aliases.get(cat, "PREMIUM")
+
+
+def _history_list_payload(
+    store: PostgresPremiumStore,
+    category: str,
+    limit: int,
+    auto_settle: bool,
+    settle_days_back: int,
+) -> Dict[str, Any]:
+    cat = _normalize_history_category_for_api(category)
+    settle_result = None
+    if auto_settle:
+        settle_result = PremiumHistorySyncer(store=store).settle_pending_recent(days_back=settle_days_back, dry_run=False)
+
+    rows = store.fetch_rows(limit=limit, category=cat)
+    counts = store.counts(category=cat)
+    summary = store.summary(category=cat)
+    items: List[Dict[str, Any]] = []
+
+    for row in rows:
+        source_a = str(row.get("sourcePlayerA") or "")
+        source_b = str(row.get("sourcePlayerB") or "")
+        predicted = str(row.get("predictedWinner") or "")
+        opponent = str(row.get("opponent") or "")
+        items.append({
+            "id": row.get("id"),
+            "date": row.get("date"),
+            "match": f"{source_a} vs {source_b}".strip(),
+            "sourcePlayerA": source_a,
+            "sourcePlayerB": source_b,
+            "predictedWinner": predicted,
+            "opponent": opponent,
+            "premiumPct": row.get("premiumPct"),
+            "status": row.get("status"),
+            "category": row.get("status"),
+            "result": row.get("result"),
+            "realWinner": row.get("realWinner"),
+            "score": row.get("score"),
+            "oddPredicted": row.get("oddPredicted"),
+            "oddOpponent": row.get("oddOpponent"),
+            "oddsSource": row.get("oddsSource"),
+            "tournament": row.get("tournament"),
+            "round": row.get("round"),
+            "surface": row.get("surface"),
+            "startTime": row.get("startTime"),
+            "settledAt": row.get("settledAt"),
+            "winnerId": row.get("winnerId"),
+            "sportradarSportEventId": row.get("sportradarSportEventId"),
+            "sportradarPlayerAId": row.get("sportradarPlayerAId"),
+            "sportradarPlayerBId": row.get("sportradarPlayerBId"),
+        })
+
+    return {
+        "status": "ok",
+        "databaseConfigured": True,
+        "databaseStatus": "ok",
+        "table": store.TABLE,
+        "category": cat,
+        "limit": limit,
+        "count": len(rows),
+        "counts": counts,
+        "summary": summary.get("summary", {}),
+        "chart": summary.get("chart", {}),
+        "items": items,
+        "rows": rows,
+        "settle": settle_result,
+        "policy": f"Liste historique moteur filtrée : {cat}. Finance/statistiques calculées uniquement sur cette catégorie.",
+        "serviceVersion": "step25-motor-history-categories",
+    }
+
+
+@app.get("/sync/history/list")
+def sync_history_list(
+    category: str = Query("premium"),
+    limit: int = Query(100, ge=1, le=1000),
+    auto_settle: bool = Query(False),
+    settle_days_back: int = Query(7, ge=1, le=60),
+) -> Dict[str, Any]:
+    """Liste historique moteur par catégorie : premium/proche/veto/refuse."""
+    cat = _normalize_history_category_for_api(category)
+
+    store = PostgresPremiumStore()
+    if not store.enabled:
+        return {
+            "status": "error",
+            "databaseConfigured": False,
+            "databaseStatus": "not_configured",
+            "table": store.TABLE,
+            "category": cat,
+            "error": "DATABASE_URL absente dans le service web.",
+            "items": [],
+            "rows": [],
+            "serviceVersion": "step25-motor-history-categories",
+        }
+
+    try:
+        return _history_list_payload(store, cat, limit, auto_settle, settle_days_back)
+    except Exception as exc:
+        return {
+            "status": "error",
+            "databaseConfigured": store.enabled,
+            "databaseStatus": "error",
+            "table": store.TABLE,
+            "category": cat,
+            "error": f"{type(exc).__name__}: {exc}",
+            "items": [],
+            "rows": [],
+            "serviceVersion": "step25-motor-history-categories",
+        }
 
 
 @app.get("/sync/premium/list")
@@ -1036,11 +1160,7 @@ def sync_premium_list(
     auto_settle: bool = Query(False),
     settle_days_back: int = Query(7, ge=1, le=60),
 ) -> Dict[str, Any]:
-    """Liste lisible des Premium stockés dans PostgreSQL.
-
-    Contient les noms des joueurs, la date, le pick, les cotes, le résultat,
-    le score et les infos Sportradar utiles pour audit.
-    """
+    """Compatibilité Unity : historique PREMIUM uniquement."""
     store = PostgresPremiumStore()
     if not store.enabled:
         return {
@@ -1048,78 +1168,26 @@ def sync_premium_list(
             "databaseConfigured": False,
             "databaseStatus": "not_configured",
             "table": store.TABLE,
+            "category": "PREMIUM",
             "error": "DATABASE_URL absente dans le service web.",
             "items": [],
             "rows": [],
-            "serviceVersion": "step2.14-auto-settle-premium-results",
+            "serviceVersion": "step25-motor-history-categories",
         }
-
     try:
-        settle_result = None
-        if auto_settle:
-            settle_result = PremiumHistorySyncer(store=store).settle_pending_recent(days_back=settle_days_back, dry_run=False)
-
-        rows = store.fetch_rows(limit=limit)
-        counts = store.counts()
-        items: List[Dict[str, Any]] = []
-        for row in rows:
-            source_a = str(row.get("sourcePlayerA") or "")
-            source_b = str(row.get("sourcePlayerB") or "")
-            predicted = str(row.get("predictedWinner") or "")
-            opponent = str(row.get("opponent") or "")
-            items.append({
-                "id": row.get("id"),
-                "date": row.get("date"),
-                "match": f"{source_a} vs {source_b}".strip(),
-                "sourcePlayerA": source_a,
-                "sourcePlayerB": source_b,
-                "predictedWinner": predicted,
-                "opponent": opponent,
-                "premiumPct": row.get("premiumPct"),
-                "status": row.get("status"),
-                "category": row.get("status"),
-                "result": row.get("result"),
-                "realWinner": row.get("realWinner"),
-                "score": row.get("score"),
-                "oddPredicted": row.get("oddPredicted"),
-                "oddOpponent": row.get("oddOpponent"),
-                "oddsSource": row.get("oddsSource"),
-                "tournament": row.get("tournament"),
-                "round": row.get("round"),
-                "surface": row.get("surface"),
-                "startTime": row.get("startTime"),
-                "settledAt": row.get("settledAt"),
-                "winnerId": row.get("winnerId"),
-                "sportradarSportEventId": row.get("sportradarSportEventId"),
-                "sportradarPlayerAId": row.get("sportradarPlayerAId"),
-                "sportradarPlayerBId": row.get("sportradarPlayerBId"),
-            })
-        return {
-            "status": "ok",
-            "databaseConfigured": True,
-            "databaseStatus": "ok",
-            "table": store.TABLE,
-            "limit": limit,
-            "count": len(rows),
-            "counts": counts,
-            "items": items,
-            "rows": rows,
-            "settle": settle_result,
-            "policy": "Liste audit Premium + Proches : noms, date, cotes, score, résultat et IDs Sportradar.",
-            "serviceVersion": "step2.14-auto-settle-premium-results",
-        }
+        return _history_list_payload(store, "PREMIUM", limit, auto_settle, settle_days_back)
     except Exception as exc:
         return {
             "status": "error",
             "databaseConfigured": store.enabled,
             "databaseStatus": "error",
             "table": store.TABLE,
+            "category": "PREMIUM",
             "error": f"{type(exc).__name__}: {exc}",
             "items": [],
             "rows": [],
-            "serviceVersion": "step2.14-auto-settle-premium-results",
+            "serviceVersion": "step25-motor-history-categories",
         }
-
 
 
 @app.get("/sync/premium/settle")
@@ -1132,7 +1200,7 @@ def sync_premium_settle(day: str = Query("today"), dry_run: bool = Query(False))
     target_day = normalize_day(day)
     syncer = PremiumHistorySyncer(store=PostgresPremiumStore())
     result = syncer.settle_day_from_sportradar(target_day, dry_run=dry_run)
-    result["serviceVersion"] = "step2.14-auto-settle-premium-results"
+    result["serviceVersion"] = "step25-motor-history-categories"
     return result
 
 
@@ -1144,37 +1212,87 @@ def sync_premium_settle_pending(days_back: int = Query(7, ge=1, le=60), dry_run:
     """
     syncer = PremiumHistorySyncer(store=PostgresPremiumStore())
     result = syncer.settle_pending_recent(days_back=days_back, dry_run=dry_run)
-    result["serviceVersion"] = "step2.14-auto-settle-premium-results"
+    result["serviceVersion"] = "step25-motor-history-categories"
     return result
 
 
-@app.get("/sync/premium/reset")
-def sync_premium_reset(confirm: str = Query("")) -> Dict[str, Any]:
-    """Reset sécurisé de l'historique Premium PostgreSQL.
 
-    Requiert confirm=YES pour éviter une suppression accidentelle.
-    """
+@app.get("/sync/history/settle")
+def sync_history_settle(day: str = Query("today"), dry_run: bool = Query(False)) -> Dict[str, Any]:
+    target_day = normalize_day(day)
+    syncer = PremiumHistorySyncer(store=PostgresPremiumStore())
+    result = syncer.settle_day_from_sportradar(target_day, dry_run=dry_run)
+    result["serviceVersion"] = "step25-motor-history-categories"
+    return result
+
+
+@app.get("/sync/history/settle-pending")
+def sync_history_settle_pending(days_back: int = Query(7, ge=1, le=60), dry_run: bool = Query(False)) -> Dict[str, Any]:
+    syncer = PremiumHistorySyncer(store=PostgresPremiumStore())
+    result = syncer.settle_pending_recent(days_back=days_back, dry_run=dry_run)
+    result["serviceVersion"] = "step25-motor-history-categories"
+    return result
+
+
+@app.get("/sync/history/reset")
+def sync_history_reset(category: str = Query("premium"), confirm: str = Query("")) -> Dict[str, Any]:
+    """Reset sécurisé d'une seule catégorie historique."""
     store = PostgresPremiumStore()
+    cat = _normalize_history_category_for_api(category) if str(category).strip().lower() not in {"all", "tout"} else "ALL"
     if str(confirm).strip() != "YES":
         return {
             "status": "refused",
             "databaseConfigured": store.enabled,
             "table": store.TABLE,
-            "message": "Reset refusé : ajoute ?confirm=YES pour vider tennis_premium_history.",
-            "example": "/sync/premium/reset?confirm=YES",
-            "serviceVersion": "step2.14-auto-settle-premium-results",
+            "category": cat,
+            "message": "Reset refusé : ajoute confirm=YES.",
+            "example": f"/sync/history/reset?category={cat.lower()}&confirm=YES",
+            "serviceVersion": "step25-motor-history-categories",
         }
     try:
-        result = store.reset_all()
-        result["serviceVersion"] = "step2.14-auto-settle-premium-results"
+        if cat == "ALL":
+            result = store.reset_all()
+        else:
+            result = store.reset_category(cat)
+        result["serviceVersion"] = "step25-motor-history-categories"
         return result
     except Exception as exc:
         return {
             "status": "error",
             "databaseConfigured": store.enabled,
             "table": store.TABLE,
+            "category": cat,
             "error": f"{type(exc).__name__}: {exc}",
-            "serviceVersion": "step2.14-auto-settle-premium-results",
+            "serviceVersion": "step25-motor-history-categories",
+        }
+
+
+@app.get("/sync/premium/reset")
+def sync_premium_reset(confirm: str = Query("")) -> Dict[str, Any]:
+    """Reset sécurisé de l'historique PREMIUM uniquement."""
+    store = PostgresPremiumStore()
+    if str(confirm).strip() != "YES":
+        return {
+            "status": "refused",
+            "databaseConfigured": store.enabled,
+            "table": store.TABLE,
+            "category": "PREMIUM",
+            "message": "Reset refusé : ajoute ?confirm=YES pour vider l'historique PREMIUM uniquement.",
+            "example": "/sync/premium/reset?confirm=YES",
+            "serviceVersion": "step25-motor-history-categories",
+        }
+    try:
+        result = store.reset_category("PREMIUM")
+        result["serviceVersion"] = "step25-motor-history-categories"
+        return result
+    except Exception as exc:
+        return {
+            "status": "error",
+            "databaseConfigured": store.enabled,
+            "table": store.TABLE,
+            "category": "PREMIUM",
+            "error": f"{type(exc).__name__}: {exc}",
+            "serviceVersion": "step25-motor-history-categories",
         }
 
 
@@ -1184,7 +1302,7 @@ def sync_premium_run(day: str = Query("today"), dry_run: bool = Query(False)) ->
     daily_result = daily(target_day, auto_history=False)
     syncer = PremiumHistorySyncer(store=PostgresPremiumStore())
     result = syncer.sync_daily_result(daily_result, target_day, dry_run=dry_run)
-    result["serviceVersion"] = "step2.14-auto-settle-premium-results"
+    result["serviceVersion"] = "step25-motor-history-categories"
     return result
 
 
