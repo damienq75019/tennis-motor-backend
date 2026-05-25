@@ -497,11 +497,11 @@ class PremiumHistorySyncer:
                 "table": self.store.TABLE,
                 "status": self.store.status(),
             },
-            "policy": "Règlement strict STEP33 : pending -> win/loss via winner_id; retired/walkover/cancelled/abandoned -> void/remboursé, même si la ligne était déjà réglée.",
+            "policy": "Règlement strict STEP34 : pending -> win/loss via winner_id; retired/walkover/cancelled/abandoned -> void/remboursé, même si la ligne était déjà réglée.",
         }
 
     def settle_pending_recent(self, *, days_back: int = 0, dry_run: bool = False, client: Optional[SportradarClient] = None) -> Dict[str, Any]:
-        # STEP33: days_back=0 means no calendar limit: settle every pending history date, year after year.
+        # STEP34: days_back=0 means no calendar limit: settle every pending history date, year after year.
         days_back = max(0, min(int(days_back or 0), 36500))
         counts = {
             "days_requested": days_back,
@@ -558,7 +558,7 @@ class PremiumHistorySyncer:
             "counts": counts,
             "dates": dates,
             "results": results,
-            "policy": "STEP33 : si days_back=0, vérifie toutes les dates ayant des lignes pending, sans limite de quelques jours; pending -> win/loss et retired/walkover/cancelled/abandoned -> void/remboursé.",
+            "policy": "STEP34 : si days_back=0, vérifie toutes les dates ayant des lignes pending, sans limite de quelques jours; pending -> win/loss et retired/walkover/cancelled/abandoned -> void/remboursé.",
         }
 
     def sync_daily_result(self, daily_result: Dict[str, Any], target_day: str, *, dry_run: bool = False) -> Dict[str, Any]:
@@ -610,7 +610,7 @@ class PremiumHistorySyncer:
             }
 
         # 1) Record all categorized engine outputs: Premium + Proches + Veto + Refusés.
-        # STEP30: dedupe raw daily payload by sport_event_id before writing history.
+        # STEP34: dedupe raw daily payload by sport_event_id before writing history.
         # One physical tennis match must create at most one history row.
         # IMPORTANT: keep the FIRST engine pick seen for the event. Do not replace it
         # with a later duplicate that has a slightly higher percentage.
@@ -769,5 +769,5 @@ class PremiumHistorySyncer:
                 "step": (daily_result.get("daily") or {}).get("step"),
                 "summary": daily_result.get("summary", {}),
             },
-            "policy": "Historique moteur STEP30 : Premium/Proches/Veto/Refusés; 1 ligne par match; retired/walkover/cancelled/abandoned -> void/remboursé; règlement win/loss via winner_id Sportradar.",
+            "policy": "Historique moteur STEP34 : Premium/Proches/Veto/Refusés; 1 ligne par match; retired/walkover/cancelled/abandoned -> void/remboursé; règlement win/loss via winner_id Sportradar.",
         }
