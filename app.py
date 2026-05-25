@@ -28,7 +28,7 @@ PAYLOAD_DIR = OUTPUT_DIR / "payloads"
 # Règle utilisateur verrouillée : Jannik Sinner reste exclu de l'analyse.
 EXCLUDED_ANALYSIS_PLAYERS = ["Jannik Sinner"]
 
-app = FastAPI(title="Tennis Motor Backend Clean", version="step30-first-pick-repair")
+app = FastAPI(title="Tennis Motor Backend Clean", version="step33-yearly-history")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -741,7 +741,7 @@ def root() -> Dict[str, Any]:
     return {
         "status": "ok",
         "service": "Tennis Motor Backend Clean",
-        "version": "step30-first-pick-repair",
+        "version": "step33-yearly-history",
         "message": "Backend propre étape 2.11 : Sportradar + PostgreSQL + cotes Flashscore + veto non forcé + détecteur qualifié audit only + placeholders masqués + vrais signaux historiques moteur.",
         "endpoints": ["/health", "/calculate", "/predictions", "/state", "/history", "/daily", "/odds/status", "/sync/results2026/status", "/sync/results2026/run", "/sync/results2026/postgres/status", "/sync/results2026/postgres/export", "/sync/premium/status", "/sync/premium/list", "/sync/premium/reset", "/sync/premium/run", "/sync/premium/settle", "/sync/premium/settle-pending", "/sync/history/list", "/sync/history/reset", "/sync/history/repair-dellien-royer", "/sync/history/settle", "/sync/history/settle-pending"],
         "excludedAnalysisPlayers": _excluded_analysis_names(),
@@ -754,7 +754,7 @@ def health() -> Dict[str, Any]:
     return {
         "status": "ok",
         "service": "Tennis Motor Backend Clean",
-        "version": "step30-first-pick-repair",
+        "version": "step33-yearly-history",
         "historyYears": list(HISTORY_YEARS),
         "historyRowsLoaded": state.get("history_rows_loaded", 0),
         "excludedAnalysisPlayers": _excluded_analysis_names(),
@@ -889,7 +889,7 @@ def odds_status() -> Dict[str, Any]:
         "records": audit.get("records", 0),
         "errors": audit.get("errors", []),
         "warnings": audit.get("warnings", []),
-        "serviceVersion": "step30-first-pick-repair",
+        "serviceVersion": "step33-yearly-history",
     }
 
 
@@ -966,7 +966,7 @@ def history() -> Dict[str, Any]:
 def sync_results2026_status() -> Dict[str, Any]:
     syncer = Results2026Syncer(client=SportradarClient(), base_dir=BASE_DIR)
     status = syncer.status()
-    status["serviceVersion"] = "step30-first-pick-repair"
+    status["serviceVersion"] = "step33-yearly-history"
     return status
 
 
@@ -974,7 +974,7 @@ def sync_results2026_status() -> Dict[str, Any]:
 def sync_results2026_postgres_status() -> Dict[str, Any]:
     syncer = Results2026Syncer(client=SportradarClient(), base_dir=BASE_DIR)
     status = syncer.postgres_status()
-    status["serviceVersion"] = "step30-first-pick-repair"
+    status["serviceVersion"] = "step33-yearly-history"
     return status
 
 
@@ -982,7 +982,7 @@ def sync_results2026_postgres_status() -> Dict[str, Any]:
 def sync_results2026_postgres_export() -> Dict[str, Any]:
     syncer = Results2026Syncer(client=SportradarClient(), base_dir=BASE_DIR)
     result = syncer.export_postgres_to_csv()
-    result["serviceVersion"] = "step30-first-pick-repair"
+    result["serviceVersion"] = "step33-yearly-history"
 
     try:
         if result.get("status") == "ok":
@@ -1003,7 +1003,7 @@ def sync_results2026_run(day: str = Query("today"), dry_run: bool = Query(False)
     target_day = normalize_day(day)
     syncer = Results2026Syncer(client=SportradarClient(), base_dir=BASE_DIR)
     result = syncer.sync_day(target_day, dry_run=dry_run)
-    result["serviceVersion"] = "step30-first-pick-repair"
+    result["serviceVersion"] = "step33-yearly-history"
 
     # Si data/2026.csv a été modifié, on force la reconstruction de l'état Elo/Form au prochain calcul.
     try:
@@ -1024,7 +1024,7 @@ def sync_results2026_run(day: str = Query("today"), dry_run: bool = Query(False)
 def sync_premium_status() -> Dict[str, Any]:
     syncer = PremiumHistorySyncer(store=PostgresPremiumStore())
     status = syncer.status()
-    status["serviceVersion"] = "step30-first-pick-repair"
+    status["serviceVersion"] = "step33-yearly-history"
     return status
 
 
@@ -1115,17 +1115,17 @@ def _history_list_payload(
         "rows": rows,
         "settle": settle_result,
         "cleanup": cleanup_result,
-        "policy": f"Liste historique moteur STEP30 filtrée : {cat}. Void/remboursé exclu du ROI; doublons legacy compactés sur date + sport_event_id.",
-        "serviceVersion": "step30-first-pick-repair",
+        "policy": f"Liste historique moteur STEP33 filtrée : {cat}. Historique durable multi-années; auto-settle sur toutes les dates pending si settle_days_back=0; void/remboursé exclu du ROI; doublons legacy compactés.",
+        "serviceVersion": "step33-yearly-history",
     }
 
 
 @app.get("/sync/history/list")
 def sync_history_list(
     category: str = Query("premium"),
-    limit: int = Query(100, ge=1, le=1000),
+    limit: int = Query(20000, ge=1, le=50000),
     auto_settle: bool = Query(False),
-    settle_days_back: int = Query(7, ge=1, le=60),
+    settle_days_back: int = Query(0, ge=0, le=36500),
 ) -> Dict[str, Any]:
     """Liste historique moteur par catégorie : premium/proche/veto/refuse."""
     cat = _normalize_history_category_for_api(category)
@@ -1141,7 +1141,7 @@ def sync_history_list(
             "error": "DATABASE_URL absente dans le service web.",
             "items": [],
             "rows": [],
-            "serviceVersion": "step30-first-pick-repair",
+            "serviceVersion": "step33-yearly-history",
         }
 
     try:
@@ -1156,15 +1156,15 @@ def sync_history_list(
             "error": f"{type(exc).__name__}: {exc}",
             "items": [],
             "rows": [],
-            "serviceVersion": "step30-first-pick-repair",
+            "serviceVersion": "step33-yearly-history",
         }
 
 
 @app.get("/sync/premium/list")
 def sync_premium_list(
-    limit: int = Query(100, ge=1, le=1000),
+    limit: int = Query(20000, ge=1, le=50000),
     auto_settle: bool = Query(False),
-    settle_days_back: int = Query(7, ge=1, le=60),
+    settle_days_back: int = Query(0, ge=0, le=36500),
 ) -> Dict[str, Any]:
     """Compatibilité Unity : historique PREMIUM uniquement."""
     store = PostgresPremiumStore()
@@ -1178,7 +1178,7 @@ def sync_premium_list(
             "error": "DATABASE_URL absente dans le service web.",
             "items": [],
             "rows": [],
-            "serviceVersion": "step30-first-pick-repair",
+            "serviceVersion": "step33-yearly-history",
         }
     try:
         return _history_list_payload(store, "PREMIUM", limit, auto_settle, settle_days_back)
@@ -1192,7 +1192,7 @@ def sync_premium_list(
             "error": f"{type(exc).__name__}: {exc}",
             "items": [],
             "rows": [],
-            "serviceVersion": "step30-first-pick-repair",
+            "serviceVersion": "step33-yearly-history",
         }
 
 
@@ -1206,7 +1206,7 @@ def sync_premium_settle(day: str = Query("today"), dry_run: bool = Query(False))
     target_day = normalize_day(day)
     syncer = PremiumHistorySyncer(store=PostgresPremiumStore())
     result = syncer.settle_day_from_sportradar(target_day, dry_run=dry_run)
-    result["serviceVersion"] = "step30-first-pick-repair"
+    result["serviceVersion"] = "step33-yearly-history"
     return result
 
 
@@ -1218,7 +1218,7 @@ def sync_premium_settle_pending(days_back: int = Query(7, ge=1, le=60), dry_run:
     """
     syncer = PremiumHistorySyncer(store=PostgresPremiumStore())
     result = syncer.settle_pending_recent(days_back=days_back, dry_run=dry_run)
-    result["serviceVersion"] = "step30-first-pick-repair"
+    result["serviceVersion"] = "step33-yearly-history"
     return result
 
 
@@ -1228,7 +1228,7 @@ def sync_history_settle(day: str = Query("today"), dry_run: bool = Query(False))
     target_day = normalize_day(day)
     syncer = PremiumHistorySyncer(store=PostgresPremiumStore())
     result = syncer.settle_day_from_sportradar(target_day, dry_run=dry_run)
-    result["serviceVersion"] = "step30-first-pick-repair"
+    result["serviceVersion"] = "step33-yearly-history"
     return result
 
 
@@ -1236,7 +1236,7 @@ def sync_history_settle(day: str = Query("today"), dry_run: bool = Query(False))
 def sync_history_settle_pending(days_back: int = Query(7, ge=1, le=60), dry_run: bool = Query(False)) -> Dict[str, Any]:
     syncer = PremiumHistorySyncer(store=PostgresPremiumStore())
     result = syncer.settle_pending_recent(days_back=days_back, dry_run=dry_run)
-    result["serviceVersion"] = "step30-first-pick-repair"
+    result["serviceVersion"] = "step33-yearly-history"
     return result
 
 
@@ -1255,11 +1255,11 @@ def sync_history_repair_dellien_royer(confirm: str = Query("")) -> Dict[str, Any
             "table": store.TABLE,
             "message": "Réparation refusée : ajoute confirm=YES.",
             "example": "/sync/history/repair-dellien-royer?confirm=YES",
-            "serviceVersion": "step30-first-pick-repair",
+            "serviceVersion": "step33-yearly-history",
         }
     try:
         result = store.repair_dellien_royer_refuse()
-        result["serviceVersion"] = "step30-first-pick-repair"
+        result["serviceVersion"] = "step33-yearly-history"
         return result
     except Exception as exc:
         return {
@@ -1267,7 +1267,7 @@ def sync_history_repair_dellien_royer(confirm: str = Query("")) -> Dict[str, Any
             "databaseConfigured": store.enabled,
             "table": store.TABLE,
             "error": f"{type(exc).__name__}: {exc}",
-            "serviceVersion": "step30-first-pick-repair",
+            "serviceVersion": "step33-yearly-history",
         }
 
 
@@ -1284,14 +1284,14 @@ def sync_history_reset(category: str = Query("premium"), confirm: str = Query(""
             "category": cat,
             "message": "Reset refusé : ajoute confirm=YES.",
             "example": f"/sync/history/reset?category={cat.lower()}&confirm=YES",
-            "serviceVersion": "step30-first-pick-repair",
+            "serviceVersion": "step33-yearly-history",
         }
     try:
         if cat == "ALL":
             result = store.reset_all()
         else:
             result = store.reset_category(cat)
-        result["serviceVersion"] = "step30-first-pick-repair"
+        result["serviceVersion"] = "step33-yearly-history"
         return result
     except Exception as exc:
         return {
@@ -1300,7 +1300,7 @@ def sync_history_reset(category: str = Query("premium"), confirm: str = Query(""
             "table": store.TABLE,
             "category": cat,
             "error": f"{type(exc).__name__}: {exc}",
-            "serviceVersion": "step30-first-pick-repair",
+            "serviceVersion": "step33-yearly-history",
         }
 
 
@@ -1316,11 +1316,11 @@ def sync_premium_reset(confirm: str = Query("")) -> Dict[str, Any]:
             "category": "PREMIUM",
             "message": "Reset refusé : ajoute ?confirm=YES pour vider l'historique PREMIUM uniquement.",
             "example": "/sync/premium/reset?confirm=YES",
-            "serviceVersion": "step30-first-pick-repair",
+            "serviceVersion": "step33-yearly-history",
         }
     try:
         result = store.reset_category("PREMIUM")
-        result["serviceVersion"] = "step30-first-pick-repair"
+        result["serviceVersion"] = "step33-yearly-history"
         return result
     except Exception as exc:
         return {
@@ -1329,7 +1329,7 @@ def sync_premium_reset(confirm: str = Query("")) -> Dict[str, Any]:
             "table": store.TABLE,
             "category": "PREMIUM",
             "error": f"{type(exc).__name__}: {exc}",
-            "serviceVersion": "step30-first-pick-repair",
+            "serviceVersion": "step33-yearly-history",
         }
 
 
@@ -1339,7 +1339,7 @@ def sync_premium_run(day: str = Query("today"), dry_run: bool = Query(False)) ->
     daily_result = daily(target_day, auto_history=False)
     syncer = PremiumHistorySyncer(store=PostgresPremiumStore())
     result = syncer.sync_daily_result(daily_result, target_day, dry_run=dry_run)
-    result["serviceVersion"] = "step30-first-pick-repair"
+    result["serviceVersion"] = "step33-yearly-history"
     return result
 
 
