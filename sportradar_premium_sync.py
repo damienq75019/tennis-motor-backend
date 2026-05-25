@@ -497,13 +497,15 @@ class PremiumHistorySyncer:
                 "table": self.store.TABLE,
                 "status": self.store.status(),
             },
-            "policy": "Règlement strict STEP30 : pending -> win/loss via winner_id; retired/walkover/cancelled/abandoned -> void/remboursé, même si la ligne était déjà réglée.",
+            "policy": "Règlement strict STEP33 : pending -> win/loss via winner_id; retired/walkover/cancelled/abandoned -> void/remboursé, même si la ligne était déjà réglée.",
         }
 
-    def settle_pending_recent(self, *, days_back: int = 7, dry_run: bool = False, client: Optional[SportradarClient] = None) -> Dict[str, Any]:
-        days_back = max(1, min(int(days_back or 7), 60))
+    def settle_pending_recent(self, *, days_back: int = 0, dry_run: bool = False, client: Optional[SportradarClient] = None) -> Dict[str, Any]:
+        # STEP33: days_back=0 means no calendar limit: settle every pending history date, year after year.
+        days_back = max(0, min(int(days_back or 0), 36500))
         counts = {
             "days_requested": days_back,
+            "scope": "all_pending_dates" if days_back == 0 else "recent_history_dates",
             "dates_with_history": 0,
             "settled": 0,
             "voided": 0,
@@ -523,7 +525,7 @@ class PremiumHistorySyncer:
             }
 
         try:
-            dates = self.store.history_dates(days_back=days_back)
+            dates = self.store.pending_dates(days_back=days_back, limit=36500) if days_back == 0 else self.store.history_dates(days_back=days_back, limit=36500)
         except Exception as exc:
             return {
                 "status": "error",
@@ -556,7 +558,7 @@ class PremiumHistorySyncer:
             "counts": counts,
             "dates": dates,
             "results": results,
-            "policy": "STEP30 : vérifie les dates récentes avec historique; pending -> win/loss et retired/walkover/cancelled/abandoned -> void/remboursé, même sur anciennes lignes déjà réglées.",
+            "policy": "STEP33 : si days_back=0, vérifie toutes les dates ayant des lignes pending, sans limite de quelques jours; pending -> win/loss et retired/walkover/cancelled/abandoned -> void/remboursé.",
         }
 
     def sync_daily_result(self, daily_result: Dict[str, Any], target_day: str, *, dry_run: bool = False) -> Dict[str, Any]:
