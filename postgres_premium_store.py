@@ -972,11 +972,309 @@ class PostgresPremiumStore:
             "policy": "Reset global historique moteur : tennis_results_2026 / Elo ne sont pas touchés.",
         }
 
+
+    def form_value_report(self, category: Optional[str] = "ALL", limit: Optional[int] = None) -> Dict[str, Any]:
+        """STEP34: active Form/Value layer from persistent history.
+
+        Uses the already settled historical categories (PREMIUM / PROCHE / VETO / REFUSE)
+        and compares win/loss/void/pending, odds, ROI and engine signals.
+        This is intentionally multi-year: no day-window limit by default.
+        """
+        cat = normalize_category(category, default="ALL")
+        rows = self.fetch_rows(limit=limit, category=cat)
+        return build_form_value_report(rows, category=cat)
+
     def summary(self, category: Optional[str] = "PREMIUM") -> Dict[str, Any]:
         cat = normalize_category(category)
         rows = self.fetch_rows(limit=None, category=cat)
         return build_premium_summary(rows, category=cat)
 
+
+
+FORM_VALUE_SIGNAL_KEYS = [
+    "premiumPct",
+    "pSwe",
+    "pAtp",
+    "pForm5",
+    "pForm10",
+    "pSurfaceForm5",
+    "pDominance",
+]
+
+
+def _row_signal_value(row: Dict[str, Any], key: str) -> Optional[float]:
+    raw = row.get("raw") if isinstance(row.get("raw"), dict) else {}
+    aliases = {
+        "premiumPct": ["premiumPct", "premium_pct", "premium"],
+        "pSwe": ["pSwe", "p_swe"],
+        "pAtp": ["pAtp", "p_atp"],
+        "pForm5": ["pForm5", "p_form5"],
+        "pForm10": ["pForm10", "p_form10"],
+        "pSurfaceForm5": ["pSurfaceForm5", "p_surface_form5"],
+        "pDominance": ["pDominance", "p_dominance"],
+    }
+    for source in (row, raw):
+        for name in aliases.get(key, [key]):
+            if name in source and source.get(name) not in (None, ""):
+                try:
+                    val = float(str(source.get(name)).replace(",", "."))
+                    if key == "premiumPct" and 0.0 <= val <= 1.0:
+                        val *= 100.0
+                    return val
+                except Exception:
+                    continue
+    return None
+
+
+def _row_odd(row: Dict[str, Any]) -> float:
+    return _f(row.get("oddPredicted"), 0.0)
+
+
+def _new_form_bucket(label: str) -> Dict[str, Any]:
+    return {
+        "label": label,
+        "total": 0,
+        "settled": 0,
+        "wins": 0,
+        "losses": 0,
+        "void": 0,
+        "voids": 0,
+        "refunded": 0,
+        "pending": 0,
+        "oddsUsed": 0,
+        "oddSum": 0.0,
+        "profitUnits": 0.0,
+        "profitEur": 0.0,
+        "signalsSum": {k: 0.0 for k in FORM_VALUE_SIGNAL_KEYS},
+        "signalsCount": {k: 0 for k in FORM_VALUE_SIGNAL_KEYS},
+        "signalsAvg": {},
+    }
+
+
+def _add_row_to_form_bucket(bucket: Dict[str, Any], row: Dict[str, Any]) -> None:
+    result = normalize_result(row.get("result"))
+    odd = _row_odd(row)
+    bucket["total"] += 1
+
+    if result == "win":
+        bucket["wins"] += 1
+        bucket["settled"] += 1
+        if odd > 1.0:
+            bucket["oddsUsed"] += 1
+            bucket["oddSum"] += odd
+            bucket["profitUnits"] += odd - 1.0
+            bucket["profitEur"] += STAKE_EUR * (odd - 1.0)
+    elif result == "loss":
+        bucket["losses"] += 1
+        bucket["settled"] += 1
+        if odd > 1.0:
+            bucket["oddsUsed"] += 1
+            bucket["oddSum"] += odd
+            bucket["profitUnits"] -= 1.0
+        bucket["profitEur"] -= STAKE_EUR
+    elif result == "void":
+        bucket["void"] += 1
+        bucket["voids"] += 1
+        bucket["refunded"] += 1
+    else:
+        bucket["pending"] += 1
+
+    for key in FORM_VALUE_SIGNAL_KEYS:
+        val = _row_signal_value(row, key)
+        if val is None:
+            continue
+        bucket["signalsSum"][key] += float(val)
+        bucket["signalsCount"][key] += 1
+
+
+def _finalize_form_bucket(bucket: Dict[str, Any]) -> Dict[str, Any]:
+    settled = int(bucket.get("settled") or 0)
+    wins = int(bucket.get("wins") or 0)
+    odds_used = int(bucket.get("oddsUsed") or 0)
+    avg_odd = round(float(bucket.get("oddSum") or 0.0) / odds_used, 3) if odds_used else 0.0
+    break_even = round(100.0 / avg_odd, 2) if avg_odd > 1.0 else 0.0
+    win_rate = round((wins / settled) * 100.0, 2) if settled else 0.0
+    roi = round((float(bucket.get("profitUnits") or 0.0) / odds_used) * 100.0, 2) if odds_used else 0.0
+    edge = round(win_rate - break_even, 2) if break_even else 0.0
+
+    avgs: Dict[str, float] = {}
+    for key in FORM_VALUE_SIGNAL_KEYS:
+        cnt = int(bucket["signalsCount"].get(key) or 0)
+        avgs[key] = round(float(bucket["signalsSum"].get(key) or 0.0) / cnt, 4) if cnt else 0.0
+
+    bucket["signalsAvg"] = avgs
+    bucket["avgOdd"] = avg_odd
+    bucket["breakEvenPct"] = break_even
+    bucket["winRatePct"] = win_rate
+    bucket["historicalEdgePct"] = edge
+    bucket["profitUnits"] = round(float(bucket.get("profitUnits") or 0.0), 3)
+    bucket["profitEur"] = round(float(bucket.get("profitEur") or 0.0), 2)
+    bucket["roiPct"] = roi
+    bucket["activeSample"] = settled >= 3 and odds_used >= 3
+
+    if not bucket["activeSample"]:
+        bucket["valueGrade"] = "INSUFFICIENT_SAMPLE"
+        bucket["recommendation"] = "WAIT"
+    elif roi > 0 and edge > 0:
+        bucket["valueGrade"] = "POSITIVE_VALUE"
+        bucket["recommendation"] = "PROMOTE"
+    elif roi < 0 and edge < 0:
+        bucket["valueGrade"] = "NEGATIVE_VALUE"
+        bucket["recommendation"] = "DOWNGRADE"
+    else:
+        bucket["valueGrade"] = "MIXED_VALUE"
+        bucket["recommendation"] = "KEEP"
+
+    # Internal sums are not useful in API responses.
+    bucket.pop("signalsSum", None)
+    bucket.pop("signalsCount", None)
+    bucket.pop("oddSum", None)
+    return bucket
+
+
+def _form_signal_fit(match_signals: Dict[str, float], reference: Dict[str, Any]) -> float:
+    avgs = reference.get("signalsAvg") if isinstance(reference, dict) else {}
+    if not isinstance(avgs, dict):
+        return 0.0
+    total = 0.0
+    count = 0
+    for key in ("pSwe", "pAtp", "pForm5", "pForm10", "pSurfaceForm5", "pDominance"):
+        mv = match_signals.get(key)
+        rv = avgs.get(key)
+        if mv is None or rv in (None, ""):
+            continue
+        try:
+            mvf = float(mv)
+            rvf = float(rv)
+        except Exception:
+            continue
+        # Signals are mostly 0..1. Similarity 100 = same, 0 = far.
+        total += max(0.0, 1.0 - min(1.0, abs(mvf - rvf))) * 100.0
+        count += 1
+    return round(total / count, 2) if count else 0.0
+
+
+def build_form_value_report(rows: List[Dict[str, Any]], category: Optional[str] = "ALL") -> Dict[str, Any]:
+    cat_filter = normalize_category(category, default="ALL")
+    categories: Dict[str, Dict[str, Any]] = {}
+    for cat in ("PREMIUM", "PROCHE", "VETO", "REFUSE"):
+        categories[cat] = {
+            "all": _new_form_bucket("all"),
+            "wins": _new_form_bucket("wins"),
+            "losses": _new_form_bucket("losses"),
+            "voids": _new_form_bucket("voids"),
+            "pending": _new_form_bucket("pending"),
+        }
+
+    selected_rows = []
+    for row in rows or []:
+        cat = row_category(row)
+        if cat_filter != "ALL" and cat != cat_filter:
+            continue
+        selected_rows.append(row)
+        result = normalize_result(row.get("result"))
+        _add_row_to_form_bucket(categories[cat]["all"], row)
+        if result == "win":
+            _add_row_to_form_bucket(categories[cat]["wins"], row)
+        elif result == "loss":
+            _add_row_to_form_bucket(categories[cat]["losses"], row)
+        elif result == "void":
+            _add_row_to_form_bucket(categories[cat]["voids"], row)
+        else:
+            _add_row_to_form_bucket(categories[cat]["pending"], row)
+
+    for cat in categories:
+        for group in list(categories[cat].keys()):
+            categories[cat][group] = _finalize_form_bucket(categories[cat][group])
+
+    ranking = []
+    for cat, groups in categories.items():
+        all_bucket = groups["all"]
+        ranking.append({
+            "category": cat,
+            "settled": all_bucket.get("settled"),
+            "winRatePct": all_bucket.get("winRatePct"),
+            "roiPct": all_bucket.get("roiPct"),
+            "historicalEdgePct": all_bucket.get("historicalEdgePct"),
+            "valueGrade": all_bucket.get("valueGrade"),
+            "recommendation": all_bucket.get("recommendation"),
+        })
+    ranking.sort(key=lambda x: (float(x.get("roiPct") or 0.0), float(x.get("historicalEdgePct") or 0.0)), reverse=True)
+
+    return {
+        "status": "ok",
+        "version": "step34-form-value-engine",
+        "category": cat_filter,
+        "rowsUsed": len(selected_rows),
+        "signals": FORM_VALUE_SIGNAL_KEYS,
+        "categories": categories,
+        "ranking": ranking,
+        "policy": "STEP34 actif : Form5/Form10/SurfaceForm5/Dominance/pSWE/pATP/premiumPct/cote sont reliés aux historiques multi-années pour détecter value positive/négative par catégorie.",
+    }
+
+
+def score_match_with_form_value(match: Dict[str, Any], category: str, report: Dict[str, Any]) -> Dict[str, Any]:
+    cat = normalize_category(category, default="REFUSE")
+    categories = report.get("categories") if isinstance(report, dict) else {}
+    groups = categories.get(cat) if isinstance(categories, dict) else None
+    if not isinstance(groups, dict):
+        return {"formValueActive": False, "formValueCategory": cat, "formValueAction": "NO_HISTORY", "formValueLabel": "Historique indisponible"}
+
+    base = groups.get("all") or {}
+    wins = groups.get("wins") or {}
+    losses = groups.get("losses") or {}
+    odd = _f(match.get("oddA") or match.get("playerAOdd") or match.get("coteA"), 0.0)
+    implied = round(100.0 / odd, 2) if odd > 1.0 else 0.0
+
+    match_signals = {key: (_row_signal_value(match, key) if isinstance(match, dict) else None) for key in FORM_VALUE_SIGNAL_KEYS}
+    # _row_signal_value expects raw-compatible row; direct match values still work.
+    match_signals = {k: (0.0 if v is None else float(v)) for k, v in match_signals.items()}
+
+    win_fit = _form_signal_fit(match_signals, wins)
+    loss_fit = _form_signal_fit(match_signals, losses)
+    form_delta = round(win_fit - loss_fit, 2)
+    hist_win_rate = float(base.get("winRatePct") or 0.0)
+    hist_roi = float(base.get("roiPct") or 0.0)
+    hist_edge = round(hist_win_rate - implied, 2) if implied else float(base.get("historicalEdgePct") or 0.0)
+    settled = int(base.get("settled") or 0)
+    active_sample = bool(base.get("activeSample"))
+
+    value_score = round(hist_edge + (hist_roi * 0.25) + (form_delta * 0.15), 2)
+
+    if not active_sample:
+        action = "WAIT"
+        label = "⏳ FORM — échantillon court"
+        playable = False
+    elif value_score >= 5.0 and hist_roi > 0:
+        action = "PROMOTE"
+        label = "✅ VALUE FORM"
+        playable = True
+    elif value_score <= -5.0 and hist_roi < 0:
+        action = "DOWNGRADE"
+        label = "❌ DANGER FORM"
+        playable = False
+    else:
+        action = "KEEP"
+        label = "⚖ FORM NEUTRE"
+        playable = False
+
+    return {
+        "formValueActive": True,
+        "formValueCategory": cat,
+        "formValueAction": action,
+        "formValuePlayable": playable,
+        "formValueLabel": label,
+        "formValueScore": value_score,
+        "formValueWinRatePct": round(hist_win_rate, 2),
+        "formValueRoiPct": round(hist_roi, 2),
+        "formValueEdgePct": hist_edge,
+        "formValueImpliedPct": implied,
+        "formValueSettled": settled,
+        "formValueWinFitPct": win_fit,
+        "formValueLossFitPct": loss_fit,
+        "formValueFormDeltaPct": form_delta,
+        "formValueReason": f"Catégorie {cat}: WR {hist_win_rate:.1f}% vs seuil cote {implied:.1f}%, ROI {hist_roi:.1f}%, fit win {win_fit:.1f} / loss {loss_fit:.1f}.",
+    }
 
 def stats_for_period(rows: List[Dict[str, Any]], period_days: Optional[int], category: Optional[str] = "PREMIUM") -> Dict[str, Any]:
     today = today_paris()
