@@ -521,10 +521,15 @@ class PostgresPremiumStore:
         when Sportradar later reports retired/walkover/cancelled.
         """
         self.ensure_schema()
-        days_back = max(1, min(int(days_back or 7), 60))
-        since = today_paris() - timedelta(days=days_back - 1)
+        days_raw = int(days_back or 0)
         where, cat_params = category_where(category)
-        params: List[Any] = [since.isoformat()]
+        params: List[Any] = []
+        date_filter = ""
+        if days_raw > 0:
+            days_raw = min(days_raw, 36500)
+            since = today_paris() - timedelta(days=days_raw - 1)
+            date_filter = " AND date >= %s"
+            params.append(since.isoformat())
         params.extend(cat_params)
         params.append(int(limit))
         with self._connect() as conn:
@@ -533,7 +538,7 @@ class PostgresPremiumStore:
                     f"""
                     SELECT DISTINCT date
                     FROM {self.TABLE}
-                    WHERE date >= %s{where}
+                    WHERE 1=1{date_filter}{where}
                     ORDER BY date ASC
                     LIMIT %s
                     """,
@@ -544,10 +549,15 @@ class PostgresPremiumStore:
 
     def pending_dates(self, days_back: int = 7, limit: int = 30, category: Optional[str] = None) -> List[str]:
         self.ensure_schema()
-        days_back = max(1, min(int(days_back or 7), 60))
-        since = today_paris() - timedelta(days=days_back - 1)
+        days_raw = int(days_back or 0)
         where, cat_params = category_where(category)
-        params: List[Any] = [since.isoformat()]
+        params: List[Any] = []
+        date_filter = ""
+        if days_raw > 0:
+            days_raw = min(days_raw, 36500)
+            since = today_paris() - timedelta(days=days_raw - 1)
+            date_filter = " AND date >= %s"
+            params.append(since.isoformat())
         params.extend(cat_params)
         params.append(int(limit))
         with self._connect() as conn:
@@ -556,8 +566,7 @@ class PostgresPremiumStore:
                     f"""
                     SELECT DISTINCT date
                     FROM {self.TABLE}
-                    WHERE result = 'pending'
-                      AND date >= %s{where}
+                    WHERE result = 'pending'{date_filter}{where}
                     ORDER BY date ASC
                     LIMIT %s
                     """,
