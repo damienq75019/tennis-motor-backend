@@ -52,6 +52,53 @@ def is_proche_jouable(match: Dict[str, Any]) -> bool:
     return 75.0 <= pct < 80.0
 
 
+
+def _status_values(match: Dict[str, Any]) -> List[str]:
+    values = [
+        match.get("status"),
+        match.get("sportradarStatus"),
+        match.get("matchStatus"),
+        match.get("sportradarMatchStatus"),
+    ]
+    raw = match.get("raw")
+    if isinstance(raw, dict):
+        values.extend([
+            raw.get("status"),
+            raw.get("sportradarStatus"),
+            raw.get("matchStatus"),
+            raw.get("sportradarMatchStatus"),
+        ])
+    return [_s(v).lower() for v in values if _s(v)]
+
+
+def _is_void_match(match: Dict[str, Any]) -> bool:
+    """Betting settlement safety: retired/walkover/cancelled/abandoned = void/refund."""
+    statuses = set(_status_values(match))
+    void_tokens = {"retired", "walkover", "abandoned", "cancelled", "canceled", "withdrawn", "forfeit", "forfeited"}
+    if statuses.intersection(void_tokens):
+        return True
+
+    # Some providers encode retirement in generic text fields.
+    blob = " ".join(_s(match.get(k)).lower() for k in ("reason", "statusReason", "matchStatusReason", "score"))
+    return any(token in blob for token in ("retired", "walkover", "abandoned", "cancelled", "canceled", "withdrawn"))
+
+
+def _summary_is_void(summary: Dict[str, Any]) -> bool:
+    status = _get_status(summary)
+    values = [
+        status.get("status"),
+        status.get("match_status"),
+        status.get("status_reason"),
+        status.get("match_status_reason"),
+    ]
+    blob = " ".join(_s(v).lower() for v in values if _s(v))
+    return any(token in blob for token in ("retired", "walkover", "abandoned", "cancelled", "canceled", "withdrawn", "forfeit"))
+
+
+def _is_cancelled_before_play(match: Dict[str, Any]) -> bool:
+    statuses = set(_status_values(match))
+    return bool(statuses.intersection({"cancelled", "canceled"})) and not _s(match.get("winnerId"))
+
 def tracked_category(match: Dict[str, Any]) -> str:
     """Catégorie historique moteur.
 
@@ -80,37 +127,6 @@ def _is_finished(match: Dict[str, Any]) -> bool:
     status = _s(match.get("status") or match.get("sportradarStatus")).lower()
     match_status = _s(match.get("matchStatus") or match.get("sportradarMatchStatus")).lower()
     return status in {"closed", "ended", "finished", "complete", "completed"} or match_status in {"ended", "finished", "complete", "completed", "retired"}
-
-
-def _is_void_result_status(status: str, match_status: str) -> bool:
-    """True when the sporting result must not be counted financially.
-
-    For the betting history, tennis retirements/abandonments/forfeits are treated
-    as refunded selections: result='void', profit=0, no win/loss/ROI impact.
-    """
-    values = {status.lower().strip(), match_status.lower().strip()}
-    void_tokens = {
-        "retired",
-        "abandoned",
-        "abandon",
-        "walkover",
-        "w/o",
-        "wo",
-        "withdrawn",
-        "forfeit",
-        "defaulted",
-        "cancelled",
-        "canceled",
-        "not_played",
-        "postponed",
-    }
-    return any(v in void_tokens for v in values if v)
-
-
-def _is_void_match(match: Dict[str, Any]) -> bool:
-    status = _s(match.get("status") or match.get("sportradarStatus"))
-    match_status = _s(match.get("matchStatus") or match.get("sportradarMatchStatus"))
-    return _is_void_result_status(status, match_status)
 
 
 def _winner_name_from_match(match: Dict[str, Any]) -> str:
@@ -147,13 +163,6 @@ def _summary_is_finished(summary: Dict[str, Any]) -> bool:
     status = _s(_get_status(summary).get("status")).lower()
     match_status = _s(_get_status(summary).get("match_status")).lower()
     return status in {"closed", "ended", "finished", "complete", "completed"} or match_status in {"ended", "finished", "complete", "completed", "retired"}
-
-
-def _summary_is_void(summary: Dict[str, Any]) -> bool:
-    status_obj = _get_status(summary)
-    status = _s(status_obj.get("status"))
-    match_status = _s(status_obj.get("match_status"))
-    return _is_void_result_status(status, match_status)
 
 
 def _summary_competitors(summary: Dict[str, Any]) -> List[Dict[str, str]]:
@@ -266,10 +275,10 @@ def _build_history_row(match: Dict[str, Any], target_day: str, category: str) ->
         "oddPredicted": _s(match.get("oddA") or match.get("playerAOdd") or match.get("coteA")),
         "oddOpponent": _s(match.get("oddB") or match.get("playerBOdd") or match.get("coteB")),
         "oddsSource": _s(match.get("oddsSource")),
-        "result": "pending",
-        "realWinner": "",
-        "settledAt": "",
-        "settleSource": "",
+        "result": "void" if _is_void_match(match) else "pending",
+        "realWinner": _winner_name_from_match(match) if _is_void_match(match) else "",
+        "settledAt": target_day if _is_void_match(match) else "",
+        "settleSource": "sportradar_void" if _is_void_match(match) else "",
         "tournament": _s(match.get("tournament")),
         "seasonName": _s(match.get("seasonName")),
         "round": _s(match.get("round")),
@@ -337,18 +346,6 @@ class PremiumHistorySyncer:
             }
 
         counts["pending_before"] = len(pending_rows)
-        if not pending_rows:
-            return {
-                "status": "ok",
-                "provider": "sportradar",
-                "targetDay": target_day,
-                "dryRun": dry_run,
-                "generatedAt": datetime.utcnow().isoformat() + "Z",
-                "errors": [],
-                "counts": counts,
-                "settledSample": [],
-                "policy": "Aucune ligne pending à régler pour cette date.",
-            }
 
         pending_by_event: Dict[str, List[Dict[str, Any]]] = {}
         for row in pending_rows:
@@ -391,12 +388,51 @@ class PremiumHistorySyncer:
         summaries_by_event = _summary_map_by_event_id(payload)
         counts["sportradar_summaries"] = len(summaries_by_event)
 
+        # First pass: void/refund events must override even old rows already marked win/loss.
+        for event_id, summary in summaries_by_event.items():
+            if not _summary_is_void(summary):
+                continue
+            real_winner = _summary_winner_name(summary)
+            winner_id = _summary_winner_id(summary)
+            score = _summary_score(summary)
+            if dry_run:
+                changed = len(self.store.fetch_rows_by_event(event_id)) if self.store.enabled else 0
+            else:
+                try:
+                    changed = self.store.void_rows_by_event(
+                        event_id,
+                        score,
+                        winner_id,
+                        reason="sportradar_daily_summaries_void",
+                        real_winner=real_winner,
+                    )
+                except TypeError:
+                    # Backward fallback if an older store signature is somehow loaded.
+                    changed = 0
+                except Exception as exc:
+                    errors.append(f"void event {event_id} failed: {type(exc).__name__}: {exc}")
+                    changed = 0
+            if changed:
+                counts["voided"] += int(changed)
+                if len(settled_sample) < 10:
+                    settled_sample.append({
+                        "eventId": event_id,
+                        "result": "void",
+                        "winnerId": winner_id,
+                        "score": score,
+                        "rowsChanged": int(changed),
+                    })
+
         for event_id, rows in pending_by_event.items():
             summary = summaries_by_event.get(event_id)
             if not summary:
                 counts["missing_in_sportradar"] += len(rows)
                 if len(unresolved_sample) < 10:
                     unresolved_sample.append({"eventId": event_id, "reason": "missing_in_sportradar", "rows": len(rows)})
+                continue
+
+            if _summary_is_void(summary):
+                # Already handled by the void pass above.
                 continue
 
             if not _summary_is_finished(summary):
@@ -417,47 +453,33 @@ class PremiumHistorySyncer:
                 continue
 
             counts["matched_pending_events"] += len(rows)
-            is_void = _summary_is_void(summary)
 
             if dry_run:
                 changed = len(rows)
             else:
                 try:
-                    if is_void:
-                        changed = self.store.void_pending_by_event(
-                            event_id,
-                            real_winner,
-                            score,
-                            winner_id,
-                            source="sportradar_daily_summaries_void",
-                        )
-                    else:
-                        changed = self.store.settle_pending_by_event(
-                            event_id,
-                            real_winner,
-                            score,
-                            winner_id,
-                            source="sportradar_daily_summaries",
-                        )
+                    changed = self.store.settle_pending_by_event(
+                        event_id,
+                        real_winner,
+                        score,
+                        winner_id,
+                        source="sportradar_daily_summaries",
+                    )
                 except Exception as exc:
                     errors.append(f"settle event {event_id} failed: {type(exc).__name__}: {exc}")
                     changed = 0
 
-            if is_void:
-                counts["voided"] += int(changed)
-            else:
-                counts["settled"] += int(changed)
+            counts["settled"] += int(changed)
             if changed and len(settled_sample) < 10:
                 settled_sample.append({
                     "eventId": event_id,
-                    "result": "void" if is_void else "win_or_loss",
                     "realWinner": real_winner,
                     "winnerId": winner_id,
                     "score": score,
                     "rowsChanged": int(changed),
                 })
 
-        counts["still_pending"] = max(0, counts["pending_before"] - counts["settled"] - counts.get("voided", 0))
+        counts["still_pending"] = max(0, counts["pending_before"] - counts["settled"])
         status = "ok" if not errors else "partial"
         return {
             "status": status,
@@ -475,15 +497,16 @@ class PremiumHistorySyncer:
                 "table": self.store.TABLE,
                 "status": self.store.status(),
             },
-            "policy": "Règlement strict : pending -> win/loss via winner_id Sportradar; abandon/retired/walkover/cancelled -> void remboursé, sans impact ROI.",
+            "policy": "Règlement strict STEP29 : pending -> win/loss via winner_id; retired/walkover/cancelled/abandoned -> void/remboursé, même si la ligne était déjà réglée.",
         }
 
     def settle_pending_recent(self, *, days_back: int = 7, dry_run: bool = False, client: Optional[SportradarClient] = None) -> Dict[str, Any]:
         days_back = max(1, min(int(days_back or 7), 60))
         counts = {
             "days_requested": days_back,
-            "dates_with_pending": 0,
+            "dates_with_history": 0,
             "settled": 0,
+            "voided": 0,
             "pending_before": 0,
             "errors": 0,
         }
@@ -500,7 +523,7 @@ class PremiumHistorySyncer:
             }
 
         try:
-            dates = self.store.pending_dates(days_back=days_back)
+            dates = self.store.history_dates(days_back=days_back)
         except Exception as exc:
             return {
                 "status": "error",
@@ -511,7 +534,7 @@ class PremiumHistorySyncer:
                 "results": results,
             }
 
-        counts["dates_with_pending"] = len(dates)
+        counts["dates_with_history"] = len(dates)
         client = client or SportradarClient()
 
         for day in dates:
@@ -519,6 +542,7 @@ class PremiumHistorySyncer:
             results.append(result)
             c = result.get("counts") or {}
             counts["settled"] += int(c.get("settled") or 0)
+            counts["voided"] += int(c.get("voided") or 0)
             counts["pending_before"] += int(c.get("pending_before") or 0)
             if result.get("status") not in {"ok", "skipped"}:
                 counts["errors"] += 1
@@ -532,7 +556,7 @@ class PremiumHistorySyncer:
             "counts": counts,
             "dates": dates,
             "results": results,
-            "policy": "Règle les pending des derniers jours via Sportradar daily summaries; aucun nouveau pick n'est créé.",
+            "policy": "STEP29 : vérifie les dates récentes avec historique; pending -> win/loss et retired/walkover/cancelled/abandoned -> void/remboursé, même sur anciennes lignes déjà réglées.",
         }
 
     def sync_daily_result(self, daily_result: Dict[str, Any], target_day: str, *, dry_run: bool = False) -> Dict[str, Any]:
@@ -554,6 +578,7 @@ class PremiumHistorySyncer:
             "ignored_not_tracked": 0,
             "settled": 0,
             "voided": 0,
+            "deduped_input_matches": 0,
             "unresolved_finished": 0,
         }
         errors: List[str] = []
@@ -583,13 +608,41 @@ class PremiumHistorySyncer:
             }
 
         # 1) Record all categorized engine outputs: Premium + Proches + Veto + Refusés.
-        for match in matches:
+        # STEP29: dedupe raw daily payload by sport_event_id before writing history.
+        # One physical tennis match must create at most one history row.
+        deduped_matches: List[Dict[str, Any]] = []
+        seen_events: Dict[str, int] = {}
+
+        def _match_rank(m: Dict[str, Any]) -> tuple:
+            category = tracked_category(m)
+            cat_rank = {"PREMIUM": 4, "PROCHE": 3, "VETO": 2, "REFUSE": 1}.get(category, 0)
+            has_odds = 1 if _s(m.get("oddA") or m.get("playerAOdd") or m.get("coteA")) else 0
+            return (cat_rank, _premium_pct(m), has_odds)
+
+        for m in matches:
+            if not isinstance(m, dict):
+                continue
+            event_id = _s(m.get("sportradarSportEventId"))
+            if not event_id:
+                deduped_matches.append(m)
+                continue
+            if event_id not in seen_events:
+                seen_events[event_id] = len(deduped_matches)
+                deduped_matches.append(m)
+                continue
+            idx = seen_events[event_id]
+            counts["deduped_input_matches"] += 1
+            if _match_rank(m) > _match_rank(deduped_matches[idx]):
+                deduped_matches[idx] = m
+
+        for match in deduped_matches:
             if not isinstance(match, dict):
                 counts["ignored_not_tracked"] += 1
                 continue
 
             category = tracked_category(match)
             if not category:
+                # Cancelled/retired non-analyzable rows are not engine picks.
                 counts["ignored_not_tracked"] += 1
                 continue
 
@@ -631,44 +684,63 @@ class PremiumHistorySyncer:
             except Exception as exc:
                 errors.append(f"upsert failed: {type(exc).__name__}: {exc}")
 
-        # 2) Settle pending tracked rows using the same Sportradar daily payload.
-        for match in matches:
-            if not isinstance(match, dict) or not _is_finished(match):
+        # 2) Settle tracked rows using the same Sportradar daily payload.
+        # Retired / walkover / cancelled / abandoned must be void/refunded, not win/loss.
+        for match in deduped_matches:
+            if not isinstance(match, dict):
                 continue
+            event_id = _s(match.get("sportradarSportEventId"))
+            if not event_id:
+                continue
+
+            if _is_void_match(match):
+                if dry_run:
+                    changed = len(self.store.fetch_rows_by_event(event_id)) if self.store.enabled else 0
+                else:
+                    try:
+                        changed = self.store.void_rows_by_event(
+                            event_id,
+                            _s(match.get("score")),
+                            _s(match.get("winnerId")),
+                            reason="sportradar_daily_void",
+                            real_winner=_winner_name_from_match(match),
+                        )
+                    except Exception as exc:
+                        errors.append(f"void failed: {type(exc).__name__}: {exc}")
+                        changed = 0
+                if changed:
+                    counts["voided"] += int(changed)
+                    if len(settled_sample) < 10:
+                        settled_sample.append({
+                            "eventId": event_id,
+                            "result": "void",
+                            "score": _s(match.get("score")),
+                            "rowsChanged": int(changed),
+                        })
+                continue
+
+            if not _is_finished(match):
+                continue
+
             real_winner = _winner_name_from_match(match)
             if not real_winner:
                 counts["unresolved_finished"] += 1
                 continue
-            event_id = _s(match.get("sportradarSportEventId"))
+
             if dry_run:
                 continue
             try:
-                if _is_void_match(match):
-                    changed = self.store.void_pending_by_event(
-                        event_id,
-                        real_winner,
-                        _s(match.get("score")),
-                        _s(match.get("winnerId")),
-                        source="sportradar_daily_payload_void",
-                    )
-                    result_label = "void"
-                else:
-                    changed = self.store.settle_pending_by_event(
-                        event_id,
-                        real_winner,
-                        _s(match.get("score")),
-                        _s(match.get("winnerId")),
-                    )
-                    result_label = "win_or_loss"
+                changed = self.store.settle_pending_by_event(
+                    event_id,
+                    real_winner,
+                    _s(match.get("score")),
+                    _s(match.get("winnerId")),
+                )
                 if changed:
-                    if result_label == "void":
-                        counts["voided"] += int(changed)
-                    else:
-                        counts["settled"] += int(changed)
+                    counts["settled"] += int(changed)
                     if len(settled_sample) < 10:
                         settled_sample.append({
                             "eventId": event_id,
-                            "result": result_label,
                             "realWinner": real_winner,
                             "score": _s(match.get("score")),
                             "rowsChanged": int(changed),
@@ -698,5 +770,5 @@ class PremiumHistorySyncer:
                 "step": (daily_result.get("daily") or {}).get("step"),
                 "summary": daily_result.get("summary", {}),
             },
-            "policy": "Historique moteur catégorisé : Premium, Proches, Veto et Refusés; pending -> win/loss via winner_id; abandon/retired/walkover/cancelled -> void remboursé.",
+            "policy": "Historique moteur STEP29 : Premium/Proches/Veto/Refusés; 1 ligne par match; retired/walkover/cancelled/abandoned -> void/remboursé; règlement win/loss via winner_id Sportradar.",
         }
