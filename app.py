@@ -15,8 +15,8 @@ from motor import HISTORY_YEARS, calculate_match_prediction, get_state
 from sportradar_client import SportradarClient
 from sportradar_daily_builder import SportradarDailyBuilder
 from sportradar_2026_results_sync import Results2026Syncer
-from postgres_premium_store import PostgresPremiumStore
-from sportradar_premium_sync import PremiumHistorySyncer
+from postgres_premium_store import PostgresPremiumStore, score_match_with_form_value
+from sportradar_premium_sync import PremiumHistorySyncer, tracked_category
 from flashscore_odds import FlashscoreOddsProvider
 
 
@@ -28,7 +28,7 @@ PAYLOAD_DIR = OUTPUT_DIR / "payloads"
 # Règle utilisateur verrouillée : Jannik Sinner reste exclu de l'analyse.
 EXCLUDED_ANALYSIS_PLAYERS = ["Jannik Sinner"]
 
-app = FastAPI(title="Tennis Motor Backend Clean", version="step33-yearly-history")
+app = FastAPI(title="Tennis Motor Backend Clean", version="step34-form-value-engine")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -736,14 +736,105 @@ def calculate_from_matches(matches: List[Dict[str, Any]]) -> Dict[str, Any]:
     }
 
 
+
+def _apply_form_value_engine(response: Dict[str, Any]) -> None:
+    """STEP34: active Form/Value layer connected to multi-year history.
+
+    Adds formValue fields to every current match without deleting the original motor traces.
+    Unity can display the active value decision and the backend can persist it in raw_json.
+    """
+    response.setdefault("daily", {})
+    matches = response.get("matches") if isinstance(response, dict) else []
+    if not isinstance(matches, list) or not matches:
+        response["daily"]["formValueEngine"] = {
+            "status": "skipped",
+            "reason": "no_matches",
+            "version": "step34-form-value-engine",
+        }
+        return
+
+    store = PostgresPremiumStore()
+    if not store.enabled:
+        response["daily"]["formValueEngine"] = {
+            "status": "skipped",
+            "reason": "database_not_configured",
+            "version": "step34-form-value-engine",
+        }
+        return
+
+    try:
+        report = store.form_value_report(category="ALL", limit=50000)
+    except Exception as exc:
+        response["daily"]["formValueEngine"] = {
+            "status": "error",
+            "version": "step34-form-value-engine",
+            "error": f"{type(exc).__name__}: {exc}",
+        }
+        return
+
+    counts = {"scored": 0, "promote": 0, "downgrade": 0, "keep": 0, "wait": 0, "ignored": 0}
+    sample: List[Dict[str, Any]] = []
+
+    for match in matches:
+        if not isinstance(match, dict):
+            counts["ignored"] += 1
+            continue
+        category = tracked_category(match)
+        if not category:
+            counts["ignored"] += 1
+            continue
+        value = score_match_with_form_value(match, category, report)
+        match.update(value)
+        match["formValueEngineVersion"] = "step34-form-value-engine"
+        old_decision = str(match.get("decision") or "")
+        action = str(value.get("formValueAction") or "")
+        if action == "PROMOTE":
+            counts["promote"] += 1
+            match["decisionWithForm"] = "✅ Jouable Form Value"
+            match["formValueFinalDecision"] = "PROMOTE"
+        elif action == "DOWNGRADE":
+            counts["downgrade"] += 1
+            match["decisionWithForm"] = "❌ Danger Form Value"
+            match["formValueFinalDecision"] = "DOWNGRADE"
+        elif action == "WAIT":
+            counts["wait"] += 1
+            match["decisionWithForm"] = old_decision
+            match["formValueFinalDecision"] = "WAIT"
+        else:
+            counts["keep"] += 1
+            match["decisionWithForm"] = old_decision
+            match["formValueFinalDecision"] = "KEEP"
+        counts["scored"] += 1
+        if len(sample) < 12:
+            sample.append({
+                "match": f"{match.get('playerA')} vs {match.get('playerB')}",
+                "category": category,
+                "action": action,
+                "score": value.get("formValueScore"),
+                "roiPct": value.get("formValueRoiPct"),
+                "edgePct": value.get("formValueEdgePct"),
+                "label": value.get("formValueLabel"),
+            })
+
+    response["daily"]["formValueEngine"] = {
+        "status": "ok",
+        "version": "step34-form-value-engine",
+        "mode": "active_history_value_layer",
+        "counts": counts,
+        "categoryRanking": report.get("ranking", []),
+        "sample": sample,
+        "policy": "Couche Form/Historique active validée utilisateur : pForm5, pForm10, pSurfaceForm5, pDominance, pSWE, pATP, premiumPct et cote sont reliés aux décisions formValue.",
+    }
+
+
 @app.get("/")
 def root() -> Dict[str, Any]:
     return {
         "status": "ok",
         "service": "Tennis Motor Backend Clean",
-        "version": "step33-yearly-history",
+        "version": "step34-form-value-engine",
         "message": "Backend propre étape 2.11 : Sportradar + PostgreSQL + cotes Flashscore + veto non forcé + détecteur qualifié audit only + placeholders masqués + vrais signaux historiques moteur.",
-        "endpoints": ["/health", "/calculate", "/predictions", "/state", "/history", "/daily", "/odds/status", "/sync/results2026/status", "/sync/results2026/run", "/sync/results2026/postgres/status", "/sync/results2026/postgres/export", "/sync/premium/status", "/sync/premium/list", "/sync/premium/reset", "/sync/premium/run", "/sync/premium/settle", "/sync/premium/settle-pending", "/sync/history/list", "/sync/history/reset", "/sync/history/repair-dellien-royer", "/sync/history/settle", "/sync/history/settle-pending"],
+        "endpoints": ["/health", "/calculate", "/predictions", "/state", "/history", "/daily", "/odds/status", "/sync/results2026/status", "/sync/results2026/run", "/sync/results2026/postgres/status", "/sync/results2026/postgres/export", "/sync/premium/status", "/sync/premium/list", "/sync/premium/reset", "/sync/premium/run", "/sync/premium/settle", "/sync/premium/settle-pending", "/sync/history/form-value", "/sync/history/list", "/sync/history/reset", "/sync/history/repair-dellien-royer", "/sync/history/settle", "/sync/history/settle-pending"],
         "excludedAnalysisPlayers": _excluded_analysis_names(),
     }
 
@@ -754,7 +845,7 @@ def health() -> Dict[str, Any]:
     return {
         "status": "ok",
         "service": "Tennis Motor Backend Clean",
-        "version": "step33-yearly-history",
+        "version": "step34-form-value-engine",
         "historyYears": list(HISTORY_YEARS),
         "historyRowsLoaded": state.get("history_rows_loaded", 0),
         "excludedAnalysisPlayers": _excluded_analysis_names(),
@@ -832,13 +923,16 @@ def daily(day: str = Query("today"), auto_history: bool = Query(True)) -> Dict[s
     response.setdefault("daily", {})
     response["daily"].update({
         "provider": "sportradar",
-        "step": "25",
+        "step": "34",
         "targetDay": target_day,
         "payloadCount": len(source_matches),
         "audit": built.get("audit", {}),
         "manualReviewPolicy": "points ATP absents ou à 0 = non analysé; placeholders Sportradar WSF/TBD/Winner masqués; noms Sportradar résolus vers historique; vrais signaux moteur quand historique disponible; veto non forcé : les victoires tournoi calculées par Sportradar sont conservées en raw/audit mais ne forcent plus player_b_tournament_wins moteur; qualifié B non activé automatiquement; détecteur Sportradar Season Links en audit only; aucune donnée n'est inventée.",
-        "oddsPolicy": "Flashscore odds are display-only and never used by the Tennis Motor decision.",
+        "oddsPolicy": "Flashscore odds are display-only for the original core; STEP34 formValue uses odds against historical win-rate/ROI.",
     })
+
+    # STEP34 : couche Form/Historique active, après enrichissement des cotes.
+    _apply_form_value_engine(response)
 
     # STEP25 : sauvegarde automatique historique moteur catégorisé.
     # Les jours futurs ne sont jamais enregistrés pour éviter de polluer l'historique.
@@ -889,7 +983,7 @@ def odds_status() -> Dict[str, Any]:
         "records": audit.get("records", 0),
         "errors": audit.get("errors", []),
         "warnings": audit.get("warnings", []),
-        "serviceVersion": "step33-yearly-history",
+        "serviceVersion": "step34-form-value-engine",
     }
 
 
@@ -966,7 +1060,7 @@ def history() -> Dict[str, Any]:
 def sync_results2026_status() -> Dict[str, Any]:
     syncer = Results2026Syncer(client=SportradarClient(), base_dir=BASE_DIR)
     status = syncer.status()
-    status["serviceVersion"] = "step33-yearly-history"
+    status["serviceVersion"] = "step34-form-value-engine"
     return status
 
 
@@ -974,7 +1068,7 @@ def sync_results2026_status() -> Dict[str, Any]:
 def sync_results2026_postgres_status() -> Dict[str, Any]:
     syncer = Results2026Syncer(client=SportradarClient(), base_dir=BASE_DIR)
     status = syncer.postgres_status()
-    status["serviceVersion"] = "step33-yearly-history"
+    status["serviceVersion"] = "step34-form-value-engine"
     return status
 
 
@@ -982,7 +1076,7 @@ def sync_results2026_postgres_status() -> Dict[str, Any]:
 def sync_results2026_postgres_export() -> Dict[str, Any]:
     syncer = Results2026Syncer(client=SportradarClient(), base_dir=BASE_DIR)
     result = syncer.export_postgres_to_csv()
-    result["serviceVersion"] = "step33-yearly-history"
+    result["serviceVersion"] = "step34-form-value-engine"
 
     try:
         if result.get("status") == "ok":
@@ -1003,7 +1097,7 @@ def sync_results2026_run(day: str = Query("today"), dry_run: bool = Query(False)
     target_day = normalize_day(day)
     syncer = Results2026Syncer(client=SportradarClient(), base_dir=BASE_DIR)
     result = syncer.sync_day(target_day, dry_run=dry_run)
-    result["serviceVersion"] = "step33-yearly-history"
+    result["serviceVersion"] = "step34-form-value-engine"
 
     # Si data/2026.csv a été modifié, on force la reconstruction de l'état Elo/Form au prochain calcul.
     try:
@@ -1024,7 +1118,7 @@ def sync_results2026_run(day: str = Query("today"), dry_run: bool = Query(False)
 def sync_premium_status() -> Dict[str, Any]:
     syncer = PremiumHistorySyncer(store=PostgresPremiumStore())
     status = syncer.status()
-    status["serviceVersion"] = "step33-yearly-history"
+    status["serviceVersion"] = "step34-form-value-engine"
     return status
 
 
@@ -1065,6 +1159,10 @@ def _history_list_payload(
     rows = store.fetch_rows(limit=limit, category=cat)
     counts = store.counts(category=cat)
     summary = store.summary(category=cat)
+    try:
+        form_value = store.form_value_report(category=cat, limit=50000)
+    except Exception as exc:
+        form_value = {"status": "error", "error": f"{type(exc).__name__}: {exc}"}
     items: List[Dict[str, Any]] = []
 
     for row in rows:
@@ -1111,13 +1209,52 @@ def _history_list_payload(
         "counts": counts,
         "summary": summary.get("summary", {}),
         "chart": summary.get("chart", {}),
+        "formValue": form_value,
         "items": items,
         "rows": rows,
         "settle": settle_result,
         "cleanup": cleanup_result,
         "policy": f"Liste historique moteur STEP33 filtrée : {cat}. Historique durable multi-années; auto-settle sur toutes les dates pending si settle_days_back=0; void/remboursé exclu du ROI; doublons legacy compactés.",
-        "serviceVersion": "step33-yearly-history",
+        "serviceVersion": "step34-form-value-engine",
     }
+
+
+
+@app.get("/sync/history/form-value")
+def sync_history_form_value(
+    category: str = Query("all"),
+    limit: int = Query(50000, ge=1, le=100000),
+) -> Dict[str, Any]:
+    """STEP34 : rapport Form/Value actif multi-années par catégorie."""
+    store = PostgresPremiumStore()
+    cat = _normalize_history_category_for_api(category) if str(category).strip().lower() not in {"all", "tout", "*"} else "ALL"
+    if not store.enabled:
+        return {
+            "status": "error",
+            "databaseConfigured": False,
+            "databaseStatus": "not_configured",
+            "table": store.TABLE,
+            "category": cat,
+            "error": "DATABASE_URL absente dans le service web.",
+            "serviceVersion": "step34-form-value-engine",
+        }
+    try:
+        report = store.form_value_report(category=cat, limit=limit)
+        report["databaseConfigured"] = True
+        report["databaseStatus"] = "ok"
+        report["table"] = store.TABLE
+        report["serviceVersion"] = "step34-form-value-engine"
+        return report
+    except Exception as exc:
+        return {
+            "status": "error",
+            "databaseConfigured": store.enabled,
+            "databaseStatus": "error",
+            "table": store.TABLE,
+            "category": cat,
+            "error": f"{type(exc).__name__}: {exc}",
+            "serviceVersion": "step34-form-value-engine",
+        }
 
 
 @app.get("/sync/history/list")
@@ -1141,7 +1278,7 @@ def sync_history_list(
             "error": "DATABASE_URL absente dans le service web.",
             "items": [],
             "rows": [],
-            "serviceVersion": "step33-yearly-history",
+            "serviceVersion": "step34-form-value-engine",
         }
 
     try:
@@ -1156,7 +1293,7 @@ def sync_history_list(
             "error": f"{type(exc).__name__}: {exc}",
             "items": [],
             "rows": [],
-            "serviceVersion": "step33-yearly-history",
+            "serviceVersion": "step34-form-value-engine",
         }
 
 
@@ -1178,7 +1315,7 @@ def sync_premium_list(
             "error": "DATABASE_URL absente dans le service web.",
             "items": [],
             "rows": [],
-            "serviceVersion": "step33-yearly-history",
+            "serviceVersion": "step34-form-value-engine",
         }
     try:
         return _history_list_payload(store, "PREMIUM", limit, auto_settle, settle_days_back)
@@ -1192,7 +1329,7 @@ def sync_premium_list(
             "error": f"{type(exc).__name__}: {exc}",
             "items": [],
             "rows": [],
-            "serviceVersion": "step33-yearly-history",
+            "serviceVersion": "step34-form-value-engine",
         }
 
 
@@ -1206,7 +1343,7 @@ def sync_premium_settle(day: str = Query("today"), dry_run: bool = Query(False))
     target_day = normalize_day(day)
     syncer = PremiumHistorySyncer(store=PostgresPremiumStore())
     result = syncer.settle_day_from_sportradar(target_day, dry_run=dry_run)
-    result["serviceVersion"] = "step33-yearly-history"
+    result["serviceVersion"] = "step34-form-value-engine"
     return result
 
 
@@ -1218,7 +1355,7 @@ def sync_premium_settle_pending(days_back: int = Query(7, ge=1, le=60), dry_run:
     """
     syncer = PremiumHistorySyncer(store=PostgresPremiumStore())
     result = syncer.settle_pending_recent(days_back=days_back, dry_run=dry_run)
-    result["serviceVersion"] = "step33-yearly-history"
+    result["serviceVersion"] = "step34-form-value-engine"
     return result
 
 
@@ -1228,7 +1365,7 @@ def sync_history_settle(day: str = Query("today"), dry_run: bool = Query(False))
     target_day = normalize_day(day)
     syncer = PremiumHistorySyncer(store=PostgresPremiumStore())
     result = syncer.settle_day_from_sportradar(target_day, dry_run=dry_run)
-    result["serviceVersion"] = "step33-yearly-history"
+    result["serviceVersion"] = "step34-form-value-engine"
     return result
 
 
@@ -1236,7 +1373,7 @@ def sync_history_settle(day: str = Query("today"), dry_run: bool = Query(False))
 def sync_history_settle_pending(days_back: int = Query(7, ge=1, le=60), dry_run: bool = Query(False)) -> Dict[str, Any]:
     syncer = PremiumHistorySyncer(store=PostgresPremiumStore())
     result = syncer.settle_pending_recent(days_back=days_back, dry_run=dry_run)
-    result["serviceVersion"] = "step33-yearly-history"
+    result["serviceVersion"] = "step34-form-value-engine"
     return result
 
 
@@ -1255,11 +1392,11 @@ def sync_history_repair_dellien_royer(confirm: str = Query("")) -> Dict[str, Any
             "table": store.TABLE,
             "message": "Réparation refusée : ajoute confirm=YES.",
             "example": "/sync/history/repair-dellien-royer?confirm=YES",
-            "serviceVersion": "step33-yearly-history",
+            "serviceVersion": "step34-form-value-engine",
         }
     try:
         result = store.repair_dellien_royer_refuse()
-        result["serviceVersion"] = "step33-yearly-history"
+        result["serviceVersion"] = "step34-form-value-engine"
         return result
     except Exception as exc:
         return {
@@ -1267,7 +1404,7 @@ def sync_history_repair_dellien_royer(confirm: str = Query("")) -> Dict[str, Any
             "databaseConfigured": store.enabled,
             "table": store.TABLE,
             "error": f"{type(exc).__name__}: {exc}",
-            "serviceVersion": "step33-yearly-history",
+            "serviceVersion": "step34-form-value-engine",
         }
 
 
@@ -1284,14 +1421,14 @@ def sync_history_reset(category: str = Query("premium"), confirm: str = Query(""
             "category": cat,
             "message": "Reset refusé : ajoute confirm=YES.",
             "example": f"/sync/history/reset?category={cat.lower()}&confirm=YES",
-            "serviceVersion": "step33-yearly-history",
+            "serviceVersion": "step34-form-value-engine",
         }
     try:
         if cat == "ALL":
             result = store.reset_all()
         else:
             result = store.reset_category(cat)
-        result["serviceVersion"] = "step33-yearly-history"
+        result["serviceVersion"] = "step34-form-value-engine"
         return result
     except Exception as exc:
         return {
@@ -1300,7 +1437,7 @@ def sync_history_reset(category: str = Query("premium"), confirm: str = Query(""
             "table": store.TABLE,
             "category": cat,
             "error": f"{type(exc).__name__}: {exc}",
-            "serviceVersion": "step33-yearly-history",
+            "serviceVersion": "step34-form-value-engine",
         }
 
 
@@ -1316,11 +1453,11 @@ def sync_premium_reset(confirm: str = Query("")) -> Dict[str, Any]:
             "category": "PREMIUM",
             "message": "Reset refusé : ajoute ?confirm=YES pour vider l'historique PREMIUM uniquement.",
             "example": "/sync/premium/reset?confirm=YES",
-            "serviceVersion": "step33-yearly-history",
+            "serviceVersion": "step34-form-value-engine",
         }
     try:
         result = store.reset_category("PREMIUM")
-        result["serviceVersion"] = "step33-yearly-history"
+        result["serviceVersion"] = "step34-form-value-engine"
         return result
     except Exception as exc:
         return {
@@ -1329,7 +1466,7 @@ def sync_premium_reset(confirm: str = Query("")) -> Dict[str, Any]:
             "table": store.TABLE,
             "category": "PREMIUM",
             "error": f"{type(exc).__name__}: {exc}",
-            "serviceVersion": "step33-yearly-history",
+            "serviceVersion": "step34-form-value-engine",
         }
 
 
@@ -1339,7 +1476,7 @@ def sync_premium_run(day: str = Query("today"), dry_run: bool = Query(False)) ->
     daily_result = daily(target_day, auto_history=False)
     syncer = PremiumHistorySyncer(store=PostgresPremiumStore())
     result = syncer.sync_daily_result(daily_result, target_day, dry_run=dry_run)
-    result["serviceVersion"] = "step33-yearly-history"
+    result["serviceVersion"] = "step34-form-value-engine"
     return result
 
 
