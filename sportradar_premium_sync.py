@@ -497,7 +497,7 @@ class PremiumHistorySyncer:
                 "table": self.store.TABLE,
                 "status": self.store.status(),
             },
-            "policy": "Règlement strict STEP29 : pending -> win/loss via winner_id; retired/walkover/cancelled/abandoned -> void/remboursé, même si la ligne était déjà réglée.",
+            "policy": "Règlement strict STEP30 : pending -> win/loss via winner_id; retired/walkover/cancelled/abandoned -> void/remboursé, même si la ligne était déjà réglée.",
         }
 
     def settle_pending_recent(self, *, days_back: int = 7, dry_run: bool = False, client: Optional[SportradarClient] = None) -> Dict[str, Any]:
@@ -556,7 +556,7 @@ class PremiumHistorySyncer:
             "counts": counts,
             "dates": dates,
             "results": results,
-            "policy": "STEP29 : vérifie les dates récentes avec historique; pending -> win/loss et retired/walkover/cancelled/abandoned -> void/remboursé, même sur anciennes lignes déjà réglées.",
+            "policy": "STEP30 : vérifie les dates récentes avec historique; pending -> win/loss et retired/walkover/cancelled/abandoned -> void/remboursé, même sur anciennes lignes déjà réglées.",
         }
 
     def sync_daily_result(self, daily_result: Dict[str, Any], target_day: str, *, dry_run: bool = False) -> Dict[str, Any]:
@@ -608,16 +608,12 @@ class PremiumHistorySyncer:
             }
 
         # 1) Record all categorized engine outputs: Premium + Proches + Veto + Refusés.
-        # STEP29: dedupe raw daily payload by sport_event_id before writing history.
+        # STEP30: dedupe raw daily payload by sport_event_id before writing history.
         # One physical tennis match must create at most one history row.
+        # IMPORTANT: keep the FIRST engine pick seen for the event. Do not replace it
+        # with a later duplicate that has a slightly higher percentage.
         deduped_matches: List[Dict[str, Any]] = []
         seen_events: Dict[str, int] = {}
-
-        def _match_rank(m: Dict[str, Any]) -> tuple:
-            category = tracked_category(m)
-            cat_rank = {"PREMIUM": 4, "PROCHE": 3, "VETO": 2, "REFUSE": 1}.get(category, 0)
-            has_odds = 1 if _s(m.get("oddA") or m.get("playerAOdd") or m.get("coteA")) else 0
-            return (cat_rank, _premium_pct(m), has_odds)
 
         for m in matches:
             if not isinstance(m, dict):
@@ -630,10 +626,11 @@ class PremiumHistorySyncer:
                 seen_events[event_id] = len(deduped_matches)
                 deduped_matches.append(m)
                 continue
-            idx = seen_events[event_id]
+            # Duplicate physical match: keep the original/first row.
+            # This avoids flipping the pick when Sportradar/Flashscore returns
+            # the same event twice with reversed orientation.
             counts["deduped_input_matches"] += 1
-            if _match_rank(m) > _match_rank(deduped_matches[idx]):
-                deduped_matches[idx] = m
+            continue
 
         for match in deduped_matches:
             if not isinstance(match, dict):
@@ -679,7 +676,7 @@ class PremiumHistorySyncer:
                     counts["rows_added"] += 1
                 elif action == "updated":
                     counts["rows_updated"] += 1
-                elif action == "kept_settled":
+                elif action in {"kept_settled", "kept_existing_pick"}:
                     counts["rows_kept_settled"] += 1
             except Exception as exc:
                 errors.append(f"upsert failed: {type(exc).__name__}: {exc}")
@@ -770,5 +767,5 @@ class PremiumHistorySyncer:
                 "step": (daily_result.get("daily") or {}).get("step"),
                 "summary": daily_result.get("summary", {}),
             },
-            "policy": "Historique moteur STEP29 : Premium/Proches/Veto/Refusés; 1 ligne par match; retired/walkover/cancelled/abandoned -> void/remboursé; règlement win/loss via winner_id Sportradar.",
+            "policy": "Historique moteur STEP30 : Premium/Proches/Veto/Refusés; 1 ligne par match; retired/walkover/cancelled/abandoned -> void/remboursé; règlement win/loss via winner_id Sportradar.",
         }
