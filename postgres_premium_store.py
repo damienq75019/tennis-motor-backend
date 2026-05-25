@@ -73,7 +73,7 @@ def same_player(a: str, b: str) -> bool:
 def premium_history_key(day: str, sport_event_id: str, source_a: str, source_b: str, predicted: str = "") -> str:
     """Stable one-row-per-match history key.
 
-    STEP29:
+    STEP30:
     - With Sportradar event id: one row per date + event, regardless of pick/orientation.
     - Without event id: one row per date + normalized pair, regardless of pick/orientation.
     This prevents duplicated rows such as A-pick and B-pick for the same match.
@@ -363,7 +363,7 @@ class PostgresPremiumStore:
 
         with self._connect() as conn:
             with conn.cursor() as cur:
-                cur.execute(f"SELECT result FROM {self.TABLE} WHERE id = %s", (row_id,))
+                cur.execute(f"SELECT result, predicted_winner FROM {self.TABLE} WHERE id = %s", (row_id,))
                 existing = cur.fetchone()
                 incoming_result = normalize_result(row.get("result"))
 
@@ -372,6 +372,16 @@ class PostgresPremiumStore:
                 # that was previously settled as win/loss.
                 if existing and normalize_result(existing[0]) in FINAL_RESULTS and incoming_result == "pending":
                     return "kept_settled"
+
+                # STEP30: first pick wins. If the same sport_event_id comes back later
+                # with reversed orientation and a different predicted winner, do not flip
+                # the historical pick. This is what caused Dellien/Royer to keep Dellien
+                # instead of the first Royer pick.
+                if existing and normalize_result(existing[0]) == "pending" and incoming_result == "pending":
+                    existing_predicted = _s(existing[1] if len(existing) > 1 else "")
+                    incoming_predicted = _s(row.get("predictedWinner"))
+                    if existing_predicted and incoming_predicted and not same_player(existing_predicted, incoming_predicted):
+                        return "kept_existing_pick"
 
                 params = (
                     row_id,
@@ -507,7 +517,7 @@ class PostgresPremiumStore:
     def history_dates(self, days_back: int = 7, limit: int = 60, category: Optional[str] = None) -> List[str]:
         """Dates with any history rows in the recent window.
 
-        Used by STEP29 auto-settle so old win/loss rows can still be corrected to void
+        Used by STEP30 auto-settle so old win/loss rows can still be corrected to void
         when Sportradar later reports retired/walkover/cancelled.
         """
         self.ensure_schema()
@@ -620,7 +630,7 @@ class PostgresPremiumStore:
         """Collapse legacy duplicate rows to one row per date + sport_event_id.
 
         Older STEP25 ids included __pick_<player>, which allowed one match to appear twice.
-        STEP29 keeps one canonical id: YYYY-MM-DD__sr:sport_event:...
+        STEP30 keeps one canonical id: YYYY-MM-DD__sr:sport_event:...
         """
         self.ensure_schema()
         where, params = category_where(category)
@@ -688,7 +698,7 @@ class PostgresPremiumStore:
             "duplicateGroups": len(groups),
             "deletedRows": deleted,
             "canonicalizedRows": canonicalized,
-            "policy": "STEP29 one row per date + sport_event_id.",
+            "policy": "STEP30 one row per date + sport_event_id.",
         }
 
     def settle_pending_by_event(self, sport_event_id: str, real_winner: str, score: str, winner_id: str, *, source: str = "sportradar") -> int:
@@ -755,6 +765,135 @@ class PostgresPremiumStore:
                 changed = int(cur.rowcount or 0)
             conn.commit()
         return changed
+
+
+    def repair_dellien_royer_refuse(self) -> Dict[str, Any]:
+        """One-time safe repair for the 2026-05-24 Dellien/Royer duplicate.
+
+        STEP30: the duplicate cleanup previously kept the later/wrong Dellien pick
+        because it sorted by premium_pct. The correct first pick was Royer.
+        This repair updates the canonical REFUSE row to the Royer pick and win.
+        """
+        self.ensure_schema()
+        day = "2026-05-24"
+        event_id = "sr:sport_event:71664880"
+        cat = "REFUSE"
+        canonical_id = premium_history_key(day, event_id, "Dellien, Hugo", "Royer, Valentin", "Royer, Valentin")
+
+        before: List[Dict[str, Any]] = []
+        after: List[Dict[str, Any]] = []
+        deleted = 0
+        updated = 0
+
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    f"""
+                    SELECT id, predicted_winner, opponent, result, real_winner, premium_pct,
+                           odd_predicted, odd_opponent, score
+                    FROM {self.TABLE}
+                    WHERE date = %s AND sport_event_id = %s AND UPPER(COALESCE(status, '')) = %s
+                    ORDER BY created_at ASC, updated_at ASC
+                    """,
+                    (day, event_id, cat),
+                )
+                cols = [desc[0] for desc in cur.description]
+                before = [dict(zip(cols, row)) for row in cur.fetchall()]
+
+                if not before:
+                    return {
+                        "status": "not_found",
+                        "message": "Aucune ligne Dellien/Royer trouvée dans REFUSE.",
+                        "date": day,
+                        "sportEventId": event_id,
+                        "category": cat,
+                    }
+
+                # If the canonical id is missing, canonicalize the oldest row first.
+                ids = [str(r.get("id")) for r in before]
+                if canonical_id not in ids:
+                    keep_id = ids[0]
+                    cur.execute(f"UPDATE {self.TABLE} SET id = %s WHERE id = %s", (canonical_id, keep_id))
+                    updated += int(cur.rowcount or 0)
+
+                # Remove any remaining legacy duplicate rows for this same event/category.
+                cur.execute(
+                    f"""
+                    DELETE FROM {self.TABLE}
+                    WHERE date = %s AND sport_event_id = %s AND UPPER(COALESCE(status, '')) = %s
+                      AND id <> %s
+                    """,
+                    (day, event_id, cat, canonical_id),
+                )
+                deleted += int(cur.rowcount or 0)
+
+                cur.execute(
+                    f"""
+                    UPDATE {self.TABLE}
+                    SET source_player_a = %s,
+                        source_player_b = %s,
+                        predicted_winner = %s,
+                        opponent = %s,
+                        premium_pct = %s,
+                        result = %s,
+                        real_winner = %s,
+                        settled_at = %s,
+                        settle_source = %s,
+                        score = %s,
+                        winner_id = %s,
+                        odd_predicted = %s,
+                        odd_opponent = %s,
+                        sportradar_player_a_id = %s,
+                        sportradar_player_b_id = %s,
+                        updated_at = NOW()
+                    WHERE id = %s
+                    """,
+                    (
+                        "Dellien, Hugo",
+                        "Royer, Valentin",
+                        "Royer, Valentin",
+                        "Dellien, Hugo",
+                        55.7,
+                        "win",
+                        "Royer, Valentin",
+                        "2026-05-24",
+                        "manual_step30_correct_first_pick",
+                        "4-6 2-6 2-6",
+                        "sr:competitor:341220",
+                        "2.3",
+                        "1.65",
+                        "sr:competitor:341220",
+                        "sr:competitor:57289",
+                        canonical_id,
+                    ),
+                )
+                updated += int(cur.rowcount or 0)
+
+                cur.execute(
+                    f"""
+                    SELECT id, predicted_winner, opponent, result, real_winner, premium_pct,
+                           odd_predicted, odd_opponent, score
+                    FROM {self.TABLE}
+                    WHERE id = %s
+                    """,
+                    (canonical_id,),
+                )
+                cols = [desc[0] for desc in cur.description]
+                after = [dict(zip(cols, row)) for row in cur.fetchall()]
+            conn.commit()
+
+        return {
+            "status": "ok",
+            "repair": "dellien_royer_refuse_first_pick",
+            "date": day,
+            "sportEventId": event_id,
+            "category": cat,
+            "deletedDuplicateRows": deleted,
+            "updatedRows": updated,
+            "before": before,
+            "after": after,
+            "policy": "Correctif manuel STEP30 : le premier pick historique était Royer, pas Dellien.",
+        }
 
 
     def reset_category(self, category: str) -> Dict[str, Any]:
