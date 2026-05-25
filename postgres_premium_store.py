@@ -50,10 +50,19 @@ def same_player(a: str, b: str) -> bool:
 
 
 def premium_history_key(day: str, sport_event_id: str, source_a: str, source_b: str, predicted: str) -> str:
+    """Stable match key for categorized history.
+
+    IMPORTANT STEP28:
+    The historical key must identify the match, not the selected player.
+    Older versions added __pick_<player>, which could create duplicates when the same
+    match was processed again with a different orientation/pick. The predicted
+    argument is kept for backward compatibility with existing calls, but it is no
+    longer part of the identifier.
+    """
     if sport_event_id:
-        return f"{day}__{sport_event_id}__pick_{_canon(predicted)}"
+        return f"{day}__{sport_event_id}"
     pair = sorted([_canon(source_a), _canon(source_b)])
-    return f"{day}__{pair[0]}__{pair[1]}__pick_{_canon(predicted)}"
+    return f"{day}__{pair[0]}__{pair[1]}"
 
 
 def today_paris() -> date:
@@ -242,6 +251,8 @@ class PostgresPremiumStore:
                 wins = int(cur.fetchone()[0] or 0)
                 cur.execute(f"SELECT COUNT(*) FROM {self.TABLE} WHERE result = 'loss'{where}", tuple(params))
                 losses = int(cur.fetchone()[0] or 0)
+                cur.execute(f"SELECT COUNT(*) FROM {self.TABLE} WHERE result IN ('void', 'refunded', 'cancelled', 'canceled', 'abandoned', 'retired'){where}", tuple(params))
+                voids = int(cur.fetchone()[0] or 0)
 
                 cur.execute(f"SELECT UPPER(COALESCE(status, 'PREMIUM')), COUNT(*) FROM {self.TABLE} GROUP BY UPPER(COALESCE(status, 'PREMIUM'))")
                 by_status_all = {str(k or "PREMIUM").upper(): int(v or 0) for k, v in cur.fetchall()}
@@ -262,6 +273,9 @@ class PostgresPremiumStore:
             "pending": pending,
             "wins": wins,
             "losses": losses,
+            "void": voids,
+            "voids": voids,
+            "refunded": voids,
             "settled": wins + losses,
         }
 
@@ -332,7 +346,30 @@ class PostgresPremiumStore:
             with conn.cursor() as cur:
                 cur.execute(f"SELECT result FROM {self.TABLE} WHERE id = %s", (row_id,))
                 existing = cur.fetchone()
-                if existing and _s(existing[0]) in {"win", "loss"}:
+
+                # STEP28 anti-doublon : if an older row exists for the same match
+                # with the previous __pick_<player> id format, update that row instead
+                # of inserting a duplicate. A match belongs to one category only; if the
+                # category is recalculated, the row status is updated.
+                if not existing:
+                    event_id_for_lookup = _s(row.get("sportradarSportEventId"))
+                    date_for_lookup = _s(row.get("date"))
+                    if event_id_for_lookup:
+                        cur.execute(
+                            f"""
+                            SELECT id, result FROM {self.TABLE}
+                            WHERE date = %s AND sport_event_id = %s
+                            ORDER BY updated_at DESC, created_at DESC
+                            LIMIT 1
+                            """,
+                            (date_for_lookup, event_id_for_lookup),
+                        )
+                        match_existing = cur.fetchone()
+                        if match_existing:
+                            row_id = _s(match_existing[0])
+                            existing = (match_existing[1],)
+
+                if existing and _s(existing[0]) in {"win", "loss", "void", "refunded", "cancelled", "canceled", "abandoned", "retired"}:
                     return "kept_settled"
 
                 params = (
@@ -472,11 +509,31 @@ class PostgresPremiumStore:
                 )
                 return [_s(row[0]) for row in cur.fetchall() if _s(row[0])]
 
-    def settle_pending_by_event(self, sport_event_id: str, real_winner: str, score: str, winner_id: str, *, source: str = "sportradar") -> int:
-        if not sport_event_id or not real_winner:
+    def _settle_result_for_prediction(self, predicted: str, real_winner: str) -> str:
+        return "win" if same_player(_s(predicted), _s(real_winner)) else "loss"
+
+    def settle_pending_by_event(
+        self,
+        sport_event_id: str,
+        real_winner: str,
+        score: str,
+        winner_id: str,
+        *,
+        source: str = "sportradar",
+        result_override: Optional[str] = None,
+    ) -> int:
+        if not sport_event_id:
+            return 0
+        if not real_winner and not result_override:
             return 0
         self.ensure_schema()
         changed = 0
+        override = _s(result_override).lower()
+        if override in {"refund", "refunded", "cancelled", "canceled", "abandoned", "retired"}:
+            override = "void"
+        if override and override not in {"win", "loss", "void"}:
+            override = "void"
+
         with self._connect() as conn:
             with conn.cursor() as cur:
                 cur.execute(
@@ -488,7 +545,7 @@ class PostgresPremiumStore:
                 )
                 rows = cur.fetchall()
                 for row_id, predicted in rows:
-                    result = "win" if same_player(_s(predicted), real_winner) else "loss"
+                    result = override or self._settle_result_for_prediction(_s(predicted), real_winner)
                     cur.execute(
                         f"""
                         UPDATE {self.TABLE}
@@ -507,10 +564,45 @@ class PostgresPremiumStore:
             conn.commit()
         return changed
 
-    def settle_pending_by_id(self, row_id: str, real_winner: str, score: str, winner_id: str, *, source: str = "sportradar-name-fallback") -> int:
-        if not row_id or not real_winner:
+    def void_pending_by_event(
+        self,
+        sport_event_id: str,
+        real_winner: str = "",
+        score: str = "",
+        winner_id: str = "",
+        *,
+        source: str = "sportradar_void",
+    ) -> int:
+        return self.settle_pending_by_event(
+            sport_event_id,
+            real_winner,
+            score,
+            winner_id,
+            source=source,
+            result_override="void",
+        )
+
+    def settle_pending_by_id(
+        self,
+        row_id: str,
+        real_winner: str,
+        score: str,
+        winner_id: str,
+        *,
+        source: str = "sportradar-name-fallback",
+        result_override: Optional[str] = None,
+    ) -> int:
+        if not row_id:
+            return 0
+        if not real_winner and not result_override:
             return 0
         self.ensure_schema()
+        override = _s(result_override).lower()
+        if override in {"refund", "refunded", "cancelled", "canceled", "abandoned", "retired"}:
+            override = "void"
+        if override and override not in {"win", "loss", "void"}:
+            override = "void"
+
         with self._connect() as conn:
             with conn.cursor() as cur:
                 cur.execute(f"SELECT predicted_winner FROM {self.TABLE} WHERE id = %s AND result = 'pending'", (row_id,))
@@ -518,7 +610,7 @@ class PostgresPremiumStore:
                 if not row:
                     return 0
                 predicted = _s(row[0])
-                result = "win" if same_player(predicted, real_winner) else "loss"
+                result = override or self._settle_result_for_prediction(predicted, real_winner)
                 cur.execute(
                     f"""
                     UPDATE {self.TABLE}
@@ -625,10 +717,11 @@ def stats_for_period(rows: List[Dict[str, Any]], period_days: Optional[int], cat
             continue
         selected.append(row)
 
-    settled = [r for r in selected if r.get("result") in {"win", "loss"}]
-    wins = sum(1 for r in settled if r.get("result") == "win")
-    losses = sum(1 for r in settled if r.get("result") == "loss")
-    pending = sum(1 for r in selected if r.get("result") == "pending")
+    settled = [r for r in selected if _s(r.get("result")).lower() in {"win", "loss"}]
+    wins = sum(1 for r in settled if _s(r.get("result")).lower() == "win")
+    losses = sum(1 for r in settled if _s(r.get("result")).lower() == "loss")
+    pending = sum(1 for r in selected if _s(r.get("result")).lower() == "pending")
+    voids = sum(1 for r in selected if _s(r.get("result")).lower() in {"void", "refunded", "cancelled", "canceled", "abandoned", "retired"})
     total = wins + losses
     win_rate = round((wins / total) * 100.0, 2) if total else 0.0
 
@@ -650,6 +743,9 @@ def stats_for_period(rows: List[Dict[str, Any]], period_days: Optional[int], cat
         "wins": wins,
         "losses": losses,
         "pending": pending,
+        "void": voids,
+        "voids": voids,
+        "refunded": voids,
         "winRate": win_rate,
         "profitUnits": round(profit_units, 3),
         "roiPct": roi,
@@ -671,6 +767,9 @@ def build_premium_summary(rows: List[Dict[str, Any]], category: Optional[str] = 
             "wins": 0,
             "losses": 0,
             "pending": 0,
+            "void": 0,
+            "voids": 0,
+            "refunded": 0,
             "winRate": 0.0,
             "profitUnits": 0.0,
             "profitEur": 0.0,
@@ -679,7 +778,7 @@ def build_premium_summary(rows: List[Dict[str, Any]], category: Optional[str] = 
             "category": cat,
         })
         odd = _f(row.get("oddPredicted"), 0.0)
-        result = row.get("result")
+        result = _s(row.get("result")).lower()
         if result == "win":
             bucket["wins"] += 1
             bucket["hadPremiumSettledToday"] = True
@@ -692,6 +791,10 @@ def build_premium_summary(rows: List[Dict[str, Any]], category: Optional[str] = 
             if odd > 1.0:
                 bucket["profitUnits"] -= 1.0
             bucket["profitEur"] -= STAKE_EUR
+        elif result in {"void", "refunded", "cancelled", "canceled", "abandoned", "retired"}:
+            bucket["void"] += 1
+            bucket["voids"] += 1
+            bucket["refunded"] += 1
         else:
             bucket["pending"] += 1
 
@@ -722,6 +825,8 @@ def build_premium_summary(rows: List[Dict[str, Any]], category: Optional[str] = 
             "cumulativeProfitUnits": round(cpu, 3),
             "cumulativeProfitEur": round(cpe, 2),
             "pendingThatDay": int(bucket.get("pending") or 0),
+            "voidThatDay": int(bucket.get("void") or bucket.get("voids") or 0),
+            "refundedThatDay": int(bucket.get("refunded") or 0),
             "hadPremiumToday": bool(bucket.get("hadPremiumToday", False)),
             "hadPremiumSettledToday": bool(bucket.get("hadPremiumSettledToday", False)),
             "category": cat,
