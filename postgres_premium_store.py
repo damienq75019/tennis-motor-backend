@@ -1,774 +1,987 @@
 from __future__ import annotations
 
-from datetime import datetime
-from typing import Any, Dict, List, Optional
+import json
+import os
+import re
+import unicodedata
+from datetime import date, datetime, timedelta
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
-from postgres_premium_store import PostgresPremiumStore, premium_history_key
-from sportradar_client import SportradarClient, SportradarError
+STAKE_EUR = 100.0
+
+VOID_RESULTS = {"void", "refunded", "refund", "cancelled", "canceled", "abandoned", "retired", "walkover", "withdrawn", "forfeit"}
+SETTLED_RESULTS = {"win", "loss"}
+FINAL_RESULTS = SETTLED_RESULTS | VOID_RESULTS
+
+
+def normalize_result(value: Any) -> str:
+    raw = _s(value).lower()
+    if raw in {"won", "winner", "w"}:
+        return "win"
+    if raw in {"lost", "loser", "l"}:
+        return "loss"
+    if raw in VOID_RESULTS:
+        return "void"
+    if raw in {"pending", ""}:
+        return "pending"
+    return raw
+
+
+def is_void_result(value: Any) -> bool:
+    return normalize_result(value) == "void"
 
 
 def _s(value: Any) -> str:
     return str(value or "").strip()
 
 
-def _premium_pct(match: Dict[str, Any]) -> float:
+def _f(value: Any, default: float = 0.0) -> float:
     try:
-        value = match.get("premiumPct", match.get("premium", 0.0))
-        score = float(str(value).replace(",", "."))
-        if 0.0 <= score <= 1.0:
-            score *= 100.0
-        return score
+        if value is None or value == "":
+            return default
+        return float(str(value).replace(",", ".").strip())
     except Exception:
-        return 0.0
+        return default
 
 
-def _is_veto(match: Dict[str, Any]) -> bool:
-    return _s(match.get("veto")).lower() in {"oui", "yes", "true", "1"}
+def _canon(value: Any) -> str:
+    text = _s(value).lower()
+    text = unicodedata.normalize("NFKD", text)
+    text = "".join(ch for ch in text if not unicodedata.combining(ch))
+    text = re.sub(r"[^a-z0-9]+", " ", text)
+    return re.sub(r"\s+", " ", text).strip()
 
 
-def _is_not_analyzable(match: Dict[str, Any]) -> bool:
-    return bool(match.get("nonAnalyzable")) or _s(match.get("analysisStatus")).lower() == "not_analyzed" or bool(match.get("error"))
-
-
-def is_premium_jouable(match: Dict[str, Any]) -> bool:
-    if not isinstance(match, dict):
+def same_player(a: str, b: str) -> bool:
+    na = _canon(a)
+    nb = _canon(b)
+    if not na or not nb:
         return False
-    if _is_not_analyzable(match) or _is_veto(match):
-        return False
-    if _premium_pct(match) < 80.0:
-        return False
-    decision = _s(match.get("decision")).lower()
-    if "pas jouable" in decision or "refus" in decision or "non analys" in decision:
-        return False
-    return True
-
-
-def is_proche_jouable(match: Dict[str, Any]) -> bool:
-    if not isinstance(match, dict):
-        return False
-    if _is_not_analyzable(match) or _is_veto(match):
-        return False
-    pct = _premium_pct(match)
-    return 75.0 <= pct < 80.0
-
-
-
-def _status_values(match: Dict[str, Any]) -> List[str]:
-    values = [
-        match.get("status"),
-        match.get("sportradarStatus"),
-        match.get("matchStatus"),
-        match.get("sportradarMatchStatus"),
-    ]
-    raw = match.get("raw")
-    if isinstance(raw, dict):
-        values.extend([
-            raw.get("status"),
-            raw.get("sportradarStatus"),
-            raw.get("matchStatus"),
-            raw.get("sportradarMatchStatus"),
-        ])
-    return [_s(v).lower() for v in values if _s(v)]
-
-
-def _is_void_match(match: Dict[str, Any]) -> bool:
-    """Betting settlement safety: retired/walkover/cancelled/abandoned = void/refund."""
-    statuses = set(_status_values(match))
-    void_tokens = {"retired", "walkover", "abandoned", "cancelled", "canceled", "withdrawn", "forfeit", "forfeited"}
-    if statuses.intersection(void_tokens):
+    if na == nb:
         return True
-
-    # Some providers encode retirement in generic text fields.
-    blob = " ".join(_s(match.get(k)).lower() for k in ("reason", "statusReason", "matchStatusReason", "score"))
-    return any(token in blob for token in ("retired", "walkover", "abandoned", "cancelled", "canceled", "withdrawn"))
-
-
-def _summary_is_void(summary: Dict[str, Any]) -> bool:
-    status = _get_status(summary)
-    values = [
-        status.get("status"),
-        status.get("match_status"),
-        status.get("status_reason"),
-        status.get("match_status_reason"),
-    ]
-    blob = " ".join(_s(v).lower() for v in values if _s(v))
-    return any(token in blob for token in ("retired", "walkover", "abandoned", "cancelled", "canceled", "withdrawn", "forfeit"))
+    pa = na.split()
+    pb = nb.split()
+    if not pa or not pb:
+        return False
+    if len(pa[-1]) >= 4 and pa[-1] == pb[-1]:
+        return True
+    if set(pa) == set(pb):
+        return True
+    return False
 
 
-def _is_cancelled_before_play(match: Dict[str, Any]) -> bool:
-    statuses = set(_status_values(match))
-    return bool(statuses.intersection({"cancelled", "canceled"})) and not _s(match.get("winnerId"))
+def premium_history_key(day: str, sport_event_id: str, source_a: str, source_b: str, predicted: str = "") -> str:
+    """Stable one-row-per-match history key.
 
-def tracked_category(match: Dict[str, Any]) -> str:
-    """Catégorie historique moteur.
-
-    PREMIUM : score >= 80, jouable, sans veto.
-    PROCHE  : 75 <= score < 80, sans veto.
-    VETO    : match analysé mais bloqué par veto moteur.
-    REFUSE  : match analysé, sans veto, sous 75 ou refusé sans veto.
+    STEP29:
+    - With Sportradar event id: one row per date + event, regardless of pick/orientation.
+    - Without event id: one row per date + normalized pair, regardless of pick/orientation.
+    This prevents duplicated rows such as A-pick and B-pick for the same match.
     """
-    if not isinstance(match, dict):
-        return ""
-    if _is_not_analyzable(match):
-        return ""
-    if _is_veto(match):
-        return "VETO"
-    if is_premium_jouable(match):
+    if sport_event_id:
+        return f"{day}__{sport_event_id}"
+    pair = sorted([_canon(source_a), _canon(source_b)])
+    return f"{day}__{pair[0]}__{pair[1]}"
+
+
+def today_paris() -> date:
+    try:
+        from zoneinfo import ZoneInfo
+        return datetime.now(ZoneInfo("Europe/Paris")).date()
+    except Exception:
+        return date.today()
+
+
+def parse_date(value: Any) -> Optional[date]:
+    try:
+        return date.fromisoformat(str(value))
+    except Exception:
+        return None
+
+
+VALID_HISTORY_CATEGORIES = {"PREMIUM", "PROCHE", "VETO", "REFUSE"}
+
+
+def normalize_category(value: Any, default: str = "PREMIUM") -> str:
+    raw = _s(value).upper()
+    raw = raw.replace("É", "E").replace("È", "E").replace("Ê", "E")
+    raw = raw.replace(" ", "_").replace("-", "_")
+    if raw in {"PREMIUM", "PREM"}:
         return "PREMIUM"
-    if is_proche_jouable(match):
+    if raw in {"PROCHE", "PROCHES"}:
         return "PROCHE"
-    return "REFUSE"
+    if raw in {"VETO", "VETOES"}:
+        return "VETO"
+    if raw in {"REFUSE", "REFUS", "REFUSES", "REFUSED", "REFUSE_SANS_VETO", "REFUSES_SANS_VETO"}:
+        return "REFUSE"
+    if raw in {"ALL", "TOUT", "*"}:
+        return "ALL"
+    return default
 
 
-def _is_finished(match: Dict[str, Any]) -> bool:
-    winner_id = _s(match.get("winnerId"))
-    if not winner_id:
-        return False
-    status = _s(match.get("status") or match.get("sportradarStatus")).lower()
-    match_status = _s(match.get("matchStatus") or match.get("sportradarMatchStatus")).lower()
-    return status in {"closed", "ended", "finished", "complete", "completed"} or match_status in {"ended", "finished", "complete", "completed", "retired"}
+def category_where(category: Any, column: str = "status") -> Tuple[str, List[Any]]:
+    cat = normalize_category(category, default="ALL")
+    if cat == "ALL":
+        return "", []
+    return f" AND UPPER(COALESCE({column}, 'PREMIUM')) = %s", [cat]
 
 
-def _winner_name_from_match(match: Dict[str, Any]) -> str:
-    winner_id = _s(match.get("winnerId"))
-    a_id = _s(match.get("sportradarPlayerAId"))
-    b_id = _s(match.get("sportradarPlayerBId"))
-    if winner_id and a_id and winner_id == a_id:
-        return _s(match.get("playerA"))
-    if winner_id and b_id and winner_id == b_id:
-        return _s(match.get("playerB"))
-    return ""
+def row_category(row: Dict[str, Any]) -> str:
+    return normalize_category(row.get("status") or row.get("category"), default="PREMIUM")
 
 
-def _get_event(summary: Dict[str, Any]) -> Dict[str, Any]:
-    return summary.get("sport_event") or {}
+def category_label(category: Any) -> str:
+    cat = normalize_category(category)
+    labels = {
+        "PREMIUM": "Premium",
+        "PROCHE": "Proches",
+        "VETO": "Veto",
+        "REFUSE": "Refusés",
+        "ALL": "Toutes catégories",
+    }
+    return labels.get(cat, cat)
 
 
-def _get_status(summary: Dict[str, Any]) -> Dict[str, Any]:
-    return summary.get("sport_event_status") or {}
+class PostgresPremiumStore:
+    """Persistent categorized pick history for Tennis Motor.
+
+    Physical table kept as tennis_premium_history for zero data loss.
+    Logical STEP25 model: PREMIUM / PROCHE / VETO / REFUSE categories.
+    """
+
+    TABLE = os.environ.get("TENNIS_MOTOR_HISTORY_TABLE", "tennis_premium_history")
+
+    def __init__(self, database_url: Optional[str] = None) -> None:
+        self.database_url = (database_url or os.environ.get("DATABASE_URL") or "").strip()
+
+    @property
+    def enabled(self) -> bool:
+        return bool(self.database_url)
+
+    def _connect(self):
+        if not self.enabled:
+            raise RuntimeError("DATABASE_URL absente")
+        try:
+            import psycopg
+        except Exception as exc:
+            raise RuntimeError("Dépendance PostgreSQL manquante. Ajoute psycopg[binary] dans requirements.txt.") from exc
+        return psycopg.connect(self.database_url, connect_timeout=10)
+
+    def ensure_schema(self) -> None:
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    f"""
+                    CREATE TABLE IF NOT EXISTS {self.TABLE} (
+                        id TEXT PRIMARY KEY,
+                        date TEXT NOT NULL,
+                        sport_event_id TEXT,
+                        source TEXT NOT NULL DEFAULT 'sportradar',
+                        source_player_a TEXT NOT NULL,
+                        source_player_b TEXT NOT NULL,
+                        predicted_winner TEXT NOT NULL,
+                        opponent TEXT NOT NULL,
+                        surface TEXT,
+                        premium_pct DOUBLE PRECISION NOT NULL DEFAULT 0,
+                        status TEXT NOT NULL DEFAULT 'PREMIUM',
+                        veto TEXT,
+                        decision TEXT,
+                        odd_predicted TEXT,
+                        odd_opponent TEXT,
+                        odds_source TEXT,
+                        result TEXT NOT NULL DEFAULT 'pending',
+                        real_winner TEXT,
+                        settled_at TEXT,
+                        settle_source TEXT,
+                        tournament TEXT,
+                        season_name TEXT,
+                        round TEXT,
+                        start_time TEXT,
+                        score TEXT,
+                        winner_id TEXT,
+                        sportradar_player_a_id TEXT,
+                        sportradar_player_b_id TEXT,
+                        raw_json TEXT NOT NULL,
+                        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                    )
+                    """
+                )
+                cur.execute(
+                    f"""
+                    CREATE INDEX IF NOT EXISTS idx_{self.TABLE}_date ON {self.TABLE}(date)
+                    """
+                )
+                cur.execute(
+                    f"""
+                    CREATE INDEX IF NOT EXISTS idx_{self.TABLE}_result ON {self.TABLE}(result)
+                    """
+                )
+                cur.execute(
+                    f"""
+                    CREATE INDEX IF NOT EXISTS idx_{self.TABLE}_sport_event_id ON {self.TABLE}(sport_event_id)
+                    """
+                )
+                cur.execute(
+                    f"""
+                    CREATE INDEX IF NOT EXISTS idx_{self.TABLE}_status ON {self.TABLE}(status)
+                    """
+                )
+            conn.commit()
+
+    def status(self) -> Dict[str, Any]:
+        if not self.enabled:
+            return {
+                "databaseConfigured": False,
+                "databaseStatus": "not_configured",
+                "table": self.TABLE,
+                "error": "DATABASE_URL absente dans le service web.",
+            }
+        try:
+            self.ensure_schema()
+            counts = self.counts()
+            return {
+                "status": "ok",
+                "databaseConfigured": True,
+                "databaseStatus": "ok",
+                "table": self.TABLE,
+                "counts": counts,
+                "policy": "PostgreSQL persistent store for Premium history, separate from Elo/results2026",
+            }
+        except Exception as exc:
+            return {
+                "status": "error",
+                "databaseConfigured": True,
+                "databaseStatus": "error",
+                "table": self.TABLE,
+                "error": f"{type(exc).__name__}: {exc}",
+            }
+
+    def counts(self, category: Optional[str] = None) -> Dict[str, Any]:
+        self.ensure_schema()
+        where, params = category_where(category)
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(f"SELECT COUNT(*) FROM {self.TABLE} WHERE 1=1{where}", tuple(params))
+                total = int(cur.fetchone()[0] or 0)
+                cur.execute(f"SELECT COUNT(*) FROM {self.TABLE} WHERE result = 'pending'{where}", tuple(params))
+                pending = int(cur.fetchone()[0] or 0)
+                cur.execute(f"SELECT COUNT(*) FROM {self.TABLE} WHERE result = 'win'{where}", tuple(params))
+                wins = int(cur.fetchone()[0] or 0)
+                cur.execute(f"SELECT COUNT(*) FROM {self.TABLE} WHERE result = 'loss'{where}", tuple(params))
+                losses = int(cur.fetchone()[0] or 0)
+                cur.execute(f"SELECT COUNT(*) FROM {self.TABLE} WHERE result IN ('void','refunded','refund','cancelled','canceled','abandoned','retired','walkover','withdrawn','forfeit'){where}", tuple(params))
+                voids = int(cur.fetchone()[0] or 0)
+
+                cur.execute(f"SELECT UPPER(COALESCE(status, 'PREMIUM')), COUNT(*) FROM {self.TABLE} GROUP BY UPPER(COALESCE(status, 'PREMIUM'))")
+                by_status_all = {str(k or "PREMIUM").upper(): int(v or 0) for k, v in cur.fetchall()}
+
+                cur.execute(f"SELECT UPPER(COALESCE(status, 'PREMIUM')), COUNT(*) FROM {self.TABLE} WHERE 1=1{where} GROUP BY UPPER(COALESCE(status, 'PREMIUM'))", tuple(params))
+                by_status_selected = {str(k or "PREMIUM").upper(): int(v or 0) for k, v in cur.fetchall()}
+
+        selected_cat = normalize_category(category, default="ALL")
+        return {
+            "category": selected_cat,
+            "total": total,
+            "premium": int(by_status_selected.get("PREMIUM", 0)) if selected_cat != "ALL" else int(by_status_all.get("PREMIUM", 0)),
+            "proches": int(by_status_selected.get("PROCHE", 0)) if selected_cat != "ALL" else int(by_status_all.get("PROCHE", 0)),
+            "veto": int(by_status_selected.get("VETO", 0)) if selected_cat != "ALL" else int(by_status_all.get("VETO", 0)),
+            "refuse": int(by_status_selected.get("REFUSE", 0)) if selected_cat != "ALL" else int(by_status_all.get("REFUSE", 0)),
+            "byStatus": by_status_selected,
+            "byStatusAll": by_status_all,
+            "pending": pending,
+            "wins": wins,
+            "losses": losses,
+            "void": voids,
+            "voids": voids,
+            "refunded": voids,
+            "settled": wins + losses,
+        }
 
 
-def _summary_event_id(summary: Dict[str, Any]) -> str:
-    return _s(_get_event(summary).get("id"))
-
-
-def _summary_winner_id(summary: Dict[str, Any]) -> str:
-    return _s(_get_status(summary).get("winner_id"))
-
-
-def _summary_is_finished(summary: Dict[str, Any]) -> bool:
-    winner_id = _summary_winner_id(summary)
-    if not winner_id:
-        return False
-    status = _s(_get_status(summary).get("status")).lower()
-    match_status = _s(_get_status(summary).get("match_status")).lower()
-    return status in {"closed", "ended", "finished", "complete", "completed"} or match_status in {"ended", "finished", "complete", "completed", "retired"}
-
-
-def _summary_competitors(summary: Dict[str, Any]) -> List[Dict[str, str]]:
-    raw = _get_event(summary).get("competitors") or []
-    out: List[Dict[str, str]] = []
-    if not isinstance(raw, list):
+    def fetch_rows(self, limit: Optional[int] = None, category: Optional[str] = None) -> List[Dict[str, Any]]:
+        self.ensure_schema()
+        sql = f"""
+            SELECT id, date, sport_event_id, source_player_a, source_player_b,
+                   predicted_winner, opponent, surface, premium_pct, status, veto,
+                   decision, odd_predicted, odd_opponent, odds_source, result,
+                   real_winner, settled_at, settle_source, tournament, season_name,
+                   round, start_time, score, winner_id, sportradar_player_a_id,
+                   sportradar_player_b_id, raw_json
+            FROM {self.TABLE}
+            WHERE 1=1
+        """
+        where, params_list = category_where(category)
+        sql += where
+        sql += " ORDER BY date DESC, created_at DESC"
+        if limit is not None:
+            sql += " LIMIT %s"
+            params_list.append(int(limit))
+        params: Tuple[Any, ...] = tuple(params_list)
+        out: List[Dict[str, Any]] = []
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(sql, params)
+                cols = [desc[0] for desc in cur.description]
+                for db_row in cur.fetchall():
+                    row = dict(zip(cols, db_row))
+                    raw_json = row.pop("raw_json", "")
+                    try:
+                        raw = json.loads(raw_json) if raw_json else {}
+                    except Exception:
+                        raw = {}
+                    row["raw"] = raw
+                    # Backward-compatible field names for Unity/history screens.
+                    row["sourcePlayerA"] = row.pop("source_player_a")
+                    row["sourcePlayerB"] = row.pop("source_player_b")
+                    row["predictedWinner"] = row.pop("predicted_winner")
+                    row["premiumPct"] = row.pop("premium_pct")
+                    row["oddPredicted"] = row.pop("odd_predicted")
+                    row["oddOpponent"] = row.pop("odd_opponent")
+                    row["oddsSource"] = row.pop("odds_source")
+                    row["realWinner"] = row.pop("real_winner")
+                    row["settledAt"] = row.pop("settled_at")
+                    row["settleSource"] = row.pop("settle_source")
+                    row["seasonName"] = row.pop("season_name")
+                    row["startTime"] = row.pop("start_time")
+                    row["winnerId"] = row.pop("winner_id")
+                    row["sportradarSportEventId"] = row.pop("sport_event_id")
+                    row["sportradarPlayerAId"] = row.pop("sportradar_player_a_id")
+                    row["sportradarPlayerBId"] = row.pop("sportradar_player_b_id")
+                    out.append(row)
         return out
-    for item in raw:
-        if not isinstance(item, dict):
-            continue
-        comp = item.get("competitor") if isinstance(item.get("competitor"), dict) else item
-        if not isinstance(comp, dict):
-            continue
-        out.append({
-            "id": _s(comp.get("id")),
-            "name": _s(comp.get("name")),
-            "qualifier": _s(item.get("qualifier") or comp.get("qualifier")),
-        })
-    return out
 
+    def upsert_premium_row(self, row: Dict[str, Any]) -> str:
+        """Insert/update a Premium row without overwriting a settled result.
 
-def _summary_winner_name(summary: Dict[str, Any]) -> str:
-    winner_id = _summary_winner_id(summary)
-    if not winner_id:
-        return ""
-    for comp in _summary_competitors(summary):
-        if comp.get("id") == winner_id:
-            return _s(comp.get("name"))
-    return ""
+        Returns: inserted | updated | kept_settled
+        """
+        self.ensure_schema()
+        row_id = _s(row.get("id"))
+        if not row_id:
+            raise ValueError("premium row id absent")
 
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(f"SELECT result FROM {self.TABLE} WHERE id = %s", (row_id,))
+                existing = cur.fetchone()
+                incoming_result = normalize_result(row.get("result"))
 
-def _home_away_ids(summary: Dict[str, Any]) -> tuple[str, str]:
-    competitors = _summary_competitors(summary)
-    home = ""
-    away = ""
-    for comp in competitors:
-        q = _s(comp.get("qualifier")).lower()
-        if q == "home":
-            home = _s(comp.get("id"))
-        elif q == "away":
-            away = _s(comp.get("id"))
-    if not home and competitors:
-        home = _s(competitors[0].get("id"))
-    if not away and len(competitors) > 1:
-        away = _s(competitors[1].get("id"))
-    return home, away
+                # Do not let a fresh pending row overwrite a final row.
+                # Exception: incoming void must be allowed to correct a retired/cancelled match
+                # that was previously settled as win/loss.
+                if existing and normalize_result(existing[0]) in FINAL_RESULTS and incoming_result == "pending":
+                    return "kept_settled"
 
+                params = (
+                    row_id,
+                    _s(row.get("date")),
+                    _s(row.get("sportradarSportEventId")),
+                    _s(row.get("source")) or "sportradar",
+                    _s(row.get("sourcePlayerA")),
+                    _s(row.get("sourcePlayerB")),
+                    _s(row.get("predictedWinner")),
+                    _s(row.get("opponent")),
+                    _s(row.get("surface")),
+                    _f(row.get("premiumPct")),
+                    _s(row.get("status")) or "PREMIUM",
+                    _s(row.get("veto")),
+                    _s(row.get("decision")),
+                    _s(row.get("oddPredicted")),
+                    _s(row.get("oddOpponent")),
+                    _s(row.get("oddsSource")),
+                    normalize_result(row.get("result")) or "pending",
+                    _s(row.get("realWinner")),
+                    _s(row.get("settledAt")),
+                    _s(row.get("settleSource")),
+                    _s(row.get("tournament")),
+                    _s(row.get("seasonName")),
+                    _s(row.get("round")),
+                    _s(row.get("startTime")),
+                    _s(row.get("score")),
+                    _s(row.get("winnerId")),
+                    _s(row.get("sportradarPlayerAId")),
+                    _s(row.get("sportradarPlayerBId")),
+                    json.dumps(row.get("raw") or row, ensure_ascii=False),
+                )
+                cur.execute(
+                    f"""
+                    INSERT INTO {self.TABLE} (
+                        id, date, sport_event_id, source, source_player_a, source_player_b,
+                        predicted_winner, opponent, surface, premium_pct, status, veto,
+                        decision, odd_predicted, odd_opponent, odds_source, result, real_winner,
+                        settled_at, settle_source, tournament, season_name, round, start_time,
+                        score, winner_id, sportradar_player_a_id, sportradar_player_b_id, raw_json
+                    ) VALUES (
+                        %s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,
+                        %s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s
+                    )
+                    ON CONFLICT (id) DO UPDATE SET
+                        source = EXCLUDED.source,
+                        source_player_a = EXCLUDED.source_player_a,
+                        source_player_b = EXCLUDED.source_player_b,
+                        predicted_winner = EXCLUDED.predicted_winner,
+                        opponent = EXCLUDED.opponent,
+                        surface = EXCLUDED.surface,
+                        premium_pct = EXCLUDED.premium_pct,
+                        status = EXCLUDED.status,
+                        veto = EXCLUDED.veto,
+                        decision = EXCLUDED.decision,
+                        odd_predicted = EXCLUDED.odd_predicted,
+                        odd_opponent = EXCLUDED.odd_opponent,
+                        odds_source = EXCLUDED.odds_source,
+                        result = CASE
+                            WHEN EXCLUDED.result <> 'pending' THEN EXCLUDED.result
+                            ELSE {self.TABLE}.result
+                        END,
+                        real_winner = CASE
+                            WHEN EXCLUDED.result <> 'pending' THEN EXCLUDED.real_winner
+                            ELSE {self.TABLE}.real_winner
+                        END,
+                        settled_at = CASE
+                            WHEN EXCLUDED.result <> 'pending' THEN EXCLUDED.settled_at
+                            ELSE {self.TABLE}.settled_at
+                        END,
+                        settle_source = CASE
+                            WHEN EXCLUDED.result <> 'pending' THEN EXCLUDED.settle_source
+                            ELSE {self.TABLE}.settle_source
+                        END,
+                        tournament = EXCLUDED.tournament,
+                        season_name = EXCLUDED.season_name,
+                        round = EXCLUDED.round,
+                        start_time = EXCLUDED.start_time,
+                        score = EXCLUDED.score,
+                        winner_id = EXCLUDED.winner_id,
+                        sportradar_player_a_id = EXCLUDED.sportradar_player_a_id,
+                        sportradar_player_b_id = EXCLUDED.sportradar_player_b_id,
+                        raw_json = EXCLUDED.raw_json,
+                        updated_at = NOW()
+                    """,
+                    params,
+                )
+            conn.commit()
+        return "updated" if existing else "inserted"
 
-def _summary_score(summary: Dict[str, Any]) -> str:
-    status = _get_status(summary)
-    period_scores = status.get("period_scores") or []
-    if not isinstance(period_scores, list) or not period_scores:
-        return ""
+    def fetch_pending_rows(self, day: Optional[str] = None, limit: Optional[int] = None, category: Optional[str] = None) -> List[Dict[str, Any]]:
+        self.ensure_schema()
+        sql = f"""
+            SELECT id, date, sport_event_id, source_player_a, source_player_b,
+                   predicted_winner, opponent, surface, premium_pct, status, result,
+                   odd_predicted, odd_opponent, tournament, round, start_time,
+                   score, winner_id, sportradar_player_a_id, sportradar_player_b_id
+            FROM {self.TABLE}
+            WHERE result = 'pending'
+        """
+        params: List[Any] = []
+        if day:
+            sql += " AND date = %s"
+            params.append(_s(day))
+        where, cat_params = category_where(category)
+        sql += where
+        params.extend(cat_params)
+        sql += " ORDER BY date ASC, created_at ASC"
+        if limit is not None:
+            sql += " LIMIT %s"
+            params.append(int(limit))
 
-    winner_id = _summary_winner_id(summary)
-    home_id, away_id = _home_away_ids(summary)
-    sets: List[str] = []
-
-    for period in period_scores:
-        if not isinstance(period, dict):
-            continue
-        home_score = _s(period.get("home_score"))
-        away_score = _s(period.get("away_score"))
-        if home_score == "" or away_score == "":
-            continue
-        if winner_id and away_id and winner_id == away_id:
-            sets.append(f"{away_score}-{home_score}")
-        else:
-            sets.append(f"{home_score}-{away_score}")
-    return " ".join(sets)
-
-
-def _summary_map_by_event_id(payload: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
-    summaries = payload.get("summaries") if isinstance(payload, dict) else []
-    out: Dict[str, Dict[str, Any]] = {}
-    if not isinstance(summaries, list):
+        out: List[Dict[str, Any]] = []
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(sql, tuple(params))
+                cols = [desc[0] for desc in cur.description]
+                for db_row in cur.fetchall():
+                    row = dict(zip(cols, db_row))
+                    row["sourcePlayerA"] = row.pop("source_player_a")
+                    row["sourcePlayerB"] = row.pop("source_player_b")
+                    row["predictedWinner"] = row.pop("predicted_winner")
+                    row["premiumPct"] = row.pop("premium_pct")
+                    row["oddPredicted"] = row.pop("odd_predicted")
+                    row["oddOpponent"] = row.pop("odd_opponent")
+                    row["sportradarSportEventId"] = row.pop("sport_event_id")
+                    row["sportradarPlayerAId"] = row.pop("sportradar_player_a_id")
+                    row["sportradarPlayerBId"] = row.pop("sportradar_player_b_id")
+                    out.append(row)
         return out
-    for summary in summaries:
-        if not isinstance(summary, dict):
+
+
+    def history_dates(self, days_back: int = 7, limit: int = 60, category: Optional[str] = None) -> List[str]:
+        """Dates with any history rows in the recent window.
+
+        Used by STEP29 auto-settle so old win/loss rows can still be corrected to void
+        when Sportradar later reports retired/walkover/cancelled.
+        """
+        self.ensure_schema()
+        days_back = max(1, min(int(days_back or 7), 60))
+        since = today_paris() - timedelta(days=days_back - 1)
+        where, cat_params = category_where(category)
+        params: List[Any] = [since.isoformat()]
+        params.extend(cat_params)
+        params.append(int(limit))
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    f"""
+                    SELECT DISTINCT date
+                    FROM {self.TABLE}
+                    WHERE date >= %s{where}
+                    ORDER BY date ASC
+                    LIMIT %s
+                    """,
+                    tuple(params),
+                )
+                return [_s(row[0]) for row in cur.fetchall() if _s(row[0])]
+
+
+    def pending_dates(self, days_back: int = 7, limit: int = 30, category: Optional[str] = None) -> List[str]:
+        self.ensure_schema()
+        days_back = max(1, min(int(days_back or 7), 60))
+        since = today_paris() - timedelta(days=days_back - 1)
+        where, cat_params = category_where(category)
+        params: List[Any] = [since.isoformat()]
+        params.extend(cat_params)
+        params.append(int(limit))
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    f"""
+                    SELECT DISTINCT date
+                    FROM {self.TABLE}
+                    WHERE result = 'pending'
+                      AND date >= %s{where}
+                    ORDER BY date ASC
+                    LIMIT %s
+                    """,
+                    tuple(params),
+                )
+                return [_s(row[0]) for row in cur.fetchall() if _s(row[0])]
+
+
+    def fetch_rows_by_event(self, sport_event_id: str) -> List[Dict[str, Any]]:
+        """Return all rows for a Sportradar event id, all categories included."""
+        if not sport_event_id:
+            return []
+        self.ensure_schema()
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    f"""
+                    SELECT id, date, sport_event_id, source_player_a, source_player_b,
+                           predicted_winner, opponent, surface, premium_pct, status, result,
+                           odd_predicted, odd_opponent, tournament, round, start_time,
+                           score, winner_id, sportradar_player_a_id, sportradar_player_b_id
+                    FROM {self.TABLE}
+                    WHERE sport_event_id = %s
+                    ORDER BY date DESC, updated_at DESC, premium_pct DESC
+                    """,
+                    (sport_event_id,),
+                )
+                cols = [desc[0] for desc in cur.description]
+                return [dict(zip(cols, row)) for row in cur.fetchall()]
+
+    def void_rows_by_event(
+        self,
+        sport_event_id: str,
+        score: str = "",
+        winner_id: str = "",
+        *,
+        reason: str = "sportradar_void",
+        real_winner: str = "",
+    ) -> int:
+        """Mark every row for an event as void/refunded.
+
+        Used for retired, walkover, abandoned and cancelled matches.
+        This intentionally overrides win/loss because betting settlement is refund/void.
+        """
+        if not sport_event_id:
+            return 0
+        self.ensure_schema()
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    f"""
+                    UPDATE {self.TABLE}
+                    SET result = 'void',
+                        real_winner = COALESCE(NULLIF(%s, ''), real_winner),
+                        settled_at = %s,
+                        settle_source = %s,
+                        score = COALESCE(NULLIF(%s, ''), score),
+                        winner_id = COALESCE(NULLIF(%s, ''), winner_id),
+                        updated_at = NOW()
+                    WHERE sport_event_id = %s
+                      AND result <> 'void'
+                    """,
+                    (_s(real_winner), today_paris().isoformat(), _s(reason) or "sportradar_void", _s(score), _s(winner_id), _s(sport_event_id)),
+                )
+                changed = int(cur.rowcount or 0)
+            conn.commit()
+        return changed
+
+    def cleanup_duplicate_events(self, category: Optional[str] = None) -> Dict[str, Any]:
+        """Collapse legacy duplicate rows to one row per date + sport_event_id.
+
+        Older STEP25 ids included __pick_<player>, which allowed one match to appear twice.
+        STEP29 keeps one canonical id: YYYY-MM-DD__sr:sport_event:...
+        """
+        self.ensure_schema()
+        where, params = category_where(category)
+        groups: List[Tuple[str, str, int]] = []
+        deleted = 0
+        canonicalized = 0
+
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    f"""
+                    SELECT date, sport_event_id, COUNT(*)
+                    FROM {self.TABLE}
+                    WHERE COALESCE(sport_event_id, '') <> ''{where}
+                    GROUP BY date, sport_event_id
+                    HAVING COUNT(*) > 1
+                    """,
+                    tuple(params),
+                )
+                groups = [(str(d), str(e), int(c or 0)) for d, e, c in cur.fetchall()]
+
+                for day, event_id, _count in groups:
+                    canonical_id = premium_history_key(day, event_id, "", "", "")
+                    cur.execute(
+                        f"""
+                        SELECT id, result, premium_pct, updated_at
+                        FROM {self.TABLE}
+                        WHERE date = %s AND sport_event_id = %s
+                        ORDER BY
+                            CASE WHEN id = %s THEN 0 ELSE 1 END,
+                            CASE WHEN result IN ('win','loss','void') THEN 0 ELSE 1 END,
+                            premium_pct DESC,
+                            updated_at DESC
+                        """,
+                        (day, event_id, canonical_id),
+                    )
+                    rows = cur.fetchall()
+                    if not rows:
+                        continue
+
+                    keep_id = str(rows[0][0])
+                    drop_ids = [str(r[0]) for r in rows[1:]]
+                    if drop_ids:
+                        cur.execute(
+                            f"DELETE FROM {self.TABLE} WHERE id = ANY(%s)",
+                            (drop_ids,),
+                        )
+                        deleted += int(cur.rowcount or 0)
+
+                    if keep_id != canonical_id:
+                        # If the canonical id already exists, keep it and delete the old keeper.
+                        cur.execute(f"SELECT 1 FROM {self.TABLE} WHERE id = %s", (canonical_id,))
+                        canonical_exists = cur.fetchone() is not None
+                        if canonical_exists:
+                            cur.execute(f"DELETE FROM {self.TABLE} WHERE id = %s", (keep_id,))
+                            deleted += int(cur.rowcount or 0)
+                        else:
+                            cur.execute(f"UPDATE {self.TABLE} SET id = %s, updated_at = NOW() WHERE id = %s", (canonical_id, keep_id))
+                            canonicalized += int(cur.rowcount or 0)
+            conn.commit()
+
+        return {
+            "status": "ok",
+            "category": normalize_category(category, default="ALL"),
+            "duplicateGroups": len(groups),
+            "deletedRows": deleted,
+            "canonicalizedRows": canonicalized,
+            "policy": "STEP29 one row per date + sport_event_id.",
+        }
+
+    def settle_pending_by_event(self, sport_event_id: str, real_winner: str, score: str, winner_id: str, *, source: str = "sportradar") -> int:
+        if not sport_event_id or not real_winner:
+            return 0
+        self.ensure_schema()
+        changed = 0
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    f"""
+                    SELECT id, predicted_winner FROM {self.TABLE}
+                    WHERE sport_event_id = %s AND result = 'pending'
+                    """,
+                    (sport_event_id,),
+                )
+                rows = cur.fetchall()
+                for row_id, predicted in rows:
+                    result = "win" if same_player(_s(predicted), real_winner) else "loss"
+                    cur.execute(
+                        f"""
+                        UPDATE {self.TABLE}
+                        SET result = %s,
+                            real_winner = %s,
+                            settled_at = %s,
+                            settle_source = %s,
+                            score = COALESCE(NULLIF(%s, ''), score),
+                            winner_id = COALESCE(NULLIF(%s, ''), winner_id),
+                            updated_at = NOW()
+                        WHERE id = %s AND result = 'pending'
+                        """,
+                        (result, real_winner, today_paris().isoformat(), _s(source) or "sportradar", score, winner_id, row_id),
+                    )
+                    changed += int(cur.rowcount or 0)
+            conn.commit()
+        return changed
+
+    def settle_pending_by_id(self, row_id: str, real_winner: str, score: str, winner_id: str, *, source: str = "sportradar-name-fallback") -> int:
+        if not row_id or not real_winner:
+            return 0
+        self.ensure_schema()
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(f"SELECT predicted_winner FROM {self.TABLE} WHERE id = %s AND result = 'pending'", (row_id,))
+                row = cur.fetchone()
+                if not row:
+                    return 0
+                predicted = _s(row[0])
+                result = "win" if same_player(predicted, real_winner) else "loss"
+                cur.execute(
+                    f"""
+                    UPDATE {self.TABLE}
+                    SET result = %s,
+                        real_winner = %s,
+                        settled_at = %s,
+                        settle_source = %s,
+                        score = COALESCE(NULLIF(%s, ''), score),
+                        winner_id = COALESCE(NULLIF(%s, ''), winner_id),
+                        updated_at = NOW()
+                    WHERE id = %s AND result = 'pending'
+                    """,
+                    (result, real_winner, today_paris().isoformat(), _s(source) or "sportradar-name-fallback", score, winner_id, row_id),
+                )
+                changed = int(cur.rowcount or 0)
+            conn.commit()
+        return changed
+
+
+    def reset_category(self, category: str) -> Dict[str, Any]:
+        """Delete history rows for one category only."""
+        if not self.enabled:
+            return {
+                "status": "error",
+                "databaseConfigured": False,
+                "databaseStatus": "not_configured",
+                "table": self.TABLE,
+                "error": "DATABASE_URL absente dans le service web.",
+            }
+        cat = normalize_category(category)
+        if cat == "ALL":
+            return self.reset_all()
+        self.ensure_schema()
+        before = self.counts(category=cat)
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(f"DELETE FROM {self.TABLE} WHERE UPPER(COALESCE(status, 'PREMIUM')) = %s", (cat,))
+                deleted = int(cur.rowcount or 0)
+            conn.commit()
+        after = self.counts(category=cat)
+        return {
+            "status": "ok",
+            "databaseConfigured": True,
+            "databaseStatus": "ok",
+            "table": self.TABLE,
+            "category": cat,
+            "deletedRows": deleted,
+            "countsBefore": before,
+            "countsAfter": after,
+            "policy": "Reset par catégorie uniquement : tennis_results_2026 / Elo ne sont pas touchés.",
+        }
+
+
+    def reset_all(self) -> Dict[str, Any]:
+        """Delete all Premium history rows from PostgreSQL.
+
+        This is intentionally separate from tennis_results_2026 and only affects
+        the historique moteur.
+        """
+        if not self.enabled:
+            return {
+                "status": "error",
+                "databaseConfigured": False,
+                "databaseStatus": "not_configured",
+                "table": self.TABLE,
+                "error": "DATABASE_URL absente dans le service web.",
+            }
+        self.ensure_schema()
+        before = self.counts()
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(f"DELETE FROM {self.TABLE}")
+                deleted = int(cur.rowcount or 0)
+            conn.commit()
+        after = self.counts()
+        return {
+            "status": "ok",
+            "databaseConfigured": True,
+            "databaseStatus": "ok",
+            "table": self.TABLE,
+            "deletedRows": deleted,
+            "countsBefore": before,
+            "countsAfter": after,
+            "policy": "Reset global historique moteur : tennis_results_2026 / Elo ne sont pas touchés.",
+        }
+
+    def summary(self, category: Optional[str] = "PREMIUM") -> Dict[str, Any]:
+        cat = normalize_category(category)
+        rows = self.fetch_rows(limit=None, category=cat)
+        return build_premium_summary(rows, category=cat)
+
+
+def stats_for_period(rows: List[Dict[str, Any]], period_days: Optional[int], category: Optional[str] = "PREMIUM") -> Dict[str, Any]:
+    today = today_paris()
+    selected: List[Dict[str, Any]] = []
+    cat = normalize_category(category)
+    for row in rows:
+        if cat != "ALL" and row_category(row) != cat:
             continue
-        event_id = _summary_event_id(summary)
-        if event_id:
-            out[event_id] = summary
-    return out
+        d = parse_date(row.get("date"))
+        if d is None:
+            continue
+        if period_days is not None and d < today - timedelta(days=period_days - 1):
+            continue
+        selected.append(row)
 
+    settled = [r for r in selected if normalize_result(r.get("result")) in {"win", "loss"}]
+    wins = sum(1 for r in settled if normalize_result(r.get("result")) == "win")
+    losses = sum(1 for r in settled if normalize_result(r.get("result")) == "loss")
+    pending = sum(1 for r in selected if normalize_result(r.get("result")) == "pending")
+    voids = sum(1 for r in selected if is_void_result(r.get("result")))
+    total = wins + losses
+    win_rate = round((wins / total) * 100.0, 2) if total else 0.0
 
-def _build_history_row(match: Dict[str, Any], target_day: str, category: str) -> Dict[str, Any]:
-    predicted = _s(match.get("playerA"))
-    opponent = _s(match.get("playerB"))
-    source_a = _s(match.get("sourcePlayerA") or predicted)
-    source_b = _s(match.get("sourcePlayerB") or opponent)
-    event_id = _s(match.get("sportradarSportEventId"))
-    row_id = premium_history_key(target_day, event_id, source_a, source_b, predicted)
+    profit_units = 0.0
+    odds_used = 0
+    for row in settled:
+        odd = _f(row.get("oddPredicted"), 0.0)
+        if odd <= 1.0:
+            continue
+        odds_used += 1
+        profit_units += (odd - 1.0) if row.get("result") == "win" else -1.0
 
+    roi = round((profit_units / odds_used) * 100.0, 2) if odds_used else 0.0
     return {
-        "id": row_id,
-        "date": target_day,
-        "sportradarSportEventId": event_id,
-        "source": "sportradar",
-        "sourcePlayerA": source_a,
-        "sourcePlayerB": source_b,
-        "predictedWinner": predicted,
-        "opponent": opponent,
-        "surface": _s(match.get("surface")),
-        "premiumPct": round(_premium_pct(match), 3),
-        "status": category,
-        "category": category,
-        "veto": _s(match.get("veto") or "non"),
-        "decision": _s(match.get("decision")),
-        "oddPredicted": _s(match.get("oddA") or match.get("playerAOdd") or match.get("coteA")),
-        "oddOpponent": _s(match.get("oddB") or match.get("playerBOdd") or match.get("coteB")),
-        "oddsSource": _s(match.get("oddsSource")),
-        "result": "void" if _is_void_match(match) else "pending",
-        "realWinner": _winner_name_from_match(match) if _is_void_match(match) else "",
-        "settledAt": target_day if _is_void_match(match) else "",
-        "settleSource": "sportradar_void" if _is_void_match(match) else "",
-        "tournament": _s(match.get("tournament")),
-        "seasonName": _s(match.get("seasonName")),
-        "round": _s(match.get("round")),
-        "startTime": _s(match.get("startTime")),
-        "score": _s(match.get("score")),
-        "winnerId": _s(match.get("winnerId")),
-        "sportradarPlayerAId": _s(match.get("sportradarPlayerAId")),
-        "sportradarPlayerBId": _s(match.get("sportradarPlayerBId")),
-        "raw": match,
+        "trackedPremium": len(selected),
+        "trackedCategory": len(selected),
+        "category": normalize_category(category),
+        "settled": total,
+        "wins": wins,
+        "losses": losses,
+        "pending": pending,
+        "void": voids,
+        "voids": voids,
+        "refunded": voids,
+        "winRate": win_rate,
+        "profitUnits": round(profit_units, 3),
+        "roiPct": roi,
+        "oddsUsed": odds_used,
     }
 
 
-class PremiumHistorySyncer:
-    def __init__(self, store: Optional[PostgresPremiumStore] = None) -> None:
-        self.store = store or PostgresPremiumStore()
+def build_premium_summary(rows: List[Dict[str, Any]], category: Optional[str] = "PREMIUM") -> Dict[str, Any]:
+    cat = normalize_category(category)
+    by_day: Dict[str, Dict[str, Any]] = {}
+    for row in rows:
+        if cat != "ALL" and row_category(row) != cat:
+            continue
+        d = _s(row.get("date"))
+        if not d:
+            continue
+        bucket = by_day.setdefault(d, {
+            "date": d,
+            "wins": 0,
+            "losses": 0,
+            "pending": 0,
+            "void": 0,
+            "voids": 0,
+            "refunded": 0,
+            "winRate": 0.0,
+            "profitUnits": 0.0,
+            "profitEur": 0.0,
+            "hadPremiumToday": True,
+            "hadPremiumSettledToday": False,
+            "category": cat,
+        })
+        odd = _f(row.get("oddPredicted"), 0.0)
+        result = normalize_result(row.get("result"))
+        if result == "win":
+            bucket["wins"] += 1
+            bucket["hadPremiumSettledToday"] = True
+            if odd > 1.0:
+                bucket["profitUnits"] += odd - 1.0
+                bucket["profitEur"] += STAKE_EUR * (odd - 1.0)
+        elif result == "loss":
+            bucket["losses"] += 1
+            bucket["hadPremiumSettledToday"] = True
+            if odd > 1.0:
+                bucket["profitUnits"] -= 1.0
+            bucket["profitEur"] -= STAKE_EUR
+        elif result == "void":
+            bucket["void"] += 1
+            bucket["voids"] += 1
+            bucket["refunded"] += 1
+        else:
+            bucket["pending"] += 1
 
-    def status(self) -> Dict[str, Any]:
-        return self.store.status()
+    days = []
+    for bucket in by_day.values():
+        settled = bucket["wins"] + bucket["losses"]
+        bucket["winRate"] = round((bucket["wins"] / settled) * 100.0, 2) if settled else 0.0
+        bucket["profitUnits"] = round(bucket["profitUnits"], 3)
+        bucket["profitEur"] = round(bucket["profitEur"], 2)
+        days.append(bucket)
+    days.sort(key=lambda x: x["date"])
 
-    def settle_day_from_sportradar(self, target_day: str, *, dry_run: bool = False, client: Optional[SportradarClient] = None) -> Dict[str, Any]:
-        """Settle pending Premium/Proche rows for one day using Sportradar summaries.
+    cumulative_days: List[Dict[str, Any]] = []
+    cw = cl = 0
+    cpu = cpe = 0.0
+    for bucket in days:
+        cw += int(bucket.get("wins") or 0)
+        cl += int(bucket.get("losses") or 0)
+        cpu += float(bucket.get("profitUnits") or 0.0)
+        cpe += float(bucket.get("profitEur") or 0.0)
+        settled = cw + cl
+        cumulative_days.append({
+            "date": bucket["date"],
+            "cumulativeWins": cw,
+            "cumulativeLosses": cl,
+            "cumulativeSettled": settled,
+            "cumulativeWinRate": round((cw / settled) * 100.0, 2) if settled else 0.0,
+            "cumulativeProfitUnits": round(cpu, 3),
+            "cumulativeProfitEur": round(cpe, 2),
+            "pendingThatDay": int(bucket.get("pending") or 0),
+            "voidThatDay": int(bucket.get("void") or 0),
+            "refundedThatDay": int(bucket.get("refunded") or 0),
+            "hadPremiumToday": bool(bucket.get("hadPremiumToday", False)),
+            "hadPremiumSettledToday": bool(bucket.get("hadPremiumSettledToday", False)),
+            "category": cat,
+        })
 
-        This does not create new picks. It only changes existing rows from:
-        result='pending' -> result='win' or result='loss'.
-        """
-        counts = {
-            "pending_before": 0,
-            "pending_with_event_id": 0,
-            "sportradar_summaries": 0,
-            "finished_summaries": 0,
-            "matched_pending_events": 0,
-            "settled": 0,
-            "voided": 0,
-            "still_pending": 0,
-            "missing_event_id": 0,
-            "missing_in_sportradar": 0,
-            "not_finished": 0,
-            "unresolved_winner": 0,
-        }
-        errors: List[str] = []
-        settled_sample: List[Dict[str, Any]] = []
-        unresolved_sample: List[Dict[str, Any]] = []
-
-        if not self.store.enabled:
-            return {
-                "status": "error",
-                "provider": "sportradar",
-                "targetDay": target_day,
-                "dryRun": dry_run,
-                "errors": ["DATABASE_URL absente : historique moteur PostgreSQL indisponible."],
-                "counts": counts,
-            }
-
-        try:
-            self.store.ensure_schema()
-            pending_rows = self.store.fetch_pending_rows(day=target_day)
-        except Exception as exc:
-            return {
-                "status": "error",
-                "provider": "postgres",
-                "targetDay": target_day,
-                "dryRun": dry_run,
-                "errors": [f"PostgreSQL error: {type(exc).__name__}: {exc}"],
-                "counts": counts,
-            }
-
-        counts["pending_before"] = len(pending_rows)
-
-        pending_by_event: Dict[str, List[Dict[str, Any]]] = {}
-        for row in pending_rows:
-            event_id = _s(row.get("sportradarSportEventId"))
-            if not event_id:
-                counts["missing_event_id"] += 1
-                if len(unresolved_sample) < 10:
-                    unresolved_sample.append({"id": row.get("id"), "reason": "missing_event_id", "pick": row.get("predictedWinner")})
-                continue
-            pending_by_event.setdefault(event_id, []).append(row)
-
-        counts["pending_with_event_id"] = sum(len(v) for v in pending_by_event.values())
-
-        client = client or SportradarClient()
-        try:
-            payload = client.daily_summaries(target_day)
-        except SportradarError as exc:
-            return {
-                "status": "error",
-                "provider": "sportradar",
-                "targetDay": target_day,
-                "dryRun": dry_run,
-                "errors": [str(exc)],
-                "counts": counts,
-                "settledSample": settled_sample,
-                "unresolvedSample": unresolved_sample,
-            }
-        except Exception as exc:
-            return {
-                "status": "error",
-                "provider": "sportradar",
-                "targetDay": target_day,
-                "dryRun": dry_run,
-                "errors": [f"{type(exc).__name__}: {exc}"],
-                "counts": counts,
-                "settledSample": settled_sample,
-                "unresolvedSample": unresolved_sample,
-            }
-
-        summaries_by_event = _summary_map_by_event_id(payload)
-        counts["sportradar_summaries"] = len(summaries_by_event)
-
-        # First pass: void/refund events must override even old rows already marked win/loss.
-        for event_id, summary in summaries_by_event.items():
-            if not _summary_is_void(summary):
-                continue
-            real_winner = _summary_winner_name(summary)
-            winner_id = _summary_winner_id(summary)
-            score = _summary_score(summary)
-            if dry_run:
-                changed = len(self.store.fetch_rows_by_event(event_id)) if self.store.enabled else 0
-            else:
-                try:
-                    changed = self.store.void_rows_by_event(
-                        event_id,
-                        score,
-                        winner_id,
-                        reason="sportradar_daily_summaries_void",
-                        real_winner=real_winner,
-                    )
-                except TypeError:
-                    # Backward fallback if an older store signature is somehow loaded.
-                    changed = 0
-                except Exception as exc:
-                    errors.append(f"void event {event_id} failed: {type(exc).__name__}: {exc}")
-                    changed = 0
-            if changed:
-                counts["voided"] += int(changed)
-                if len(settled_sample) < 10:
-                    settled_sample.append({
-                        "eventId": event_id,
-                        "result": "void",
-                        "winnerId": winner_id,
-                        "score": score,
-                        "rowsChanged": int(changed),
-                    })
-
-        for event_id, rows in pending_by_event.items():
-            summary = summaries_by_event.get(event_id)
-            if not summary:
-                counts["missing_in_sportradar"] += len(rows)
-                if len(unresolved_sample) < 10:
-                    unresolved_sample.append({"eventId": event_id, "reason": "missing_in_sportradar", "rows": len(rows)})
-                continue
-
-            if _summary_is_void(summary):
-                # Already handled by the void pass above.
-                continue
-
-            if not _summary_is_finished(summary):
-                counts["not_finished"] += len(rows)
-                if len(unresolved_sample) < 10:
-                    unresolved_sample.append({"eventId": event_id, "reason": "not_finished", "rows": len(rows)})
-                continue
-
-            counts["finished_summaries"] += 1
-            real_winner = _summary_winner_name(summary)
-            winner_id = _summary_winner_id(summary)
-            score = _summary_score(summary)
-
-            if not real_winner:
-                counts["unresolved_winner"] += len(rows)
-                if len(unresolved_sample) < 10:
-                    unresolved_sample.append({"eventId": event_id, "reason": "winner_name_not_resolved", "winnerId": winner_id})
-                continue
-
-            counts["matched_pending_events"] += len(rows)
-
-            if dry_run:
-                changed = len(rows)
-            else:
-                try:
-                    changed = self.store.settle_pending_by_event(
-                        event_id,
-                        real_winner,
-                        score,
-                        winner_id,
-                        source="sportradar_daily_summaries",
-                    )
-                except Exception as exc:
-                    errors.append(f"settle event {event_id} failed: {type(exc).__name__}: {exc}")
-                    changed = 0
-
-            counts["settled"] += int(changed)
-            if changed and len(settled_sample) < 10:
-                settled_sample.append({
-                    "eventId": event_id,
-                    "realWinner": real_winner,
-                    "winnerId": winner_id,
-                    "score": score,
-                    "rowsChanged": int(changed),
-                })
-
-        counts["still_pending"] = max(0, counts["pending_before"] - counts["settled"])
-        status = "ok" if not errors else "partial"
-        return {
-            "status": status,
-            "provider": "sportradar",
-            "targetDay": target_day,
-            "dryRun": dry_run,
-            "generatedAt": datetime.utcnow().isoformat() + "Z",
-            "errors": errors,
-            "counts": counts,
-            "settledSample": settled_sample,
-            "unresolvedSample": unresolved_sample,
-            "storage": {
-                "mode": "postgres",
-                "databaseConfigured": self.store.enabled,
-                "table": self.store.TABLE,
-                "status": self.store.status(),
-            },
-            "policy": "Règlement strict STEP29 : pending -> win/loss via winner_id; retired/walkover/cancelled/abandoned -> void/remboursé, même si la ligne était déjà réglée.",
-        }
-
-    def settle_pending_recent(self, *, days_back: int = 7, dry_run: bool = False, client: Optional[SportradarClient] = None) -> Dict[str, Any]:
-        days_back = max(1, min(int(days_back or 7), 60))
-        counts = {
-            "days_requested": days_back,
-            "dates_with_history": 0,
-            "settled": 0,
-            "voided": 0,
-            "pending_before": 0,
-            "errors": 0,
-        }
-        results: List[Dict[str, Any]] = []
-
-        if not self.store.enabled:
-            return {
-                "status": "error",
-                "provider": "sportradar",
-                "dryRun": dry_run,
-                "errors": ["DATABASE_URL absente : historique moteur PostgreSQL indisponible."],
-                "counts": counts,
-                "results": results,
-            }
-
-        try:
-            dates = self.store.history_dates(days_back=days_back)
-        except Exception as exc:
-            return {
-                "status": "error",
-                "provider": "postgres",
-                "dryRun": dry_run,
-                "errors": [f"PostgreSQL error: {type(exc).__name__}: {exc}"],
-                "counts": counts,
-                "results": results,
-            }
-
-        counts["dates_with_history"] = len(dates)
-        client = client or SportradarClient()
-
-        for day in dates:
-            result = self.settle_day_from_sportradar(day, dry_run=dry_run, client=client)
-            results.append(result)
-            c = result.get("counts") or {}
-            counts["settled"] += int(c.get("settled") or 0)
-            counts["voided"] += int(c.get("voided") or 0)
-            counts["pending_before"] += int(c.get("pending_before") or 0)
-            if result.get("status") not in {"ok", "skipped"}:
-                counts["errors"] += 1
-
-        status = "ok" if counts["errors"] == 0 else "partial"
-        return {
-            "status": status,
-            "provider": "sportradar",
-            "dryRun": dry_run,
-            "generatedAt": datetime.utcnow().isoformat() + "Z",
-            "counts": counts,
-            "dates": dates,
-            "results": results,
-            "policy": "STEP29 : vérifie les dates récentes avec historique; pending -> win/loss et retired/walkover/cancelled/abandoned -> void/remboursé, même sur anciennes lignes déjà réglées.",
-        }
-
-    def sync_daily_result(self, daily_result: Dict[str, Any], target_day: str, *, dry_run: bool = False) -> Dict[str, Any]:
-        matches = daily_result.get("matches") if isinstance(daily_result, dict) else []
-        if not isinstance(matches, list):
-            return {"status": "error", "errors": ["daily_result sans matches[]"], "targetDay": target_day}
-
-        counts = {
-            "daily_matches": len(matches),
-            "premium_candidates": 0,
-            "proche_candidates": 0,
-            "veto_candidates": 0,
-            "refuse_candidates": 0,
-            "tracked_candidates": 0,
-            "rows_prepared": 0,
-            "rows_added": 0,
-            "rows_updated": 0,
-            "rows_kept_settled": 0,
-            "ignored_not_tracked": 0,
-            "settled": 0,
-            "voided": 0,
-            "deduped_input_matches": 0,
-            "unresolved_finished": 0,
-        }
-        errors: List[str] = []
-        added_sample: List[Dict[str, Any]] = []
-        settled_sample: List[Dict[str, Any]] = []
-
-        if not self.store.enabled:
-            return {
-                "status": "error",
-                "provider": "sportradar",
-                "targetDay": target_day,
-                "dryRun": dry_run,
-                "errors": ["DATABASE_URL absente : historique moteur PostgreSQL indisponible."],
-                "counts": counts,
-            }
-
-        try:
-            self.store.ensure_schema()
-        except Exception as exc:
-            return {
-                "status": "error",
-                "provider": "sportradar",
-                "targetDay": target_day,
-                "dryRun": dry_run,
-                "errors": [f"PostgreSQL error: {type(exc).__name__}: {exc}"],
-                "counts": counts,
-            }
-
-        # 1) Record all categorized engine outputs: Premium + Proches + Veto + Refusés.
-        # STEP29: dedupe raw daily payload by sport_event_id before writing history.
-        # One physical tennis match must create at most one history row.
-        deduped_matches: List[Dict[str, Any]] = []
-        seen_events: Dict[str, int] = {}
-
-        def _match_rank(m: Dict[str, Any]) -> tuple:
-            category = tracked_category(m)
-            cat_rank = {"PREMIUM": 4, "PROCHE": 3, "VETO": 2, "REFUSE": 1}.get(category, 0)
-            has_odds = 1 if _s(m.get("oddA") or m.get("playerAOdd") or m.get("coteA")) else 0
-            return (cat_rank, _premium_pct(m), has_odds)
-
-        for m in matches:
-            if not isinstance(m, dict):
-                continue
-            event_id = _s(m.get("sportradarSportEventId"))
-            if not event_id:
-                deduped_matches.append(m)
-                continue
-            if event_id not in seen_events:
-                seen_events[event_id] = len(deduped_matches)
-                deduped_matches.append(m)
-                continue
-            idx = seen_events[event_id]
-            counts["deduped_input_matches"] += 1
-            if _match_rank(m) > _match_rank(deduped_matches[idx]):
-                deduped_matches[idx] = m
-
-        for match in deduped_matches:
-            if not isinstance(match, dict):
-                counts["ignored_not_tracked"] += 1
-                continue
-
-            category = tracked_category(match)
-            if not category:
-                # Cancelled/retired non-analyzable rows are not engine picks.
-                counts["ignored_not_tracked"] += 1
-                continue
-
-            if category == "PREMIUM":
-                counts["premium_candidates"] += 1
-            elif category == "PROCHE":
-                counts["proche_candidates"] += 1
-            elif category == "VETO":
-                counts["veto_candidates"] += 1
-            elif category == "REFUSE":
-                counts["refuse_candidates"] += 1
-            counts["tracked_candidates"] += 1
-
-            row = _build_history_row(match, target_day, category)
-            counts["rows_prepared"] += 1
-
-            if len(added_sample) < 10:
-                added_sample.append({
-                    "eventId": row.get("sportradarSportEventId"),
-                    "category": category,
-                    "pick": row.get("predictedWinner"),
-                    "opponent": row.get("opponent"),
-                    "premiumPct": row.get("premiumPct"),
-                    "tournament": row.get("tournament"),
-                    "round": row.get("round"),
-                })
-
-            if dry_run:
-                continue
-
-            try:
-                action = self.store.upsert_premium_row(row)
-                if action == "inserted":
-                    counts["rows_added"] += 1
-                elif action == "updated":
-                    counts["rows_updated"] += 1
-                elif action == "kept_settled":
-                    counts["rows_kept_settled"] += 1
-            except Exception as exc:
-                errors.append(f"upsert failed: {type(exc).__name__}: {exc}")
-
-        # 2) Settle tracked rows using the same Sportradar daily payload.
-        # Retired / walkover / cancelled / abandoned must be void/refunded, not win/loss.
-        for match in deduped_matches:
-            if not isinstance(match, dict):
-                continue
-            event_id = _s(match.get("sportradarSportEventId"))
-            if not event_id:
-                continue
-
-            if _is_void_match(match):
-                if dry_run:
-                    changed = len(self.store.fetch_rows_by_event(event_id)) if self.store.enabled else 0
-                else:
-                    try:
-                        changed = self.store.void_rows_by_event(
-                            event_id,
-                            _s(match.get("score")),
-                            _s(match.get("winnerId")),
-                            reason="sportradar_daily_void",
-                            real_winner=_winner_name_from_match(match),
-                        )
-                    except Exception as exc:
-                        errors.append(f"void failed: {type(exc).__name__}: {exc}")
-                        changed = 0
-                if changed:
-                    counts["voided"] += int(changed)
-                    if len(settled_sample) < 10:
-                        settled_sample.append({
-                            "eventId": event_id,
-                            "result": "void",
-                            "score": _s(match.get("score")),
-                            "rowsChanged": int(changed),
-                        })
-                continue
-
-            if not _is_finished(match):
-                continue
-
-            real_winner = _winner_name_from_match(match)
-            if not real_winner:
-                counts["unresolved_finished"] += 1
-                continue
-
-            if dry_run:
-                continue
-            try:
-                changed = self.store.settle_pending_by_event(
-                    event_id,
-                    real_winner,
-                    _s(match.get("score")),
-                    _s(match.get("winnerId")),
-                )
-                if changed:
-                    counts["settled"] += int(changed)
-                    if len(settled_sample) < 10:
-                        settled_sample.append({
-                            "eventId": event_id,
-                            "realWinner": real_winner,
-                            "score": _s(match.get("score")),
-                            "rowsChanged": int(changed),
-                        })
-            except Exception as exc:
-                errors.append(f"settle failed: {type(exc).__name__}: {exc}")
-
-        status = "ok" if not errors else "partial"
-        return {
-            "status": status,
-            "provider": "sportradar",
-            "targetDay": target_day,
-            "dryRun": dry_run,
-            "generatedAt": datetime.utcnow().isoformat() + "Z",
-            "errors": errors,
-            "counts": counts,
-            "addedSample": added_sample,
-            "settledSample": settled_sample,
-            "storage": {
-                "mode": "postgres",
-                "databaseConfigured": self.store.enabled,
-                "table": self.store.TABLE,
-                "status": self.store.status(),
-            },
-            "daily": {
-                "payloadCount": (daily_result.get("daily") or {}).get("payloadCount"),
-                "step": (daily_result.get("daily") or {}).get("step"),
-                "summary": daily_result.get("summary", {}),
-            },
-            "policy": "Historique moteur STEP29 : Premium/Proches/Veto/Refusés; 1 ligne par match; retired/walkover/cancelled/abandoned -> void/remboursé; règlement win/loss via winner_id Sportradar.",
-        }
+    return {
+        "status": "ok",
+        "storage": {"mode": "postgres", "table": PostgresPremiumStore.TABLE},
+        "summary": {
+            "category": cat,
+            "label": category_label(cat),
+            "day": stats_for_period(rows, 1, cat),
+            "week": stats_for_period(rows, 7, cat),
+            "month": stats_for_period(rows, 30, cat),
+            "year": stats_for_period(rows, 365, cat),
+            "all": stats_for_period(rows, None, cat),
+        },
+        "chart": {
+            "days": days,
+            "cumulativeDays": cumulative_days,
+            "category": cat,
+            "label": category_label(cat),
+            "description": f"Historique {category_label(cat)} séparé, stocké dans PostgreSQL.",
+            "stakeEur": STAKE_EUR,
+            "euroAxisMin": -2000.0,
+            "euroAxisMax": 2000.0,
+            "winRateAxisMin": 0.0,
+            "winRateAxisMax": 100.0,
+        },
+        "rows": rows,
+    }
