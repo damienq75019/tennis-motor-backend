@@ -14,6 +14,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from motor import HISTORY_YEARS, calculate_match_prediction, get_state
 from sportradar_client import SportradarClient
 from sportradar_daily_builder import SportradarDailyBuilder
+from api_tennis_daily_builder import ApiTennisDailyBuilder
 from sportradar_2026_results_sync import Results2026Syncer
 from postgres_premium_store import PostgresPremiumStore, score_match_with_form_value
 from sportradar_premium_sync import PremiumHistorySyncer, tracked_category
@@ -28,7 +29,7 @@ PAYLOAD_DIR = OUTPUT_DIR / "payloads"
 # Règle utilisateur verrouillée : Jannik Sinner reste exclu de l'analyse.
 EXCLUDED_ANALYSIS_PLAYERS = ["Jannik Sinner"]
 
-app = FastAPI(title="Tennis Motor Backend Clean", version="step34-form-value-engine")
+app = FastAPI(title="Tennis Motor Backend Clean", version="step36-api-tennis-migration")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -749,7 +750,7 @@ def _apply_form_value_engine(response: Dict[str, Any]) -> None:
         response["daily"]["formValueEngine"] = {
             "status": "skipped",
             "reason": "no_matches",
-            "version": "step34-form-value-engine",
+            "version": "step36-api-tennis-migration",
         }
         return
 
@@ -758,7 +759,7 @@ def _apply_form_value_engine(response: Dict[str, Any]) -> None:
         response["daily"]["formValueEngine"] = {
             "status": "skipped",
             "reason": "database_not_configured",
-            "version": "step34-form-value-engine",
+            "version": "step36-api-tennis-migration",
         }
         return
 
@@ -767,7 +768,7 @@ def _apply_form_value_engine(response: Dict[str, Any]) -> None:
     except Exception as exc:
         response["daily"]["formValueEngine"] = {
             "status": "error",
-            "version": "step34-form-value-engine",
+            "version": "step36-api-tennis-migration",
             "error": f"{type(exc).__name__}: {exc}",
         }
         return
@@ -818,7 +819,7 @@ def _apply_form_value_engine(response: Dict[str, Any]) -> None:
 
     response["daily"]["formValueEngine"] = {
         "status": "ok",
-        "version": "step34-form-value-engine",
+        "version": "step36-api-tennis-migration",
         "mode": "active_history_value_layer",
         "counts": counts,
         "categoryRanking": report.get("ranking", []),
@@ -832,9 +833,9 @@ def root() -> Dict[str, Any]:
     return {
         "status": "ok",
         "service": "Tennis Motor Backend Clean",
-        "version": "step34-form-value-engine",
-        "message": "Backend propre étape 2.11 : Sportradar + PostgreSQL + cotes Flashscore + veto non forcé + détecteur qualifié audit only + placeholders masqués + vrais signaux historiques moteur.",
-        "endpoints": ["/health", "/calculate", "/predictions", "/state", "/history", "/daily", "/odds/status", "/sync/results2026/status", "/sync/results2026/run", "/sync/results2026/postgres/status", "/sync/results2026/postgres/export", "/sync/premium/status", "/sync/premium/list", "/sync/premium/reset", "/sync/premium/run", "/sync/premium/settle", "/sync/premium/settle-pending", "/sync/history/form-value", "/sync/history/list", "/sync/history/reset", "/sync/history/repair-dellien-royer", "/sync/history/settle", "/sync/history/settle-pending"],
+        "version": "step36-api-tennis-migration",
+        "message": "Backend STEP36 : API-Tennis en provider quotidien prioritaire + PostgreSQL + cotes Flashscore + Form Value Engine + historiques Premium/Proches/Veto/Refusés.",
+        "endpoints": ["/health", "/calculate", "/predictions", "/state", "/history", "/daily", "/api-tennis/status", "/sportradar/status", "/odds/status", "/sync/results2026/status", "/sync/results2026/run", "/sync/results2026/postgres/status", "/sync/results2026/postgres/export", "/sync/premium/status", "/sync/premium/list", "/sync/premium/reset", "/sync/premium/run", "/sync/premium/settle", "/sync/premium/settle-pending", "/sync/history/form-value", "/sync/history/list", "/sync/history/reset", "/sync/history/repair-dellien-royer", "/sync/history/settle", "/sync/history/settle-pending"],
         "excludedAnalysisPlayers": _excluded_analysis_names(),
     }
 
@@ -845,17 +846,19 @@ def health() -> Dict[str, Any]:
     return {
         "status": "ok",
         "service": "Tennis Motor Backend Clean",
-        "version": "step34-form-value-engine",
+        "version": "step36-api-tennis-migration",
         "historyYears": list(HISTORY_YEARS),
         "historyRowsLoaded": state.get("history_rows_loaded", 0),
         "excludedAnalysisPlayers": _excluded_analysis_names(),
-        "dailyProvider": "sportradar",
+        "dailyProvider": "api_tennis",
         "oddsProvider": "flashscore",
         "oddsUsage": "display_only_not_used_by_engine",
         "results2026Sync": "enabled",
         "results2026Storage": "postgres" if os.environ.get("DATABASE_URL", "").strip() else "csv",
         "premiumHistoryStorage": "postgres" if os.environ.get("DATABASE_URL", "").strip() else "unavailable",
         "databaseUrlConfigured": bool(os.environ.get("DATABASE_URL", "").strip()),
+        "apiTennisKeyConfigured": bool(os.environ.get("API_TENNIS_KEY", "").strip()),
+        "apiTennisEventTypeKey": "265",
         "sportradarApiKeyConfigured": bool(os.environ.get("SPORTRADAR_API_KEY", "").strip()),
         "sportradarAccessLevel": os.environ.get("SPORTRADAR_ACCESS_LEVEL", "trial"),
         "qualifierDetector": "sportradar_season_links_audit_only",
@@ -880,24 +883,37 @@ async def predictions_post(request: Request) -> Dict[str, Any]:
 
 
 @app.get("/daily")
-def daily(day: str = Query("today"), auto_history: bool = Query(True)) -> Dict[str, Any]:
+def daily(day: str = Query("today"), auto_history: bool = Query(True), provider: str = Query("api_tennis")) -> Dict[str, Any]:
     target_day = normalize_day(day)
+    selected_provider = (provider or os.environ.get("DAILY_PROVIDER", "api_tennis") or "api_tennis").strip().lower()
 
-    builder = SportradarDailyBuilder(audit_dir=AUDIT_DIR)
-    built = builder.build_matches_for_day(target_day)
+    if selected_provider in {"sportradar", "sr"}:
+        builder = SportradarDailyBuilder(audit_dir=AUDIT_DIR)
+        built = builder.build_matches_for_day(target_day)
+        provider_name = "sportradar"
+        provider_key_configured = bool(os.environ.get("SPORTRADAR_API_KEY", "").strip())
+        error_status = "sportradar_error"
+        error_message = "Erreur Sportradar inconnue."
+    else:
+        builder = ApiTennisDailyBuilder(audit_dir=AUDIT_DIR)
+        built = builder.build_matches_for_day(target_day)
+        provider_name = "api_tennis"
+        provider_key_configured = bool(os.environ.get("API_TENNIS_KEY", "").strip())
+        error_status = "api_tennis_error"
+        error_message = "Erreur API-Tennis inconnue."
 
     if built.get("status") != "ok":
         response = _empty_response(
-            status="sportradar_error",
-            message=str(built.get("error") or "Erreur Sportradar inconnue."),
+            status=error_status,
+            message=str(built.get("error") or error_message),
             target_day=target_day,
         )
         response["daily"].update({
-            "provider": "sportradar",
-            "step": "2.5",
+            "provider": provider_name,
+            "step": "36",
             "targetDay": target_day,
             "audit": built.get("audit", {}),
-            "apiKeyConfigured": bool(os.environ.get("SPORTRADAR_API_KEY", "").strip()),
+            "apiKeyConfigured": provider_key_configured,
         })
         return response
 
@@ -922,13 +938,15 @@ def daily(day: str = Query("today"), auto_history: bool = Query(True)) -> Dict[s
 
     response.setdefault("daily", {})
     response["daily"].update({
-        "provider": "sportradar",
-        "step": "34",
+        "provider": provider_name,
+        "step": "36",
         "targetDay": target_day,
         "payloadCount": len(source_matches),
         "audit": built.get("audit", {}),
-        "manualReviewPolicy": "points ATP absents ou à 0 = non analysé; placeholders Sportradar WSF/TBD/Winner masqués; noms Sportradar résolus vers historique; vrais signaux moteur quand historique disponible; veto non forcé : les victoires tournoi calculées par Sportradar sont conservées en raw/audit mais ne forcent plus player_b_tournament_wins moteur; qualifié B non activé automatiquement; détecteur Sportradar Season Links en audit only; aucune donnée n'est inventée.",
-        "oddsPolicy": "Flashscore odds are display-only for the original core; STEP34 formValue uses odds against historical win-rate/ROI.",
+        "manualReviewPolicy": "points ATP absents ou à 0 = non analysé; API-Tennis fournit les matchs ATP simples via event_type_key=265; noms API-Tennis enrichis par get_standings ATP quand possible; aucune donnée n'est inventée.",
+        "oddsPolicy": "Flashscore odds are display-only for the original core; STEP34/36 formValue uses odds against historical win-rate/ROI.",
+        "apiTennisProviderActive": provider_name == "api_tennis",
+        "apiTennisKeyConfigured": bool(os.environ.get("API_TENNIS_KEY", "").strip()),
     })
 
     # STEP34 : couche Form/Historique active, après enrichissement des cotes.
@@ -983,7 +1001,7 @@ def odds_status() -> Dict[str, Any]:
         "records": audit.get("records", 0),
         "errors": audit.get("errors", []),
         "warnings": audit.get("warnings", []),
-        "serviceVersion": "step34-form-value-engine",
+        "serviceVersion": "step36-api-tennis-migration",
     }
 
 
@@ -996,6 +1014,22 @@ def sportradar_status() -> Dict[str, Any]:
         "apiKeyConfigured": client.enabled,
         "accessLevel": client.config.access_level,
         "language": client.config.language,
+        "note": "La clé API n'est jamais renvoyée par le backend.",
+    }
+
+
+@app.get("/api-tennis/status")
+def api_tennis_status() -> Dict[str, Any]:
+    builder = ApiTennisDailyBuilder(audit_dir=AUDIT_DIR)
+    return {
+        "status": "ok" if builder.enabled else "missing_key",
+        "provider": "api_tennis",
+        "apiKeyConfigured": builder.enabled,
+        "eventTypeKey": "265",
+        "eventTypeType": "Atp Singles",
+        "baseUrl": builder.config.base_url,
+        "timezone": builder.config.timezone,
+        "usage": "STEP36 daily provider: get_standings ATP + get_fixtures ATP Singles.",
         "note": "La clé API n'est jamais renvoyée par le backend.",
     }
 
@@ -1215,7 +1249,7 @@ def _history_list_payload(
         "settle": settle_result,
         "cleanup": cleanup_result,
         "policy": f"Liste historique moteur STEP33 filtrée : {cat}. Historique durable multi-années; auto-settle sur toutes les dates pending si settle_days_back=0; void/remboursé exclu du ROI; doublons legacy compactés.",
-        "serviceVersion": "step34-form-value-engine",
+        "serviceVersion": "step36-api-tennis-migration",
     }
 
 
@@ -1236,7 +1270,7 @@ def sync_history_form_value(
             "table": store.TABLE,
             "category": cat,
             "error": "DATABASE_URL absente dans le service web.",
-            "serviceVersion": "step34-form-value-engine",
+            "serviceVersion": "step36-api-tennis-migration",
         }
     try:
         report = store.form_value_report(category=cat, limit=limit)
@@ -1253,7 +1287,7 @@ def sync_history_form_value(
             "table": store.TABLE,
             "category": cat,
             "error": f"{type(exc).__name__}: {exc}",
-            "serviceVersion": "step34-form-value-engine",
+            "serviceVersion": "step36-api-tennis-migration",
         }
 
 
@@ -1278,7 +1312,7 @@ def sync_history_list(
             "error": "DATABASE_URL absente dans le service web.",
             "items": [],
             "rows": [],
-            "serviceVersion": "step34-form-value-engine",
+            "serviceVersion": "step36-api-tennis-migration",
         }
 
     try:
@@ -1293,7 +1327,7 @@ def sync_history_list(
             "error": f"{type(exc).__name__}: {exc}",
             "items": [],
             "rows": [],
-            "serviceVersion": "step34-form-value-engine",
+            "serviceVersion": "step36-api-tennis-migration",
         }
 
 
@@ -1315,7 +1349,7 @@ def sync_premium_list(
             "error": "DATABASE_URL absente dans le service web.",
             "items": [],
             "rows": [],
-            "serviceVersion": "step34-form-value-engine",
+            "serviceVersion": "step36-api-tennis-migration",
         }
     try:
         return _history_list_payload(store, "PREMIUM", limit, auto_settle, settle_days_back)
@@ -1329,7 +1363,7 @@ def sync_premium_list(
             "error": f"{type(exc).__name__}: {exc}",
             "items": [],
             "rows": [],
-            "serviceVersion": "step34-form-value-engine",
+            "serviceVersion": "step36-api-tennis-migration",
         }
 
 
@@ -1392,7 +1426,7 @@ def sync_history_repair_dellien_royer(confirm: str = Query("")) -> Dict[str, Any
             "table": store.TABLE,
             "message": "Réparation refusée : ajoute confirm=YES.",
             "example": "/sync/history/repair-dellien-royer?confirm=YES",
-            "serviceVersion": "step34-form-value-engine",
+            "serviceVersion": "step36-api-tennis-migration",
         }
     try:
         result = store.repair_dellien_royer_refuse()
@@ -1404,7 +1438,7 @@ def sync_history_repair_dellien_royer(confirm: str = Query("")) -> Dict[str, Any
             "databaseConfigured": store.enabled,
             "table": store.TABLE,
             "error": f"{type(exc).__name__}: {exc}",
-            "serviceVersion": "step34-form-value-engine",
+            "serviceVersion": "step36-api-tennis-migration",
         }
 
 
@@ -1421,7 +1455,7 @@ def sync_history_reset(category: str = Query("premium"), confirm: str = Query(""
             "category": cat,
             "message": "Reset refusé : ajoute confirm=YES.",
             "example": f"/sync/history/reset?category={cat.lower()}&confirm=YES",
-            "serviceVersion": "step34-form-value-engine",
+            "serviceVersion": "step36-api-tennis-migration",
         }
     try:
         if cat == "ALL":
@@ -1437,7 +1471,7 @@ def sync_history_reset(category: str = Query("premium"), confirm: str = Query(""
             "table": store.TABLE,
             "category": cat,
             "error": f"{type(exc).__name__}: {exc}",
-            "serviceVersion": "step34-form-value-engine",
+            "serviceVersion": "step36-api-tennis-migration",
         }
 
 
@@ -1453,7 +1487,7 @@ def sync_premium_reset(confirm: str = Query("")) -> Dict[str, Any]:
             "category": "PREMIUM",
             "message": "Reset refusé : ajoute ?confirm=YES pour vider l'historique PREMIUM uniquement.",
             "example": "/sync/premium/reset?confirm=YES",
-            "serviceVersion": "step34-form-value-engine",
+            "serviceVersion": "step36-api-tennis-migration",
         }
     try:
         result = store.reset_category("PREMIUM")
@@ -1466,7 +1500,7 @@ def sync_premium_reset(confirm: str = Query("")) -> Dict[str, Any]:
             "table": store.TABLE,
             "category": "PREMIUM",
             "error": f"{type(exc).__name__}: {exc}",
-            "serviceVersion": "step34-form-value-engine",
+            "serviceVersion": "step36-api-tennis-migration",
         }
 
 
