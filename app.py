@@ -1001,7 +1001,7 @@ def odds_status() -> Dict[str, Any]:
         "records": audit.get("records", 0),
         "errors": audit.get("errors", []),
         "warnings": audit.get("warnings", []),
-        "serviceVersion": "step37-api-tennis-verified-corrections",
+        "serviceVersion": "step38-api-tennis-settle",
     }
 
 
@@ -1094,7 +1094,7 @@ def history() -> Dict[str, Any]:
 def sync_results2026_status() -> Dict[str, Any]:
     syncer = Results2026Syncer(client=SportradarClient(), base_dir=BASE_DIR)
     status = syncer.status()
-    status["serviceVersion"] = "step34-form-value-engine"
+    status["serviceVersion"] = "step38-api-tennis-settle"
     return status
 
 
@@ -1102,7 +1102,7 @@ def sync_results2026_status() -> Dict[str, Any]:
 def sync_results2026_postgres_status() -> Dict[str, Any]:
     syncer = Results2026Syncer(client=SportradarClient(), base_dir=BASE_DIR)
     status = syncer.postgres_status()
-    status["serviceVersion"] = "step34-form-value-engine"
+    status["serviceVersion"] = "step38-api-tennis-settle"
     return status
 
 
@@ -1110,7 +1110,7 @@ def sync_results2026_postgres_status() -> Dict[str, Any]:
 def sync_results2026_postgres_export() -> Dict[str, Any]:
     syncer = Results2026Syncer(client=SportradarClient(), base_dir=BASE_DIR)
     result = syncer.export_postgres_to_csv()
-    result["serviceVersion"] = "step34-form-value-engine"
+    result["serviceVersion"] = "step38-api-tennis-settle"
 
     try:
         if result.get("status") == "ok":
@@ -1131,7 +1131,7 @@ def sync_results2026_run(day: str = Query("today"), dry_run: bool = Query(False)
     target_day = normalize_day(day)
     syncer = Results2026Syncer(client=SportradarClient(), base_dir=BASE_DIR)
     result = syncer.sync_day(target_day, dry_run=dry_run)
-    result["serviceVersion"] = "step34-form-value-engine"
+    result["serviceVersion"] = "step38-api-tennis-settle"
 
     # Si data/2026.csv a été modifié, on force la reconstruction de l'état Elo/Form au prochain calcul.
     try:
@@ -1152,7 +1152,7 @@ def sync_results2026_run(day: str = Query("today"), dry_run: bool = Query(False)
 def sync_premium_status() -> Dict[str, Any]:
     syncer = PremiumHistorySyncer(store=PostgresPremiumStore())
     status = syncer.status()
-    status["serviceVersion"] = "step34-form-value-engine"
+    status["serviceVersion"] = "step38-api-tennis-settle"
     return status
 
 
@@ -1185,7 +1185,7 @@ def _history_list_payload(
     cleanup_result = None
     if auto_settle:
         syncer = PremiumHistorySyncer(store=store)
-        settle_result = syncer.settle_pending_recent(days_back=settle_days_back, dry_run=False)
+        settle_result = syncer.settle_pending_recent(days_back=settle_days_back, dry_run=False, provider="api_tennis")
         cleanup_result = store.cleanup_duplicate_events(category=cat)
     else:
         cleanup_result = store.cleanup_duplicate_events(category=cat)
@@ -1249,7 +1249,7 @@ def _history_list_payload(
         "settle": settle_result,
         "cleanup": cleanup_result,
         "policy": f"Liste historique moteur STEP33 filtrée : {cat}. Historique durable multi-années; auto-settle sur toutes les dates pending si settle_days_back=0; void/remboursé exclu du ROI; doublons legacy compactés.",
-        "serviceVersion": "step37-api-tennis-verified-corrections",
+        "serviceVersion": "step38-api-tennis-settle",
     }
 
 
@@ -1270,14 +1270,14 @@ def sync_history_form_value(
             "table": store.TABLE,
             "category": cat,
             "error": "DATABASE_URL absente dans le service web.",
-            "serviceVersion": "step37-api-tennis-verified-corrections",
+            "serviceVersion": "step38-api-tennis-settle",
         }
     try:
         report = store.form_value_report(category=cat, limit=limit)
         report["databaseConfigured"] = True
         report["databaseStatus"] = "ok"
         report["table"] = store.TABLE
-        report["serviceVersion"] = "step34-form-value-engine"
+        report["serviceVersion"] = "step38-api-tennis-settle"
         return report
     except Exception as exc:
         return {
@@ -1287,7 +1287,7 @@ def sync_history_form_value(
             "table": store.TABLE,
             "category": cat,
             "error": f"{type(exc).__name__}: {exc}",
-            "serviceVersion": "step37-api-tennis-verified-corrections",
+            "serviceVersion": "step38-api-tennis-settle",
         }
 
 
@@ -1312,7 +1312,7 @@ def sync_history_list(
             "error": "DATABASE_URL absente dans le service web.",
             "items": [],
             "rows": [],
-            "serviceVersion": "step37-api-tennis-verified-corrections",
+            "serviceVersion": "step38-api-tennis-settle",
         }
 
     try:
@@ -1327,7 +1327,7 @@ def sync_history_list(
             "error": f"{type(exc).__name__}: {exc}",
             "items": [],
             "rows": [],
-            "serviceVersion": "step37-api-tennis-verified-corrections",
+            "serviceVersion": "step38-api-tennis-settle",
         }
 
 
@@ -1349,7 +1349,7 @@ def sync_premium_list(
             "error": "DATABASE_URL absente dans le service web.",
             "items": [],
             "rows": [],
-            "serviceVersion": "step37-api-tennis-verified-corrections",
+            "serviceVersion": "step38-api-tennis-settle",
         }
     try:
         return _history_list_payload(store, "PREMIUM", limit, auto_settle, settle_days_back)
@@ -1363,7 +1363,7 @@ def sync_premium_list(
             "error": f"{type(exc).__name__}: {exc}",
             "items": [],
             "rows": [],
-            "serviceVersion": "step37-api-tennis-verified-corrections",
+            "serviceVersion": "step38-api-tennis-settle",
         }
 
 
@@ -1376,8 +1376,8 @@ def sync_premium_settle(day: str = Query("today"), dry_run: bool = Query(False))
     """
     target_day = normalize_day(day)
     syncer = PremiumHistorySyncer(store=PostgresPremiumStore())
-    result = syncer.settle_day_from_sportradar(target_day, dry_run=dry_run)
-    result["serviceVersion"] = "step34-form-value-engine"
+    result = syncer.settle_day_from_api_tennis(target_day, dry_run=dry_run)
+    result["serviceVersion"] = "step38-api-tennis-settle"
     return result
 
 
@@ -1388,8 +1388,8 @@ def sync_premium_settle_pending(days_back: int = Query(7, ge=1, le=60), dry_run:
     C'est l'endpoint à utiliser pour un cron Railway ou un contrôle manuel après les matchs.
     """
     syncer = PremiumHistorySyncer(store=PostgresPremiumStore())
-    result = syncer.settle_pending_recent(days_back=days_back, dry_run=dry_run)
-    result["serviceVersion"] = "step34-form-value-engine"
+    result = syncer.settle_pending_recent(days_back=days_back, dry_run=dry_run, provider="api_tennis")
+    result["serviceVersion"] = "step38-api-tennis-settle"
     return result
 
 
@@ -1398,16 +1398,16 @@ def sync_premium_settle_pending(days_back: int = Query(7, ge=1, le=60), dry_run:
 def sync_history_settle(day: str = Query("today"), dry_run: bool = Query(False)) -> Dict[str, Any]:
     target_day = normalize_day(day)
     syncer = PremiumHistorySyncer(store=PostgresPremiumStore())
-    result = syncer.settle_day_from_sportradar(target_day, dry_run=dry_run)
-    result["serviceVersion"] = "step34-form-value-engine"
+    result = syncer.settle_day_from_api_tennis(target_day, dry_run=dry_run)
+    result["serviceVersion"] = "step38-api-tennis-settle"
     return result
 
 
 @app.get("/sync/history/settle-pending")
 def sync_history_settle_pending(days_back: int = Query(7, ge=1, le=60), dry_run: bool = Query(False)) -> Dict[str, Any]:
     syncer = PremiumHistorySyncer(store=PostgresPremiumStore())
-    result = syncer.settle_pending_recent(days_back=days_back, dry_run=dry_run)
-    result["serviceVersion"] = "step34-form-value-engine"
+    result = syncer.settle_pending_recent(days_back=days_back, dry_run=dry_run, provider="api_tennis")
+    result["serviceVersion"] = "step38-api-tennis-settle"
     return result
 
 
@@ -1426,11 +1426,11 @@ def sync_history_repair_dellien_royer(confirm: str = Query("")) -> Dict[str, Any
             "table": store.TABLE,
             "message": "Réparation refusée : ajoute confirm=YES.",
             "example": "/sync/history/repair-dellien-royer?confirm=YES",
-            "serviceVersion": "step37-api-tennis-verified-corrections",
+            "serviceVersion": "step38-api-tennis-settle",
         }
     try:
         result = store.repair_dellien_royer_refuse()
-        result["serviceVersion"] = "step34-form-value-engine"
+        result["serviceVersion"] = "step38-api-tennis-settle"
         return result
     except Exception as exc:
         return {
@@ -1438,7 +1438,7 @@ def sync_history_repair_dellien_royer(confirm: str = Query("")) -> Dict[str, Any
             "databaseConfigured": store.enabled,
             "table": store.TABLE,
             "error": f"{type(exc).__name__}: {exc}",
-            "serviceVersion": "step37-api-tennis-verified-corrections",
+            "serviceVersion": "step38-api-tennis-settle",
         }
 
 
@@ -1455,14 +1455,14 @@ def sync_history_reset(category: str = Query("premium"), confirm: str = Query(""
             "category": cat,
             "message": "Reset refusé : ajoute confirm=YES.",
             "example": f"/sync/history/reset?category={cat.lower()}&confirm=YES",
-            "serviceVersion": "step37-api-tennis-verified-corrections",
+            "serviceVersion": "step38-api-tennis-settle",
         }
     try:
         if cat == "ALL":
             result = store.reset_all()
         else:
             result = store.reset_category(cat)
-        result["serviceVersion"] = "step34-form-value-engine"
+        result["serviceVersion"] = "step38-api-tennis-settle"
         return result
     except Exception as exc:
         return {
@@ -1471,7 +1471,7 @@ def sync_history_reset(category: str = Query("premium"), confirm: str = Query(""
             "table": store.TABLE,
             "category": cat,
             "error": f"{type(exc).__name__}: {exc}",
-            "serviceVersion": "step37-api-tennis-verified-corrections",
+            "serviceVersion": "step38-api-tennis-settle",
         }
 
 
@@ -1487,11 +1487,11 @@ def sync_premium_reset(confirm: str = Query("")) -> Dict[str, Any]:
             "category": "PREMIUM",
             "message": "Reset refusé : ajoute ?confirm=YES pour vider l'historique PREMIUM uniquement.",
             "example": "/sync/premium/reset?confirm=YES",
-            "serviceVersion": "step37-api-tennis-verified-corrections",
+            "serviceVersion": "step38-api-tennis-settle",
         }
     try:
         result = store.reset_category("PREMIUM")
-        result["serviceVersion"] = "step34-form-value-engine"
+        result["serviceVersion"] = "step38-api-tennis-settle"
         return result
     except Exception as exc:
         return {
@@ -1500,7 +1500,7 @@ def sync_premium_reset(confirm: str = Query("")) -> Dict[str, Any]:
             "table": store.TABLE,
             "category": "PREMIUM",
             "error": f"{type(exc).__name__}: {exc}",
-            "serviceVersion": "step37-api-tennis-verified-corrections",
+            "serviceVersion": "step38-api-tennis-settle",
         }
 
 
@@ -1510,7 +1510,7 @@ def sync_premium_run(day: str = Query("today"), dry_run: bool = Query(False)) ->
     daily_result = daily(target_day, auto_history=False)
     syncer = PremiumHistorySyncer(store=PostgresPremiumStore())
     result = syncer.sync_daily_result(daily_result, target_day, dry_run=dry_run)
-    result["serviceVersion"] = "step34-form-value-engine"
+    result["serviceVersion"] = "step38-api-tennis-settle"
     return result
 
 
