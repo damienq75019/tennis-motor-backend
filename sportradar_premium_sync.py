@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
+from api_tennis_daily_builder import ApiTennisDailyBuilder
 from postgres_premium_store import PostgresPremiumStore, premium_history_key
 from sportradar_client import SportradarClient, SportradarError
 
@@ -298,6 +299,207 @@ class PremiumHistorySyncer:
     def status(self) -> Dict[str, Any]:
         return self.store.status()
 
+    def settle_day_from_api_tennis(self, target_day: str, *, dry_run: bool = False, builder: Optional[ApiTennisDailyBuilder] = None) -> Dict[str, Any]:
+        """Settle pending history rows for one day using API-Tennis fixtures/results.
+
+        This is the normal STEP38 settlement path after migration away from Sportradar.
+        It does not create new picks. It only changes existing rows:
+        pending -> win/loss/void.
+        """
+        counts = {
+            "pending_before": 0,
+            "pending_with_event_id": 0,
+            "api_tennis_matches": 0,
+            "finished_matches": 0,
+            "matched_pending_events": 0,
+            "settled": 0,
+            "voided": 0,
+            "still_pending": 0,
+            "missing_event_id": 0,
+            "missing_in_api_tennis": 0,
+            "not_finished": 0,
+            "unresolved_winner": 0,
+        }
+        errors: List[str] = []
+        settled_sample: List[Dict[str, Any]] = []
+        unresolved_sample: List[Dict[str, Any]] = []
+
+        if not self.store.enabled:
+            return {
+                "status": "error",
+                "provider": "api_tennis",
+                "targetDay": target_day,
+                "dryRun": dry_run,
+                "errors": ["DATABASE_URL absente : historique moteur PostgreSQL indisponible."],
+                "counts": counts,
+            }
+
+        try:
+            self.store.ensure_schema()
+            pending_rows = self.store.fetch_pending_rows(day=target_day)
+        except Exception as exc:
+            return {
+                "status": "error",
+                "provider": "postgres",
+                "targetDay": target_day,
+                "dryRun": dry_run,
+                "errors": [f"PostgreSQL error: {type(exc).__name__}: {exc}"],
+                "counts": counts,
+            }
+
+        counts["pending_before"] = len(pending_rows)
+
+        pending_by_event: Dict[str, List[Dict[str, Any]]] = {}
+        for row in pending_rows:
+            event_id = _s(row.get("sportradarSportEventId"))
+            if not event_id:
+                counts["missing_event_id"] += 1
+                if len(unresolved_sample) < 10:
+                    unresolved_sample.append({"id": row.get("id"), "reason": "missing_event_id", "pick": row.get("predictedWinner")})
+                continue
+            pending_by_event.setdefault(event_id, []).append(row)
+
+        counts["pending_with_event_id"] = sum(len(v) for v in pending_by_event.values())
+
+        builder = builder or ApiTennisDailyBuilder()
+        payload = builder.build_matches_for_day(target_day)
+        if payload.get("status") != "ok":
+            return {
+                "status": "error",
+                "provider": "api_tennis",
+                "targetDay": target_day,
+                "dryRun": dry_run,
+                "errors": [str(payload.get("error") or "Erreur API-Tennis inconnue")],
+                "counts": counts,
+                "settledSample": settled_sample,
+                "unresolvedSample": unresolved_sample,
+                "audit": payload.get("audit", {}),
+            }
+
+        matches = payload.get("matches") if isinstance(payload, dict) else []
+        if not isinstance(matches, list):
+            matches = []
+        matches_by_event: Dict[str, Dict[str, Any]] = {}
+        for match in matches:
+            if not isinstance(match, dict):
+                continue
+            event_id = _s(match.get("sportradarSportEventId") or match.get("sportEventId"))
+            if event_id:
+                matches_by_event[event_id] = match
+
+        counts["api_tennis_matches"] = len(matches_by_event)
+
+        # First pass: void/refund overrides even if the row was already settled earlier.
+        for event_id, match in matches_by_event.items():
+            if not _is_void_match(match):
+                continue
+            real_winner = _winner_name_from_match(match)
+            winner_id = _s(match.get("winnerId"))
+            score = _s(match.get("score"))
+            if dry_run:
+                changed = len(self.store.fetch_rows_by_event(event_id)) if self.store.enabled else 0
+            else:
+                try:
+                    changed = self.store.void_rows_by_event(
+                        event_id,
+                        score,
+                        winner_id,
+                        reason="api_tennis_fixtures_void",
+                        real_winner=real_winner,
+                    )
+                except Exception as exc:
+                    errors.append(f"void event {event_id} failed: {type(exc).__name__}: {exc}")
+                    changed = 0
+            if changed:
+                counts["voided"] += int(changed)
+                if len(settled_sample) < 10:
+                    settled_sample.append({
+                        "eventId": event_id,
+                        "result": "void",
+                        "winnerId": winner_id,
+                        "realWinner": real_winner,
+                        "score": score,
+                        "rowsChanged": int(changed),
+                    })
+
+        for event_id, rows in pending_by_event.items():
+            match = matches_by_event.get(event_id)
+            if not match:
+                counts["missing_in_api_tennis"] += len(rows)
+                if len(unresolved_sample) < 10:
+                    unresolved_sample.append({"eventId": event_id, "reason": "missing_in_api_tennis", "rows": len(rows)})
+                continue
+
+            if _is_void_match(match):
+                # Already handled by void pass above.
+                continue
+
+            if not _is_finished(match):
+                counts["not_finished"] += len(rows)
+                if len(unresolved_sample) < 10:
+                    unresolved_sample.append({"eventId": event_id, "reason": "not_finished", "rows": len(rows), "status": _s(match.get("status")), "matchStatus": _s(match.get("matchStatus"))})
+                continue
+
+            counts["finished_matches"] += 1
+            real_winner = _winner_name_from_match(match)
+            winner_id = _s(match.get("winnerId"))
+            score = _s(match.get("score"))
+
+            if not real_winner:
+                counts["unresolved_winner"] += len(rows)
+                if len(unresolved_sample) < 10:
+                    unresolved_sample.append({"eventId": event_id, "reason": "winner_name_not_resolved", "winnerId": winner_id})
+                continue
+
+            counts["matched_pending_events"] += len(rows)
+
+            if dry_run:
+                changed = len(rows)
+            else:
+                try:
+                    changed = self.store.settle_pending_by_event(
+                        event_id,
+                        real_winner,
+                        score,
+                        winner_id,
+                        source="api_tennis_fixtures",
+                    )
+                except Exception as exc:
+                    errors.append(f"settle event {event_id} failed: {type(exc).__name__}: {exc}")
+                    changed = 0
+
+            counts["settled"] += int(changed)
+            if changed and len(settled_sample) < 10:
+                settled_sample.append({
+                    "eventId": event_id,
+                    "realWinner": real_winner,
+                    "winnerId": winner_id,
+                    "score": score,
+                    "rowsChanged": int(changed),
+                })
+
+        counts["still_pending"] = max(0, counts["pending_before"] - counts["settled"] - counts["voided"])
+        status = "ok" if not errors else "partial"
+        return {
+            "status": status,
+            "provider": "api_tennis",
+            "targetDay": target_day,
+            "dryRun": dry_run,
+            "generatedAt": datetime.utcnow().isoformat() + "Z",
+            "errors": errors,
+            "counts": counts,
+            "settledSample": settled_sample,
+            "unresolvedSample": unresolved_sample,
+            "audit": payload.get("audit", {}),
+            "storage": {
+                "mode": "postgres",
+                "databaseConfigured": self.store.enabled,
+                "table": self.store.TABLE,
+                "status": self.store.status(),
+            },
+            "policy": "Règlement STEP38 API-Tennis : pending -> win/loss via winner_id API-Tennis; retired/walkover/cancelled/abandoned -> void/remboursé.",
+        }
+
     def settle_day_from_sportradar(self, target_day: str, *, dry_run: bool = False, client: Optional[SportradarClient] = None) -> Dict[str, Any]:
         """Settle pending Premium/Proche rows for one day using Sportradar summaries.
 
@@ -500,7 +702,7 @@ class PremiumHistorySyncer:
             "policy": "Règlement strict STEP34 : pending -> win/loss via winner_id; retired/walkover/cancelled/abandoned -> void/remboursé, même si la ligne était déjà réglée.",
         }
 
-    def settle_pending_recent(self, *, days_back: int = 0, dry_run: bool = False, client: Optional[SportradarClient] = None) -> Dict[str, Any]:
+    def settle_pending_recent(self, *, days_back: int = 0, dry_run: bool = False, client: Optional[SportradarClient] = None, provider: str = "api_tennis") -> Dict[str, Any]:
         # STEP34: days_back=0 means no calendar limit: settle every pending history date, year after year.
         days_back = max(0, min(int(days_back or 0), 36500))
         counts = {
@@ -537,10 +739,15 @@ class PremiumHistorySyncer:
             }
 
         counts["dates_with_history"] = len(dates)
+        provider_norm = _s(provider or "api_tennis").lower()
+        api_builder = ApiTennisDailyBuilder() if provider_norm in {"api_tennis", "api-tennis", "apitennis"} else None
         client = client or SportradarClient()
 
         for day in dates:
-            result = self.settle_day_from_sportradar(day, dry_run=dry_run, client=client)
+            if provider_norm in {"api_tennis", "api-tennis", "apitennis"}:
+                result = self.settle_day_from_api_tennis(day, dry_run=dry_run, builder=api_builder)
+            else:
+                result = self.settle_day_from_sportradar(day, dry_run=dry_run, client=client)
             results.append(result)
             c = result.get("counts") or {}
             counts["settled"] += int(c.get("settled") or 0)
@@ -552,13 +759,13 @@ class PremiumHistorySyncer:
         status = "ok" if counts["errors"] == 0 else "partial"
         return {
             "status": status,
-            "provider": "history_provider",
+            "provider": "api_tennis" if _s(provider or "api_tennis").lower() in {"api_tennis", "api-tennis", "apitennis"} else "sportradar",
             "dryRun": dry_run,
             "generatedAt": datetime.utcnow().isoformat() + "Z",
             "counts": counts,
             "dates": dates,
             "results": results,
-            "policy": "STEP34 : si days_back=0, vérifie toutes les dates ayant des lignes pending, sans limite de quelques jours; pending -> win/loss et retired/walkover/cancelled/abandoned -> void/remboursé.",
+            "policy": "STEP38 : si days_back=0, vérifie toutes les dates ayant des lignes pending; provider par défaut API-Tennis; pending -> win/loss et retired/walkover/cancelled/abandoned -> void/remboursé.",
         }
 
     def sync_daily_result(self, daily_result: Dict[str, Any], target_day: str, *, dry_run: bool = False) -> Dict[str, Any]:
