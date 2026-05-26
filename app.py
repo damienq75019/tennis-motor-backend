@@ -29,7 +29,7 @@ PAYLOAD_DIR = OUTPUT_DIR / "payloads"
 # Règle utilisateur verrouillée : Jannik Sinner reste exclu de l'analyse.
 EXCLUDED_ANALYSIS_PLAYERS = ["Jannik Sinner"]
 
-app = FastAPI(title="Tennis Motor Backend Clean", version="step36-api-tennis-migration")
+app = FastAPI(title="Tennis Motor Backend Clean", version="step37-api-tennis-verified-corrections")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -750,7 +750,7 @@ def _apply_form_value_engine(response: Dict[str, Any]) -> None:
         response["daily"]["formValueEngine"] = {
             "status": "skipped",
             "reason": "no_matches",
-            "version": "step36-api-tennis-migration",
+            "version": "step37-api-tennis-verified-corrections",
         }
         return
 
@@ -759,7 +759,7 @@ def _apply_form_value_engine(response: Dict[str, Any]) -> None:
         response["daily"]["formValueEngine"] = {
             "status": "skipped",
             "reason": "database_not_configured",
-            "version": "step36-api-tennis-migration",
+            "version": "step37-api-tennis-verified-corrections",
         }
         return
 
@@ -768,7 +768,7 @@ def _apply_form_value_engine(response: Dict[str, Any]) -> None:
     except Exception as exc:
         response["daily"]["formValueEngine"] = {
             "status": "error",
-            "version": "step36-api-tennis-migration",
+            "version": "step37-api-tennis-verified-corrections",
             "error": f"{type(exc).__name__}: {exc}",
         }
         return
@@ -819,7 +819,7 @@ def _apply_form_value_engine(response: Dict[str, Any]) -> None:
 
     response["daily"]["formValueEngine"] = {
         "status": "ok",
-        "version": "step36-api-tennis-migration",
+        "version": "step37-api-tennis-verified-corrections",
         "mode": "active_history_value_layer",
         "counts": counts,
         "categoryRanking": report.get("ranking", []),
@@ -833,8 +833,8 @@ def root() -> Dict[str, Any]:
     return {
         "status": "ok",
         "service": "Tennis Motor Backend Clean",
-        "version": "step36-api-tennis-migration",
-        "message": "Backend STEP36 : API-Tennis en provider quotidien prioritaire + PostgreSQL + cotes Flashscore + Form Value Engine + historiques Premium/Proches/Veto/Refusés.",
+        "version": "step37-api-tennis-verified-corrections",
+        "message": "Backend STEP37 : API-Tennis vérifié + correction seasonName + Form Value sans promotion si cote manquante.",
         "endpoints": ["/health", "/calculate", "/predictions", "/state", "/history", "/daily", "/api-tennis/status", "/sportradar/status", "/odds/status", "/sync/results2026/status", "/sync/results2026/run", "/sync/results2026/postgres/status", "/sync/results2026/postgres/export", "/sync/premium/status", "/sync/premium/list", "/sync/premium/reset", "/sync/premium/run", "/sync/premium/settle", "/sync/premium/settle-pending", "/sync/history/form-value", "/sync/history/list", "/sync/history/reset", "/sync/history/repair-dellien-royer", "/sync/history/settle", "/sync/history/settle-pending"],
         "excludedAnalysisPlayers": _excluded_analysis_names(),
     }
@@ -846,7 +846,7 @@ def health() -> Dict[str, Any]:
     return {
         "status": "ok",
         "service": "Tennis Motor Backend Clean",
-        "version": "step36-api-tennis-migration",
+        "version": "step37-api-tennis-verified-corrections",
         "historyYears": list(HISTORY_YEARS),
         "historyRowsLoaded": state.get("history_rows_loaded", 0),
         "excludedAnalysisPlayers": _excluded_analysis_names(),
@@ -1001,7 +1001,7 @@ def odds_status() -> Dict[str, Any]:
         "records": audit.get("records", 0),
         "errors": audit.get("errors", []),
         "warnings": audit.get("warnings", []),
-        "serviceVersion": "step36-api-tennis-migration",
+        "serviceVersion": "step37-api-tennis-verified-corrections",
     }
 
 
@@ -1249,7 +1249,7 @@ def _history_list_payload(
         "settle": settle_result,
         "cleanup": cleanup_result,
         "policy": f"Liste historique moteur STEP33 filtrée : {cat}. Historique durable multi-années; auto-settle sur toutes les dates pending si settle_days_back=0; void/remboursé exclu du ROI; doublons legacy compactés.",
-        "serviceVersion": "step36-api-tennis-migration",
+        "serviceVersion": "step37-api-tennis-verified-corrections",
     }
 
 
@@ -1270,7 +1270,7 @@ def sync_history_form_value(
             "table": store.TABLE,
             "category": cat,
             "error": "DATABASE_URL absente dans le service web.",
-            "serviceVersion": "step36-api-tennis-migration",
+            "serviceVersion": "step37-api-tennis-verified-corrections",
         }
     try:
         report = store.form_value_report(category=cat, limit=limit)
@@ -1287,7 +1287,7 @@ def sync_history_form_value(
             "table": store.TABLE,
             "category": cat,
             "error": f"{type(exc).__name__}: {exc}",
-            "serviceVersion": "step36-api-tennis-migration",
+            "serviceVersion": "step37-api-tennis-verified-corrections",
         }
 
 
@@ -1312,7 +1312,7 @@ def sync_history_list(
             "error": "DATABASE_URL absente dans le service web.",
             "items": [],
             "rows": [],
-            "serviceVersion": "step36-api-tennis-migration",
+            "serviceVersion": "step37-api-tennis-verified-corrections",
         }
 
     try:
@@ -1327,7 +1327,7 @@ def sync_history_list(
             "error": f"{type(exc).__name__}: {exc}",
             "items": [],
             "rows": [],
-            "serviceVersion": "step36-api-tennis-migration",
+            "serviceVersion": "step37-api-tennis-verified-corrections",
         }
 
 
@@ -1349,7 +1349,7 @@ def sync_premium_list(
             "error": "DATABASE_URL absente dans le service web.",
             "items": [],
             "rows": [],
-            "serviceVersion": "step36-api-tennis-migration",
+            "serviceVersion": "step37-api-tennis-verified-corrections",
         }
     try:
         return _history_list_payload(store, "PREMIUM", limit, auto_settle, settle_days_back)
@@ -1363,7 +1363,7 @@ def sync_premium_list(
             "error": f"{type(exc).__name__}: {exc}",
             "items": [],
             "rows": [],
-            "serviceVersion": "step36-api-tennis-migration",
+            "serviceVersion": "step37-api-tennis-verified-corrections",
         }
 
 
@@ -1426,7 +1426,7 @@ def sync_history_repair_dellien_royer(confirm: str = Query("")) -> Dict[str, Any
             "table": store.TABLE,
             "message": "Réparation refusée : ajoute confirm=YES.",
             "example": "/sync/history/repair-dellien-royer?confirm=YES",
-            "serviceVersion": "step36-api-tennis-migration",
+            "serviceVersion": "step37-api-tennis-verified-corrections",
         }
     try:
         result = store.repair_dellien_royer_refuse()
@@ -1438,7 +1438,7 @@ def sync_history_repair_dellien_royer(confirm: str = Query("")) -> Dict[str, Any
             "databaseConfigured": store.enabled,
             "table": store.TABLE,
             "error": f"{type(exc).__name__}: {exc}",
-            "serviceVersion": "step36-api-tennis-migration",
+            "serviceVersion": "step37-api-tennis-verified-corrections",
         }
 
 
@@ -1455,7 +1455,7 @@ def sync_history_reset(category: str = Query("premium"), confirm: str = Query(""
             "category": cat,
             "message": "Reset refusé : ajoute confirm=YES.",
             "example": f"/sync/history/reset?category={cat.lower()}&confirm=YES",
-            "serviceVersion": "step36-api-tennis-migration",
+            "serviceVersion": "step37-api-tennis-verified-corrections",
         }
     try:
         if cat == "ALL":
@@ -1471,7 +1471,7 @@ def sync_history_reset(category: str = Query("premium"), confirm: str = Query(""
             "table": store.TABLE,
             "category": cat,
             "error": f"{type(exc).__name__}: {exc}",
-            "serviceVersion": "step36-api-tennis-migration",
+            "serviceVersion": "step37-api-tennis-verified-corrections",
         }
 
 
@@ -1487,7 +1487,7 @@ def sync_premium_reset(confirm: str = Query("")) -> Dict[str, Any]:
             "category": "PREMIUM",
             "message": "Reset refusé : ajoute ?confirm=YES pour vider l'historique PREMIUM uniquement.",
             "example": "/sync/premium/reset?confirm=YES",
-            "serviceVersion": "step36-api-tennis-migration",
+            "serviceVersion": "step37-api-tennis-verified-corrections",
         }
     try:
         result = store.reset_category("PREMIUM")
@@ -1500,7 +1500,7 @@ def sync_premium_reset(confirm: str = Query("")) -> Dict[str, Any]:
             "table": store.TABLE,
             "category": "PREMIUM",
             "error": f"{type(exc).__name__}: {exc}",
-            "serviceVersion": "step36-api-tennis-migration",
+            "serviceVersion": "step37-api-tennis-verified-corrections",
         }
 
 
