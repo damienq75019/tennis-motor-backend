@@ -251,6 +251,30 @@ class ApiTennisDailyBuilder:
     def _bool_text(value: Any) -> bool:
         return str(value or "").strip().lower() in {"true", "1", "yes", "oui"}
 
+    @staticmethod
+    def _clean_season_name(event: Dict[str, Any], target_day: str) -> str:
+        """Build a stable season label from the actual target date.
+
+        API-Tennis can return a stale tournament_season value on some fixtures
+        (for example French Open 2025 while event_date is in 2026).  For Tennis
+        Motor, the date of the fixture is the source of truth for the displayed
+        season year and for the historical key.
+        """
+        tournament = ApiTennisDailyBuilder._safe_str(event.get("tournament_name")) or "Tournament"
+        raw_season = ApiTennisDailyBuilder._safe_str(event.get("tournament_season"))
+        target_year = ""
+        try:
+            target_year = str(datetime.fromisoformat(str(target_day)).year)
+        except Exception:
+            m = re.search(r"\b(20\d{2})\b", str(target_day or ""))
+            target_year = m.group(1) if m else ""
+
+        if target_year:
+            return f"{tournament} {target_year}".strip()
+        if raw_season:
+            return f"{tournament} {raw_season}".strip()
+        return tournament
+
     def build_matches_for_day(self, target_day: str) -> Dict[str, Any]:
         if not self.enabled:
             return {
@@ -360,7 +384,8 @@ class ApiTennisDailyBuilder:
                 "sportradarSeasonId": "",
                 "sportradarCompetitionId": self._safe_str(event.get("tournament_key")),
                 "tournament": self._safe_str(event.get("tournament_name")),
-                "seasonName": f"{self._safe_str(event.get('tournament_name'))} {self._safe_str(event.get('tournament_season'))}".strip(),
+                "seasonName": self._clean_season_name(event, target_day),
+                "apiTennisRawTournamentSeason": self._safe_str(event.get("tournament_season")),
                 "round": self._safe_str(event.get("tournament_round")),
                 "startTime": start_time,
                 "status": status,
