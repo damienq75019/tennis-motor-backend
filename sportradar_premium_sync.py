@@ -261,7 +261,7 @@ def _build_history_row(match: Dict[str, Any], target_day: str, category: str) ->
         "id": row_id,
         "date": target_day,
         "sportradarSportEventId": event_id,
-        "source": "sportradar",
+        "source": _s(match.get("source") or match.get("dataProvider") or "api_tennis"),
         "sourcePlayerA": source_a,
         "sourcePlayerB": source_b,
         "predictedWinner": predicted,
@@ -278,7 +278,7 @@ def _build_history_row(match: Dict[str, Any], target_day: str, category: str) ->
         "result": "void" if _is_void_match(match) else "pending",
         "realWinner": _winner_name_from_match(match) if _is_void_match(match) else "",
         "settledAt": target_day if _is_void_match(match) else "",
-        "settleSource": "sportradar_void" if _is_void_match(match) else "",
+        "settleSource": f"{_s(match.get("source") or match.get("dataProvider") or "api_tennis")}_void" if _is_void_match(match) else "",
         "tournament": _s(match.get("tournament")),
         "seasonName": _s(match.get("seasonName")),
         "round": _s(match.get("round")),
@@ -325,7 +325,7 @@ class PremiumHistorySyncer:
         if not self.store.enabled:
             return {
                 "status": "error",
-                "provider": "sportradar",
+                "provider": "history_provider",
                 "targetDay": target_day,
                 "dryRun": dry_run,
                 "errors": ["DATABASE_URL absente : historique moteur PostgreSQL indisponible."],
@@ -365,7 +365,7 @@ class PremiumHistorySyncer:
         except SportradarError as exc:
             return {
                 "status": "error",
-                "provider": "sportradar",
+                "provider": "history_provider",
                 "targetDay": target_day,
                 "dryRun": dry_run,
                 "errors": [str(exc)],
@@ -376,7 +376,7 @@ class PremiumHistorySyncer:
         except Exception as exc:
             return {
                 "status": "error",
-                "provider": "sportradar",
+                "provider": "history_provider",
                 "targetDay": target_day,
                 "dryRun": dry_run,
                 "errors": [f"{type(exc).__name__}: {exc}"],
@@ -403,7 +403,7 @@ class PremiumHistorySyncer:
                         event_id,
                         score,
                         winner_id,
-                        reason="sportradar_daily_summaries_void",
+                        reason="provider_daily_summaries_void",
                         real_winner=real_winner,
                     )
                 except TypeError:
@@ -483,7 +483,7 @@ class PremiumHistorySyncer:
         status = "ok" if not errors else "partial"
         return {
             "status": status,
-            "provider": "sportradar",
+            "provider": "history_provider",
             "targetDay": target_day,
             "dryRun": dry_run,
             "generatedAt": datetime.utcnow().isoformat() + "Z",
@@ -517,7 +517,7 @@ class PremiumHistorySyncer:
         if not self.store.enabled:
             return {
                 "status": "error",
-                "provider": "sportradar",
+                "provider": "history_provider",
                 "dryRun": dry_run,
                 "errors": ["DATABASE_URL absente : historique moteur PostgreSQL indisponible."],
                 "counts": counts,
@@ -552,7 +552,7 @@ class PremiumHistorySyncer:
         status = "ok" if counts["errors"] == 0 else "partial"
         return {
             "status": status,
-            "provider": "sportradar",
+            "provider": "history_provider",
             "dryRun": dry_run,
             "generatedAt": datetime.utcnow().isoformat() + "Z",
             "counts": counts,
@@ -590,7 +590,7 @@ class PremiumHistorySyncer:
         if not self.store.enabled:
             return {
                 "status": "error",
-                "provider": "sportradar",
+                "provider": "history_provider",
                 "targetDay": target_day,
                 "dryRun": dry_run,
                 "errors": ["DATABASE_URL absente : historique moteur PostgreSQL indisponible."],
@@ -602,7 +602,7 @@ class PremiumHistorySyncer:
         except Exception as exc:
             return {
                 "status": "error",
-                "provider": "sportradar",
+                "provider": "history_provider",
                 "targetDay": target_day,
                 "dryRun": dry_run,
                 "errors": [f"PostgreSQL error: {type(exc).__name__}: {exc}"],
@@ -701,7 +701,7 @@ class PremiumHistorySyncer:
                             event_id,
                             _s(match.get("score")),
                             _s(match.get("winnerId")),
-                            reason="sportradar_daily_void",
+                            reason=f"{_s(match.get("source") or match.get("dataProvider") or "provider")}_daily_void",
                             real_winner=_winner_name_from_match(match),
                         )
                     except Exception as exc:
@@ -750,7 +750,7 @@ class PremiumHistorySyncer:
         status = "ok" if not errors else "partial"
         return {
             "status": status,
-            "provider": "sportradar",
+            "provider": "history_provider",
             "targetDay": target_day,
             "dryRun": dry_run,
             "generatedAt": datetime.utcnow().isoformat() + "Z",
@@ -769,5 +769,5 @@ class PremiumHistorySyncer:
                 "step": (daily_result.get("daily") or {}).get("step"),
                 "summary": daily_result.get("summary", {}),
             },
-            "policy": "Historique moteur STEP34 : Premium/Proches/Veto/Refusés; 1 ligne par match; retired/walkover/cancelled/abandoned -> void/remboursé; règlement win/loss via winner_id Sportradar.",
+            "policy": "Historique moteur STEP36 : Premium/Proches/Veto/Refusés; 1 ligne par match; retired/walkover/cancelled/abandoned -> void/remboursé; règlement win/loss via winner_id provider.",
         }
