@@ -1224,7 +1224,8 @@ def score_match_with_form_value(match: Dict[str, Any], category: str, report: Di
     wins = groups.get("wins") or {}
     losses = groups.get("losses") or {}
     odd = _f(match.get("oddA") or match.get("playerAOdd") or match.get("coteA"), 0.0)
-    implied = round(100.0 / odd, 2) if odd > 1.0 else 0.0
+    has_valid_odd = odd > 1.0
+    implied = round(100.0 / odd, 2) if has_valid_odd else 0.0
 
     match_signals = {key: (_row_signal_value(match, key) if isinstance(match, dict) else None) for key in FORM_VALUE_SIGNAL_KEYS}
     # _row_signal_value expects raw-compatible row; direct match values still work.
@@ -1244,6 +1245,13 @@ def score_match_with_form_value(match: Dict[str, Any], category: str, report: Di
     if not active_sample:
         action = "WAIT"
         label = "⏳ FORM — échantillon court"
+        playable = False
+    elif not has_valid_odd:
+        # No market price = no value decision.  A Refusé with a strong historical
+        # category must not be promoted if the implied probability cannot be
+        # calculated from a real odd.
+        action = "WAIT"
+        label = "⏳ FORM — cote manquante"
         playable = False
     elif value_score >= 5.0 and hist_roi > 0:
         action = "PROMOTE"
@@ -1273,7 +1281,12 @@ def score_match_with_form_value(match: Dict[str, Any], category: str, report: Di
         "formValueWinFitPct": win_fit,
         "formValueLossFitPct": loss_fit,
         "formValueFormDeltaPct": form_delta,
-        "formValueReason": f"Catégorie {cat}: WR {hist_win_rate:.1f}% vs seuil cote {implied:.1f}%, ROI {hist_roi:.1f}%, fit win {win_fit:.1f} / loss {loss_fit:.1f}.",
+        "formValueOddAvailable": bool(has_valid_odd),
+        "formValueReason": (
+            f"Catégorie {cat}: WR {hist_win_rate:.1f}% vs seuil cote {implied:.1f}%, ROI {hist_roi:.1f}%, fit win {win_fit:.1f} / loss {loss_fit:.1f}."
+            if has_valid_odd
+            else f"Catégorie {cat}: cote manquante, aucune promotion value autorisée; ROI hist {hist_roi:.1f}%, fit win {win_fit:.1f} / loss {loss_fit:.1f}."
+        ),
     }
 
 def stats_for_period(rows: List[Dict[str, Any]], period_days: Optional[int], category: Optional[str] = "PREMIUM") -> Dict[str, Any]:
