@@ -1,0 +1,10 @@
+fastapi
+uvicorn[standard]
+pydantic
+requests
+beautifulsoup4
+lxml
+pandas
+numpy
+playwright==1.60.0
+psycopg[binary]
