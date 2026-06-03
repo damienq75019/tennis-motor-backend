@@ -609,11 +609,7 @@ class PostgresPremiumStore:
                         refuse_value_cote_180, refuse_value_large, refuse_value_strict, refuse_value_danger,
                         refuse_value_status, refuse_value_decision, refuse_value_label, refuse_value_reason,
                         veto_audit, veto_audit_active, veto_audit_policy, raw_json
-                    ) VALUES (
-                        %s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,
-                        %s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,
-                        %s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s
-                    )
+                    ) VALUES ({','.join(['%s'] * len(params))})
                     ON CONFLICT (id) DO UPDATE SET
                         source = EXCLUDED.source,
                         source_player_a = EXCLUDED.source_player_a,
