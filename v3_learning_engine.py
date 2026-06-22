@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Tennis Motor — V3.2.1 Rule Validator / Quarantine
+Tennis Motor — V3.2.2 Latest Shadow Cleanup
 
 Non-destructive intelligent layer above STEP56/STEP62.
 
-V3.2.1 adds Rule Validator / Quarantine after the V3.2 Shadow Result Tracker:
+V3.2.2 adds latest-decision-only tracking and shadow cleanup after V3.2.1:
 - persistent learning memory table from PostgreSQL history;
 - automatic shadow-rule generation from historical segments;
 - shadow evaluation for daily/live candidates;
@@ -14,12 +14,15 @@ V3.2.1 adds Rule Validator / Quarantine after the V3.2 Shadow Result Tracker:
 - V2 vs V3 shadow performance comparison;
 - automatic validation of shadow rules;
 - automatic quarantine/warning for rules that fail in real shadow results;
+- one active shadow decision per match in tracking;
+- cleanup/purge of old duplicated shadow decisions;
+- quarantined/warning rules excluded from active shadow performance;
 - zero replacement of the official motor until out-of-sample validation.
 
 Policy:
 - V2/STEP56 remains the official prediction engine.
-- V3.2.1 learns, writes memory, creates shadow rules, resolves conflicts, tracks settled shadow results, then validates or quarantines rules.
-- V3.2.1 does not change a bet decision automatically.
+- V3.2.2 learns, writes memory, creates shadow rules, resolves conflicts, tracks settled shadow results, validates/quarantines rules, and tracks only the latest active decision per match.
+- V3.2.2 does not change a bet decision automatically.
 """
 from __future__ import annotations
 
@@ -39,7 +42,7 @@ FINAL_WIN = "win"
 FINAL_LOSS = "loss"
 FINAL_VOID = "void"
 FINAL_PENDING = "pending"
-V3_VERSION = "v3.2.1-rule-validator-quarantine"
+V3_VERSION = "v3.2.2-latest-shadow-cleanup"
 
 
 def _s(value: Any) -> str:
@@ -855,8 +858,16 @@ class V3LearningMemoryStore:
                 cur.execute(f"ALTER TABLE {self.DECISIONS_TABLE} ADD COLUMN IF NOT EXISTS delta_vs_v2_eur DOUBLE PRECISION NOT NULL DEFAULT 0")
                 cur.execute(f"ALTER TABLE {self.DECISIONS_TABLE} ADD COLUMN IF NOT EXISTS settled_at TIMESTAMPTZ")
                 cur.execute(f"ALTER TABLE {self.DECISIONS_TABLE} ADD COLUMN IF NOT EXISTS tracking_payload_json TEXT NOT NULL DEFAULT '{{}}'")
+
+                # STEP V3.2.2: latest-decision cleanup metadata.
+                # v3_version lets reports ignore very old shadow rows if needed; is_active is kept
+                # for future archiving without breaking the current table.
+                cur.execute(f"ALTER TABLE {self.DECISIONS_TABLE} ADD COLUMN IF NOT EXISTS v3_version TEXT NOT NULL DEFAULT ''")
+                cur.execute(f"ALTER TABLE {self.DECISIONS_TABLE} ADD COLUMN IF NOT EXISTS is_active BOOLEAN NOT NULL DEFAULT TRUE")
                 cur.execute(f"CREATE INDEX IF NOT EXISTS idx_{self.DECISIONS_TABLE}_final_result ON {self.DECISIONS_TABLE}(final_result)")
                 cur.execute(f"CREATE INDEX IF NOT EXISTS idx_{self.DECISIONS_TABLE}_primary_rule ON {self.DECISIONS_TABLE}(primary_rule_id)")
+                cur.execute(f"CREATE INDEX IF NOT EXISTS idx_{self.DECISIONS_TABLE}_day_match_updated ON {self.DECISIONS_TABLE}(day, match_key, updated_at DESC)")
+                cur.execute(f"CREATE INDEX IF NOT EXISTS idx_{self.DECISIONS_TABLE}_active ON {self.DECISIONS_TABLE}(is_active)")
             conn.commit()
 
     def status(self) -> Dict[str, Any]:
@@ -1142,76 +1153,281 @@ class V3LearningMemoryStore:
                     })
         return out
 
-    def persist_shadow_decisions(self, day: str, decisions: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
+    def persist_shadow_decisions(
+        self,
+        day: str,
+        decisions: Sequence[Dict[str, Any]],
+        *,
+        purge_existing: bool = True,
+    ) -> Dict[str, Any]:
+        """Persist exactly one active V3 shadow decision per match.
+
+        STEP V3.2.2 change:
+        - V3.1/V3.2 wrote one row per matched rule, which polluted tracking
+          (for example 716 rows for 82 matches).
+        - V3.2.2 writes only the conflict resolver's primary rule decision.
+        - When purge_existing=True, all previous rows for the day are deleted first,
+          so a fresh /v3/shadow/daily?persist=true gives one row per match.
+        """
         self.ensure_schema()
+        day = _s(day)
         written = 0
+        deleted_existing = 0
         with self._connect() as conn:
             with conn.cursor() as cur:
+                if purge_existing and day and day.lower() not in {"all", "*"}:
+                    cur.execute(f"DELETE FROM {self.DECISIONS_TABLE} WHERE day = %s", (day,))
+                    deleted_existing = int(cur.rowcount or 0)
+
                 for d in decisions:
+                    match_key = _s(d.get("matchKey"))
+                    if not match_key:
+                        continue
                     match = d.get("match") or {}
-                    for rule in d.get("matchedRules", []) or []:
-                        decision_id = "v3d_" + _stable_hash(day, d.get("matchKey"), rule.get("ruleId"), length=18)
+                    primary_rule = d.get("primaryRule") or {}
+                    primary_rule_id = _s(primary_rule.get("ruleId")) or "NO_RULE"
+                    # Stable by day+match only: reruns update the same effective decision.
+                    decision_id = "v3d_latest_" + _stable_hash(day, match_key, length=22)
+                    cur.execute(
+                        f"""
+                        INSERT INTO {self.DECISIONS_TABLE} (
+                            decision_id, rule_id, primary_rule_id, match_key, day, player_a, player_b, category,
+                            shadow_decision, reason, result, final_result, source_payload_json,
+                            tracking_payload_json, v3_version, is_active, updated_at
+                        ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,TRUE,NOW())
+                        ON CONFLICT (decision_id) DO UPDATE SET
+                            rule_id = EXCLUDED.rule_id,
+                            primary_rule_id = EXCLUDED.primary_rule_id,
+                            player_a = EXCLUDED.player_a,
+                            player_b = EXCLUDED.player_b,
+                            category = EXCLUDED.category,
+                            shadow_decision = EXCLUDED.shadow_decision,
+                            reason = EXCLUDED.reason,
+                            result = EXCLUDED.result,
+                            final_result = EXCLUDED.final_result,
+                            final_profit_eur = 0,
+                            final_staked_eur = 0,
+                            delta_vs_v2_eur = 0,
+                            source_payload_json = EXCLUDED.source_payload_json,
+                            tracking_payload_json = EXCLUDED.tracking_payload_json,
+                            v3_version = EXCLUDED.v3_version,
+                            is_active = TRUE,
+                            settled_at = NULL,
+                            updated_at = NOW()
+                        """,
+                        (
+                            decision_id,
+                            primary_rule_id,
+                            primary_rule_id,
+                            match_key,
+                            day,
+                            _s(match.get("playerA") or match.get("sourcePlayerA") or match.get("predictedWinner")),
+                            _s(match.get("playerB") or match.get("sourcePlayerB") or match.get("opponent")),
+                            row_category(match),
+                            d.get("shadowDecision"),
+                            d.get("reason", ""),
+                            "pending",
+                            "pending",
+                            _json_dumps(d),
+                            _json_dumps(compact_shadow_payload(d)),
+                            V3_VERSION,
+                        ),
+                    )
+                    written += 1
+            conn.commit()
+        return {
+            "status": "ok",
+            "version": V3_VERSION,
+            "mode": "latest_decision_only",
+            "purgeExistingDay": bool(purge_existing),
+            "oldRowsDeleted": deleted_existing,
+            "shadowDecisionsWritten": written,
+            "policy": "V3.2.2 écrit une seule décision active par match : la règle primaire choisie par le resolver.",
+        }
+
+    def cleanup_shadow_decisions(
+        self,
+        *,
+        day: str = "",
+        keep_latest: bool = True,
+        purge_non_shadow_rules: bool = True,
+        dry_run: bool = True,
+    ) -> Dict[str, Any]:
+        """Remove/preview duplicated or inactive shadow decisions.
+
+        - keep_latest: keeps only the most recent row per match_key.
+        - purge_non_shadow_rules: removes rows whose primary rule is now quarantine/warning/disabled.
+        """
+        self.ensure_schema()
+        day = _s(day)
+        day_clause = ""
+        day_params: List[Any] = []
+        if day and day.lower() not in {"all", "*"}:
+            day_clause = "WHERE day = %s"
+            day_params.append(day)
+
+        def _scope_sql(prefix: str = "") -> str:
+            if not day_clause:
+                return ""
+            return (" AND " if prefix else " WHERE ") + "day = %s"
+
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(f"SELECT COUNT(*) FROM {self.DECISIONS_TABLE} {day_clause}", tuple(day_params))
+                before_total = int(cur.fetchone()[0] or 0)
+
+                duplicate_count = 0
+                non_shadow_count = 0
+                if keep_latest:
+                    cur.execute(
+                        f"""
+                        WITH ranked AS (
+                            SELECT decision_id,
+                                   ROW_NUMBER() OVER (
+                                       PARTITION BY match_key
+                                       ORDER BY updated_at DESC,
+                                                CASE WHEN COALESCE(primary_rule_id, rule_id, '') = COALESCE(rule_id, primary_rule_id, '') THEN 1 ELSE 0 END DESC,
+                                                created_at DESC
+                                   ) AS rn
+                            FROM {self.DECISIONS_TABLE}
+                            {day_clause}
+                        )
+                        SELECT COUNT(*) FROM ranked WHERE rn > 1
+                        """,
+                        tuple(day_params),
+                    )
+                    duplicate_count = int(cur.fetchone()[0] or 0)
+
+                if purge_non_shadow_rules:
+                    cur.execute(
+                        f"""
+                        SELECT COUNT(*)
+                        FROM {self.DECISIONS_TABLE} d
+                        JOIN {self.RULES_TABLE} r
+                          ON r.rule_id = COALESCE(NULLIF(d.primary_rule_id, ''), d.rule_id)
+                        WHERE r.status NOT IN ('shadow')
+                        {('AND d.day = %s' if day_clause else '')}
+                        """,
+                        tuple(day_params),
+                    )
+                    non_shadow_count = int(cur.fetchone()[0] or 0)
+
+                deleted_duplicates = 0
+                deleted_non_shadow = 0
+                if not dry_run:
+                    if purge_non_shadow_rules:
                         cur.execute(
                             f"""
-                            INSERT INTO {self.DECISIONS_TABLE} (
-                                decision_id, rule_id, primary_rule_id, match_key, day, player_a, player_b, category,
-                                shadow_decision, reason, result, final_result, source_payload_json, tracking_payload_json, updated_at
-                            ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,NOW())
-                            ON CONFLICT (decision_id) DO UPDATE SET
-                                primary_rule_id = EXCLUDED.primary_rule_id,
-                                shadow_decision = EXCLUDED.shadow_decision,
-                                reason = EXCLUDED.reason,
-                                result = EXCLUDED.result,
-                                source_payload_json = EXCLUDED.source_payload_json,
-                                tracking_payload_json = EXCLUDED.tracking_payload_json,
-                                updated_at = NOW()
+                            DELETE FROM {self.DECISIONS_TABLE} d
+                            USING {self.RULES_TABLE} r
+                            WHERE r.rule_id = COALESCE(NULLIF(d.primary_rule_id, ''), d.rule_id)
+                              AND r.status NOT IN ('shadow')
+                              {('AND d.day = %s' if day_clause else '')}
                             """,
-                            (
-                                decision_id, rule.get("ruleId"), primary_rule_id_from_payload(d, rule.get("ruleId")), d.get("matchKey"), day,
-                                _s(match.get("playerA") or match.get("sourcePlayerA") or match.get("predictedWinner")),
-                                _s(match.get("playerB") or match.get("sourcePlayerB") or match.get("opponent")),
-                                row_category(match), d.get("shadowDecision"), d.get("reason", ""), "pending", "pending", _json_dumps(d), _json_dumps(compact_shadow_payload(d)),
-                            ),
+                            tuple(day_params),
                         )
-                        written += 1
-            conn.commit()
-        return {"status": "ok", "shadowDecisionsWritten": written}
+                        deleted_non_shadow = int(cur.rowcount or 0)
+                    if keep_latest:
+                        cur.execute(
+                            f"""
+                            WITH ranked AS (
+                                SELECT decision_id,
+                                       ROW_NUMBER() OVER (
+                                           PARTITION BY match_key
+                                           ORDER BY updated_at DESC,
+                                                    CASE WHEN COALESCE(primary_rule_id, rule_id, '') = COALESCE(rule_id, primary_rule_id, '') THEN 1 ELSE 0 END DESC,
+                                                    created_at DESC
+                                       ) AS rn
+                                FROM {self.DECISIONS_TABLE}
+                                {day_clause}
+                            )
+                            DELETE FROM {self.DECISIONS_TABLE} d
+                            USING ranked
+                            WHERE d.decision_id = ranked.decision_id
+                              AND ranked.rn > 1
+                            """,
+                            tuple(day_params),
+                        )
+                        deleted_duplicates = int(cur.rowcount or 0)
+                    conn.commit()
 
+                cur.execute(f"SELECT COUNT(*) FROM {self.DECISIONS_TABLE} {day_clause}", tuple(day_params))
+                after_total = int(cur.fetchone()[0] or 0)
 
-    def fetch_shadow_decisions(self, day: str = "", limit: int = 50000, status: str = "all") -> List[Dict[str, Any]]:
+        return {
+            "status": "ok",
+            "version": V3_VERSION,
+            "day": day or "all",
+            "dryRun": bool(dry_run),
+            "beforeRows": before_total,
+            "duplicateRowsToDelete": duplicate_count,
+            "nonShadowRuleRowsToDelete": non_shadow_count,
+            "deletedDuplicateRows": deleted_duplicates,
+            "deletedNonShadowRuleRows": deleted_non_shadow,
+            "afterRows": after_total,
+            "policy": "Nettoyage V3.2.2 : une seule décision latest par match + exclusion des règles quarantine/warning du tracking actif.",
+        }
+
+    def fetch_shadow_decisions(
+        self,
+        day: str = "",
+        limit: int = 50000,
+        status: str = "all",
+        *,
+        latest_only: bool = True,
+        active_rules_only: bool = True,
+    ) -> List[Dict[str, Any]]:
         self.ensure_schema()
         params: List[Any] = []
-        where_parts: List[str] = []
+        where_parts: List[str] = ["COALESCE(d.is_active, TRUE) = TRUE"]
         if day and _s(day).lower() not in {"all", "*"}:
-            where_parts.append("day = %s")
+            where_parts.append("d.day = %s")
             params.append(_s(day))
         if status and _s(status).lower() not in {"all", "*"}:
-            where_parts.append("shadow_decision = %s")
+            where_parts.append("d.shadow_decision = %s")
             params.append(_s(status))
         where = (" WHERE " + " AND ".join(where_parts)) if where_parts else ""
         sql = f"""
-            SELECT decision_id, rule_id, primary_rule_id, match_key, day, player_a, player_b, category,
-                   shadow_decision, reason, result, final_result, final_profit_eur, final_staked_eur,
-                   delta_vs_v2_eur, source_payload_json, tracking_payload_json, created_at, updated_at
-            FROM {self.DECISIONS_TABLE}{where}
-            ORDER BY updated_at DESC
+            SELECT d.decision_id, d.rule_id, d.primary_rule_id, d.match_key, d.day, d.player_a, d.player_b, d.category,
+                   d.shadow_decision, d.reason, d.result, d.final_result, d.final_profit_eur, d.final_staked_eur,
+                   d.delta_vs_v2_eur, d.source_payload_json, d.tracking_payload_json, d.created_at, d.updated_at,
+                   d.v3_version, d.is_active,
+                   COALESCE(r.status, 'shadow') AS effective_rule_status,
+                   COALESCE(r.name, '') AS effective_rule_name,
+                   COALESCE(r.source_segment, '') AS effective_rule_segment
+            FROM {self.DECISIONS_TABLE} d
+            LEFT JOIN {self.RULES_TABLE} r
+              ON r.rule_id = COALESCE(NULLIF(d.primary_rule_id, ''), d.rule_id)
+            {where}
+            ORDER BY d.updated_at DESC,
+                     CASE WHEN COALESCE(d.primary_rule_id, d.rule_id, '') = COALESCE(d.rule_id, d.primary_rule_id, '') THEN 1 ELSE 0 END DESC,
+                     d.created_at DESC
             LIMIT %s
         """
         params.append(int(limit))
-        out: List[Dict[str, Any]] = []
+        rows: List[Dict[str, Any]] = []
         with self._connect() as conn:
             with conn.cursor() as cur:
                 cur.execute(sql, tuple(params))
                 cols = [d[0] for d in cur.description]
                 for db_row in cur.fetchall():
                     r = dict(zip(cols, db_row))
+                    rule_status = _s(r.get("effective_rule_status") or "shadow").lower()
+                    if active_rules_only and rule_status not in {"shadow"}:
+                        continue
                     payload = _json_loads(r.get("source_payload_json"), {})
                     tracking = _json_loads(r.get("tracking_payload_json"), {})
-                    out.append({
+                    primary_rule_id = r.get("primary_rule_id") or primary_rule_id_from_payload(payload, r.get("rule_id"))
+                    primary_name = primary_rule_name_from_payload(payload, r.get("rule_id"))
+                    if _s(r.get("effective_rule_name")):
+                        primary_name = _s(r.get("effective_rule_name"))
+                    rows.append({
                         "decisionId": r.get("decision_id"),
                         "ruleId": r.get("rule_id"),
-                        "primaryRuleId": r.get("primary_rule_id") or primary_rule_id_from_payload(payload, r.get("rule_id")),
-                        "primaryRuleName": primary_rule_name_from_payload(payload, r.get("rule_id")),
+                        "primaryRuleId": primary_rule_id,
+                        "primaryRuleName": primary_name,
+                        "primaryRuleStatus": rule_status,
+                        "primaryRuleSegment": r.get("effective_rule_segment"),
                         "matchKey": r.get("match_key"),
                         "day": r.get("day"),
                         "playerA": r.get("player_a"),
@@ -1224,10 +1440,20 @@ class V3LearningMemoryStore:
                         "finalProfitEur": r.get("final_profit_eur"),
                         "finalStakedEur": r.get("final_staked_eur"),
                         "deltaVsV2Eur": r.get("delta_vs_v2_eur"),
+                        "v3Version": r.get("v3_version"),
                         "sourcePayload": payload,
                         "trackingPayload": tracking,
+                        "updatedAt": r.get("updated_at"),
                     })
-        return out
+
+        if latest_only:
+            deduped: Dict[str, Dict[str, Any]] = {}
+            for row in rows:
+                key = _s(row.get("matchKey"))
+                if key and key not in deduped:
+                    deduped[key] = row
+            rows = list(deduped.values())
+        return rows
 
     def track_shadow_results(
         self,

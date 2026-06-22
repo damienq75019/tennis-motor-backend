@@ -2464,6 +2464,7 @@ def v3_status() -> Dict[str, Any]:
             "/v3/shadow/daily?day=today&persist=false",
             "/v3/shadow/track?day=today&sync_memory=true",
             "/v3/shadow/performance?day=today",
+            "/v3/shadow/cleanup?day=today&dry_run=true",
             "/v3/rules/validate?day=today&sync_results=true&dry_run=false",
         ],
         "policy": "V3 apprend, corrige la qualification, priorise les règles shadow, suit leurs résultats, puis met en quarantaine les règles shadow qui échouent. Elle ne remplace jamais STEP56/STEP62 sans validation hors échantillon.",
@@ -2672,6 +2673,7 @@ def v3_shadow_daily(
     provider: str = Query("api_tennis"),
     status: str = Query("shadow"),
     persist: bool = Query(False),
+    purge_existing: bool = Query(True),
     odds_cutoff: float = Query(1.90, ge=1.01, le=100.0),
 ) -> Dict[str, Any]:
     """Run V3 shadow rules against today's/tomorrow's current daily matches.
@@ -2687,7 +2689,11 @@ def v3_shadow_daily(
         shadow = evaluate_shadow_matches(matches, rules, day=normalize_day(day), odds_cutoff=odds_cutoff)
         write_info = None
         if persist:
-            write_info = v3_store.persist_shadow_decisions(normalize_day(day), shadow.get("decisions", []))
+            write_info = v3_store.persist_shadow_decisions(
+                normalize_day(day),
+                shadow.get("decisions", []),
+                purge_existing=purge_existing,
+            )
         return {
             "status": "ok",
             "version": V3_VERSION,
@@ -2697,8 +2703,36 @@ def v3_shadow_daily(
             "rulesLoaded": len(rules),
             "persisted": write_info,
             "shadow": shadow,
-            "policy": "Shadow seulement : aucune décision officielle n'est remplacée.",
+            "policy": "Shadow seulement : aucune décision officielle n'est remplacée. V3.2.2 persiste une seule décision active par match quand persist=true.",
         }
+    except Exception as exc:
+        return {"status": "error", "version": V3_VERSION, "error": f"{type(exc).__name__}: {exc}"}
+
+
+@app.get("/v3/shadow/cleanup")
+def v3_shadow_cleanup(
+    day: str = Query("today", description="today, yesterday, tomorrow, YYYY-MM-DD ou all"),
+    keep_latest: bool = Query(True),
+    purge_non_shadow_rules: bool = Query(True),
+    dry_run: bool = Query(True),
+) -> Dict[str, Any]:
+    """STEP V3.2.2 — cleanup duplicated/old shadow decisions.
+
+    Use dry_run=true first to preview. Then dry_run=false to delete duplicates
+    and decisions attached to quarantine/warning rules.
+    """
+    v3_store = V3LearningMemoryStore()
+    try:
+        raw_day = (day or "today").strip().lower()
+        resolved_day = "" if raw_day in {"all", "*", "tout"} else normalize_day(day)
+        report = v3_store.cleanup_shadow_decisions(
+            day=resolved_day,
+            keep_latest=keep_latest,
+            purge_non_shadow_rules=purge_non_shadow_rules,
+            dry_run=dry_run,
+        )
+        report["endpoint"] = "/v3/shadow/cleanup"
+        return report
     except Exception as exc:
         return {"status": "error", "version": V3_VERSION, "error": f"{type(exc).__name__}: {exc}"}
 
