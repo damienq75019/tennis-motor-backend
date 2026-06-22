@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Tennis Motor — V3.2.2 Latest Shadow Cleanup
+Tennis Motor — V3.2.3 Odds Validity Guard
 
 Non-destructive intelligent layer above STEP56/STEP62.
 
-V3.2.2 adds latest-decision-only tracking and shadow cleanup after V3.2.1:
+V3.2.3 adds an odds validity guard after V3.2.2:
 - persistent learning memory table from PostgreSQL history;
 - automatic shadow-rule generation from historical segments;
 - shadow evaluation for daily/live candidates;
@@ -17,12 +17,13 @@ V3.2.2 adds latest-decision-only tracking and shadow cleanup after V3.2.1:
 - one active shadow decision per match in tracking;
 - cleanup/purge of old duplicated shadow decisions;
 - quarantined/warning rules excluded from active shadow performance;
+- invalid/missing odds excluded from ROI, stake, settled counts, and rule validation;
 - zero replacement of the official motor until out-of-sample validation.
 
 Policy:
 - V2/STEP56 remains the official prediction engine.
-- V3.2.2 learns, writes memory, creates shadow rules, resolves conflicts, tracks settled shadow results, validates/quarantines rules, and tracks only the latest active decision per match.
-- V3.2.2 does not change a bet decision automatically.
+- V3.2.3 learns, writes memory, creates shadow rules, resolves conflicts, tracks settled shadow results, validates/quarantines rules, tracks only the latest active decision per match, and excludes invalid odds from financial metrics.
+- V3.2.3 does not change a bet decision automatically.
 """
 from __future__ import annotations
 
@@ -42,7 +43,8 @@ FINAL_WIN = "win"
 FINAL_LOSS = "loss"
 FINAL_VOID = "void"
 FINAL_PENDING = "pending"
-V3_VERSION = "v3.2.2-latest-shadow-cleanup"
+FINAL_ODDS_INVALID = "odds_invalid"
+V3_VERSION = "v3.2.3-odds-validity-guard"
 
 
 def _s(value: Any) -> str:
@@ -177,11 +179,46 @@ def row_odd(row: Dict[str, Any]) -> float:
     return 0.0
 
 
+def is_valid_odd_value(odd: Any) -> bool:
+    """Return True only for real bookmaker odds usable in ROI/stake calculations."""
+    return _f(odd, 0.0) > 1.0
+
+
+def row_has_valid_odd(row: Dict[str, Any]) -> bool:
+    return row_odd(row) > 1.0
+
+
+def row_odds_status(row: Optional[Dict[str, Any]]) -> str:
+    if not row:
+        return "not_found"
+    result = row_result(row)
+    if result in {FINAL_WIN, FINAL_LOSS} and not row_has_valid_odd(row):
+        return FINAL_ODDS_INVALID
+    if row_has_valid_odd(row):
+        return "valid"
+    if result == FINAL_PENDING:
+        return "pending_no_valid_odd"
+    if result == FINAL_VOID:
+        return "void_no_valid_odd"
+    return FINAL_ODDS_INVALID
+
+
+def row_result_for_roi(row: Dict[str, Any]) -> str:
+    result = row_result(row)
+    if result in {FINAL_WIN, FINAL_LOSS} and not row_has_valid_odd(row):
+        return FINAL_ODDS_INVALID
+    return result
+
+
 def row_profit(row: Dict[str, Any], stake: float = STAKE_EUR) -> Tuple[float, float]:
     result = row_result(row)
     odd = row_odd(row)
+    # STEP V3.2.3: no valid odds = no stake, no ROI impact.
+    # A settled win/loss with odd <= 1.00 is tracked as odds_invalid elsewhere.
+    if result in {FINAL_WIN, FINAL_LOSS} and odd <= 1.0:
+        return (0.0, 0.0)
     if result == FINAL_WIN:
-        return ((odd - 1.0) * stake if odd > 1.0 else 0.0, stake)
+        return ((odd - 1.0) * stake, stake)
     if result == FINAL_LOSS:
         return (-stake, stake)
     return (0.0, 0.0)
@@ -210,6 +247,7 @@ def empty_result_bucket() -> Dict[str, Any]:
         "voids": 0,
         "pending": 0,
         "notFound": 0,
+        "oddsInvalid": 0,
         "stakedEur": 0.0,
         "profitIfPlayedEur": 0.0,
         "roiIfPlayedPct": 0.0,
@@ -227,10 +265,13 @@ def add_row_to_bucket(bucket: Dict[str, Any], row: Optional[Dict[str, Any]], *, 
         return
     result = row_result(row)
     odd = row_odd(row)
-    if odd > 1.0:
+    odds_valid = odd > 1.0
+    if odds_valid:
         bucket["_oddSum"] += odd
         bucket["_oddCount"] += 1
-    if result == FINAL_WIN:
+    if result in {FINAL_WIN, FINAL_LOSS} and not odds_valid:
+        bucket["oddsInvalid"] += 1
+    elif result == FINAL_WIN:
         bucket["wins"] += 1
         bucket["settled"] += 1
     elif result == FINAL_LOSS:
@@ -714,7 +755,9 @@ def compact_learning_row(row: Dict[str, Any]) -> Dict[str, Any]:
         "surface": row.get("surface"),
         "premiumPct": _f(row.get("premiumPct"), 0.0),
         "odd": row_odd(row),
+        "oddsStatus": row_odds_status(row),
         "result": row_result(row),
+        "resultForRoi": row_result_for_roi(row),
         "score": row.get("score"),
         "scoreFeatures": score,
         "segments": row_segments(row),
@@ -1242,7 +1285,7 @@ class V3LearningMemoryStore:
             "purgeExistingDay": bool(purge_existing),
             "oldRowsDeleted": deleted_existing,
             "shadowDecisionsWritten": written,
-            "policy": "V3.2.2 écrit une seule décision active par match : la règle primaire choisie par le resolver.",
+            "policy": "V3.2.3 écrit une seule décision active par match et exclut les cotes invalides du ROI/stake.",
         }
 
     def cleanup_shadow_decisions(
@@ -1365,7 +1408,7 @@ class V3LearningMemoryStore:
             "deletedDuplicateRows": deleted_duplicates,
             "deletedNonShadowRuleRows": deleted_non_shadow,
             "afterRows": after_total,
-            "policy": "Nettoyage V3.2.2 : une seule décision latest par match + exclusion des règles quarantine/warning du tracking actif.",
+            "policy": "Nettoyage V3.2.3 : une seule décision latest par match + exclusion des règles quarantine/warning + garde cotes invalides.",
         }
 
     def fetch_shadow_decisions(
@@ -1487,6 +1530,7 @@ class V3LearningMemoryStore:
         settled = 0
         pending = 0
         not_found = 0
+        odds_invalid = 0
         update_rows: List[Tuple[Any, ...]] = []
 
         # First update every persisted row, even if later summaries are deduped.
@@ -1502,18 +1546,25 @@ class V3LearningMemoryStore:
                 not_found += 1
                 continue
             found += 1
-            final = row_result(memory_row)
+            raw_final = row_result(memory_row)
+            final = row_result_for_roi(memory_row)
             profit, staked = row_profit(memory_row)
             delta, _ = result_delta_if_skipped(memory_row)
             shadow_decision = _s(d.get("shadowDecision")).upper()
             effective_delta = delta if shadow_decision == "V3_SHADOW_DOWNGRADE" else (profit if shadow_decision == "V3_SHADOW_PROMOTE" else 0.0)
             if final == FINAL_PENDING:
                 pending += 1
+            elif final == FINAL_ODDS_INVALID:
+                odds_invalid += 1
             else:
                 settled += 1
             tracking_payload = {
                 "matchedMemoryKey": match_key,
                 "finalCompactRow": compact_learning_row(memory_row),
+                "rawFinalResult": raw_final,
+                "resultForRoi": final,
+                "oddsStatus": row_odds_status(memory_row),
+                "oddsInvalidExcludedFromRoi": final == FINAL_ODDS_INVALID,
                 "profitIfPlayedEur": round(profit, 2),
                 "stakedEur": round(staked, 2),
                 "deltaVsV2IfAppliedEur": round(effective_delta, 2),
@@ -1560,6 +1611,7 @@ class V3LearningMemoryStore:
             "updatedRows": updated,
             "settledRows": settled,
             "pendingRows": pending,
+            "oddsInvalidRows": odds_invalid,
             "notFoundRows": not_found,
         }
         return report
@@ -1611,6 +1663,7 @@ class V3LearningMemoryStore:
         settled_scope = 0
         pending_scope = 0
         not_found_scope = 0
+        odds_invalid_scope = 0
 
         examples: List[Dict[str, Any]] = []
         for match_key, d in by_match.items():
@@ -1652,10 +1705,13 @@ class V3LearningMemoryStore:
                 not_found_scope += 1
             else:
                 result = row_result(row)
+                result_for_roi = row_result_for_roi(row)
                 profit, staked = row_profit(row)
-                if result == FINAL_PENDING:
+                if result_for_roi == FINAL_PENDING:
                     pending_scope += 1
-                elif result in {FINAL_WIN, FINAL_LOSS}:
+                elif result_for_roi == FINAL_ODDS_INVALID:
+                    odds_invalid_scope += 1
+                elif result_for_roi in {FINAL_WIN, FINAL_LOSS}:
                     settled_scope += 1
                     v2_scope_profit += profit
                     v2_scope_staked += staked
@@ -1670,6 +1726,9 @@ class V3LearningMemoryStore:
                         "primaryRuleId": primary_id,
                         "primaryRuleName": primary_name,
                         "result": result,
+                        "resultForRoi": row_result_for_roi(row),
+                        "oddsStatus": row_odds_status(row),
+                        "oddsInvalidExcludedFromRoi": row_result_for_roi(row) == FINAL_ODDS_INVALID,
                         "profitIfPlayedEur": round(profit, 2),
                         "deltaVsV2IfAppliedEur": round((-profit if decision == "V3_SHADOW_DOWNGRADE" else profit if decision == "V3_SHADOW_PROMOTE" else 0.0), 2),
                         "playerA": row.get("sourcePlayerA") or row.get("playerA") or row.get("predictedWinner"),
@@ -1690,12 +1749,13 @@ class V3LearningMemoryStore:
             "status": "ok",
             "version": V3_VERSION,
             "day": day or "all",
-            "policy": "Performance shadow : PROMOTE = joué en V3, DOWNGRADE/WATCH/NO_SIGNAL = évité en V3. STEP56 officiel n'est pas remplacé.",
+            "policy": "Performance shadow : PROMOTE = joué en V3, DOWNGRADE/WATCH/NO_SIGNAL = évité en V3. Cotes invalides exclues du ROI/stake. STEP56 officiel n'est pas remplacé.",
             "scope": {
                 "rawDecisionRows": len(decisions),
                 "uniqueMatches": len(by_match),
                 "settledMatches": settled_scope,
                 "pendingMatches": pending_scope,
+                "oddsInvalidMatches": odds_invalid_scope,
                 "notFoundMatches": not_found_scope,
             },
             "v2BaselineSameScope": {

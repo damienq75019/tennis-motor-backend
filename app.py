@@ -2467,7 +2467,7 @@ def v3_status() -> Dict[str, Any]:
             "/v3/shadow/cleanup?day=today&dry_run=true",
             "/v3/rules/validate?day=today&sync_results=true&dry_run=false",
         ],
-        "policy": "V3 apprend, corrige la qualification, priorise les règles shadow, suit leurs résultats, puis met en quarantaine les règles shadow qui échouent. Elle ne remplace jamais STEP56/STEP62 sans validation hors échantillon.",
+        "policy": "V3 apprend, corrige la qualification, priorise les règles shadow, suit leurs résultats, met en quarantaine les règles shadow qui échouent, et exclut les cotes invalides du ROI/stake. Elle ne remplace jamais STEP56/STEP62 sans validation hors échantillon.",
     }
 
 
@@ -2703,7 +2703,7 @@ def v3_shadow_daily(
             "rulesLoaded": len(rules),
             "persisted": write_info,
             "shadow": shadow,
-            "policy": "Shadow seulement : aucune décision officielle n'est remplacée. V3.2.2 persiste une seule décision active par match quand persist=true.",
+            "policy": "Shadow seulement : aucune décision officielle n'est remplacée. V3.2.3 persiste une seule décision active par match et exclut les cotes invalides du ROI/stake.",
         }
     except Exception as exc:
         return {"status": "error", "version": V3_VERSION, "error": f"{type(exc).__name__}: {exc}"}
@@ -2716,7 +2716,7 @@ def v3_shadow_cleanup(
     purge_non_shadow_rules: bool = Query(True),
     dry_run: bool = Query(True),
 ) -> Dict[str, Any]:
-    """STEP V3.2.2 — cleanup duplicated/old shadow decisions.
+    """STEP V3.2.2/V3.2.3 — cleanup duplicated/old shadow decisions.
 
     Use dry_run=true first to preview. Then dry_run=false to delete duplicates
     and decisions attached to quarantine/warning rules.
@@ -2747,7 +2747,7 @@ def v3_shadow_track(
 ) -> Dict[str, Any]:
     """STEP V3.2 — update shadow decisions with final outcomes and return performance.
 
-    This endpoint is the first real shadow validation loop:
+    This endpoint is the real shadow validation loop with odds validity guard:
     - refreshes V3 memory from settled history when sync_memory=true;
     - matches persisted shadow decisions to settled history by event/match key;
     - updates final_result/profit/delta_vs_v2 in tennis_v3_shadow_decisions;
