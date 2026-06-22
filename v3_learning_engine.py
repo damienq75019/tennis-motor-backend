@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Tennis Motor — V3.2.3 Odds Validity Guard
+Tennis Motor — V3.3.1 Daily Runner
 
 Non-destructive intelligent layer above STEP56/STEP62.
 
-V3.2.3 adds an odds validity guard after V3.2.2:
+V3.3.1 adds a daily runner above V3.3:
 - persistent learning memory table from PostgreSQL history;
 - automatic shadow-rule generation from historical segments;
 - shadow evaluation for daily/live candidates;
@@ -18,12 +18,17 @@ V3.2.3 adds an odds validity guard after V3.2.2:
 - cleanup/purge of old duplicated shadow decisions;
 - quarantined/warning rules excluded from active shadow performance;
 - invalid/missing odds excluded from ROI, stake, settled counts, and rule validation;
-- zero replacement of the official motor until out-of-sample validation.
+- multi-day out-of-sample validation of shadow rules;
+- daily pre-match and post-match orchestration via /v3/daily/run;
+- train vs real-shadow comparison over several days;
+- automatic quarantine/warning for rules that fail across several days;
+- no official promotion from one single day;
+- zero replacement of the official motor until clean out-of-sample validation.
 
 Policy:
 - V2/STEP56 remains the official prediction engine.
-- V3.2.3 learns, writes memory, creates shadow rules, resolves conflicts, tracks settled shadow results, validates/quarantines rules, tracks only the latest active decision per match, and excludes invalid odds from financial metrics.
-- V3.2.3 does not change a bet decision automatically.
+- V3.3 learns, writes memory, creates shadow rules, resolves conflicts, tracks settled shadow results, validates/quarantines rules, tracks only the latest active decision per match, excludes invalid odds from financial metrics, and validates rules across multiple out-of-sample days.
+- V3.3 does not change a bet decision automatically.
 """
 from __future__ import annotations
 
@@ -44,7 +49,7 @@ FINAL_LOSS = "loss"
 FINAL_VOID = "void"
 FINAL_PENDING = "pending"
 FINAL_ODDS_INVALID = "odds_invalid"
-V3_VERSION = "v3.2.3-odds-validity-guard"
+V3_VERSION = "v3.3.1-daily-runner"
 
 
 def _s(value: Any) -> str:
@@ -870,6 +875,20 @@ class V3LearningMemoryStore:
                 cur.execute(f"ALTER TABLE {self.RULES_TABLE} ADD COLUMN IF NOT EXISTS shadow_validation_payload_json TEXT NOT NULL DEFAULT '{{}}'")
                 cur.execute(f"ALTER TABLE {self.RULES_TABLE} ADD COLUMN IF NOT EXISTS last_validated_at TIMESTAMPTZ")
                 cur.execute(f"CREATE INDEX IF NOT EXISTS idx_{self.RULES_TABLE}_validation ON {self.RULES_TABLE}(shadow_validation_status)")
+
+                # STEP V3.3: out-of-sample multi-day validation columns.
+                # These fields are shadow-only audit fields; they never make a rule official.
+                cur.execute(f"ALTER TABLE {self.RULES_TABLE} ADD COLUMN IF NOT EXISTS oos_days INTEGER NOT NULL DEFAULT 0")
+                cur.execute(f"ALTER TABLE {self.RULES_TABLE} ADD COLUMN IF NOT EXISTS oos_settled INTEGER NOT NULL DEFAULT 0")
+                cur.execute(f"ALTER TABLE {self.RULES_TABLE} ADD COLUMN IF NOT EXISTS oos_wins INTEGER NOT NULL DEFAULT 0")
+                cur.execute(f"ALTER TABLE {self.RULES_TABLE} ADD COLUMN IF NOT EXISTS oos_losses INTEGER NOT NULL DEFAULT 0")
+                cur.execute(f"ALTER TABLE {self.RULES_TABLE} ADD COLUMN IF NOT EXISTS oos_profit_eur DOUBLE PRECISION NOT NULL DEFAULT 0")
+                cur.execute(f"ALTER TABLE {self.RULES_TABLE} ADD COLUMN IF NOT EXISTS oos_roi_pct DOUBLE PRECISION NOT NULL DEFAULT 0")
+                cur.execute(f"ALTER TABLE {self.RULES_TABLE} ADD COLUMN IF NOT EXISTS oos_delta_vs_v2_eur DOUBLE PRECISION NOT NULL DEFAULT 0")
+                cur.execute(f"ALTER TABLE {self.RULES_TABLE} ADD COLUMN IF NOT EXISTS oos_validation_status TEXT NOT NULL DEFAULT 'untested'")
+                cur.execute(f"ALTER TABLE {self.RULES_TABLE} ADD COLUMN IF NOT EXISTS oos_validation_payload_json TEXT NOT NULL DEFAULT '{{}}'")
+                cur.execute(f"ALTER TABLE {self.RULES_TABLE} ADD COLUMN IF NOT EXISTS last_oos_validated_at TIMESTAMPTZ")
+                cur.execute(f"CREATE INDEX IF NOT EXISTS idx_{self.RULES_TABLE}_oos_validation ON {self.RULES_TABLE}(oos_validation_status)")
                 cur.execute(
                     f"""
                     CREATE TABLE IF NOT EXISTS {self.DECISIONS_TABLE} (
@@ -1150,7 +1169,9 @@ class V3LearningMemoryStore:
                    train_profit_eur, confidence, reason,
                    shadow_settled, shadow_wins, shadow_losses, shadow_profit_eur, shadow_roi_pct,
                    shadow_delta_vs_v2_eur, shadow_validation_status, shadow_validation_payload_json,
-                   last_validated_at, created_at, updated_at
+                   oos_days, oos_settled, oos_wins, oos_losses, oos_profit_eur, oos_roi_pct,
+                   oos_delta_vs_v2_eur, oos_validation_status, oos_validation_payload_json,
+                   last_validated_at, last_oos_validated_at, created_at, updated_at
             FROM {self.RULES_TABLE}{where}
             ORDER BY train_profit_eur DESC, train_roi_pct DESC, train_settled DESC
             LIMIT %s
@@ -1193,6 +1214,15 @@ class V3LearningMemoryStore:
                         "shadowDeltaVsV2Eur": r.get("shadow_delta_vs_v2_eur", 0.0),
                         "shadowValidationStatus": r.get("shadow_validation_status", "untested"),
                         "shadowValidationPayload": _json_loads(r.get("shadow_validation_payload_json"), {}),
+                        "oosDays": r.get("oos_days", 0),
+                        "oosSettled": r.get("oos_settled", 0),
+                        "oosWins": r.get("oos_wins", 0),
+                        "oosLosses": r.get("oos_losses", 0),
+                        "oosProfitEur": r.get("oos_profit_eur", 0.0),
+                        "oosRoiPct": r.get("oos_roi_pct", 0.0),
+                        "oosDeltaVsV2Eur": r.get("oos_delta_vs_v2_eur", 0.0),
+                        "oosValidationStatus": r.get("oos_validation_status", "untested"),
+                        "oosValidationPayload": _json_loads(r.get("oos_validation_payload_json"), {}),
                     })
         return out
 
@@ -1285,7 +1315,7 @@ class V3LearningMemoryStore:
             "purgeExistingDay": bool(purge_existing),
             "oldRowsDeleted": deleted_existing,
             "shadowDecisionsWritten": written,
-            "policy": "V3.2.3 écrit une seule décision active par match et exclut les cotes invalides du ROI/stake.",
+            "policy": "V3.3 écrit une seule décision active par match, exclut les cotes invalides du ROI/stake et prépare la validation multi-jours.",
         }
 
     def cleanup_shadow_decisions(
@@ -1408,7 +1438,7 @@ class V3LearningMemoryStore:
             "deletedDuplicateRows": deleted_duplicates,
             "deletedNonShadowRuleRows": deleted_non_shadow,
             "afterRows": after_total,
-            "policy": "Nettoyage V3.2.3 : une seule décision latest par match + exclusion des règles quarantine/warning + garde cotes invalides.",
+            "policy": "Nettoyage V3.3 : une seule décision latest par match + exclusion des règles quarantine/warning + garde cotes invalides + validation multi-jours.",
         }
 
     def fetch_shadow_decisions(
@@ -2017,6 +2047,363 @@ class V3LearningMemoryStore:
                 "v3ShadowConservative": performance.get("v3ShadowConservative", {}),
                 "byDecision": performance.get("byDecision", {}),
             },
+        }
+
+
+
+    def list_shadow_days(
+        self,
+        *,
+        start_day: str = "",
+        end_day: str = "",
+        last_days: int = 14,
+    ) -> List[str]:
+        """Return distinct shadow-decision days available for out-of-sample validation."""
+        self.ensure_schema()
+        where: List[str] = ["COALESCE(day, '') <> ''"]
+        params: List[Any] = []
+        if _s(start_day):
+            where.append("day >= %s")
+            params.append(_s(start_day))
+        if _s(end_day):
+            where.append("day <= %s")
+            params.append(_s(end_day))
+        sql = f"""
+            SELECT DISTINCT day
+            FROM {self.DECISIONS_TABLE}
+            WHERE {' AND '.join(where)}
+            ORDER BY day ASC
+        """
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(sql, tuple(params))
+                days = [_s(row[0]) for row in cur.fetchall() if _s(row[0])]
+        if int(last_days or 0) > 0 and len(days) > int(last_days):
+            days = days[-int(last_days):]
+        return days
+
+    def validate_shadow_rules_multiday(
+        self,
+        *,
+        start_day: str = "",
+        end_day: str = "",
+        last_days: int = 14,
+        limit: int = 50000,
+        odds_cutoff: float = DEFAULT_ODDS_CUTOFF,
+        min_test_days: int = 2,
+        min_test_settled: int = 10,
+        min_positive_days: int = 2,
+        min_test_roi_pct: float = 3.0,
+        promote_quarantine_roi_below: float = -1.0,
+        promote_quarantine_profit_below: float = -1.0,
+        downgrade_warning_delta_below: float = -1.0,
+        strengthen_delta_above: float = 1.0,
+        dry_run: bool = True,
+    ) -> Dict[str, Any]:
+        """Validate shadow rules on several real out-of-sample days.
+
+        This is stricter than /v3/rules/validate:
+        - one single day can never make a rule stable;
+        - PROMOTE rules need several settled days and positive real ROI;
+        - DOWNGRADE rules need several settled days and positive avoided-loss delta;
+        - negative/unstable rules can be quarantined or warned;
+        - no rule is ever made official automatically.
+        """
+        self.ensure_schema()
+        days = self.list_shadow_days(start_day=start_day, end_day=end_day, last_days=last_days)
+        if not days:
+            return {
+                "status": "no_data",
+                "version": V3_VERSION,
+                "days": [],
+                "dryRun": bool(dry_run),
+                "policy": "Aucune journée shadow disponible pour validation hors échantillon.",
+            }
+
+        rules = {r.get("ruleId"): r for r in self.list_shadow_rules(status="all", limit=10000)}
+        rule_daily: Dict[str, List[Dict[str, Any]]] = {}
+        daily_reports: List[Dict[str, Any]] = []
+        v2_profit = 0.0
+        v2_staked = 0.0
+        v3_profit = 0.0
+        v3_staked = 0.0
+
+        for d in days:
+            report = self.build_shadow_performance_report(day=d, limit=limit, odds_cutoff=odds_cutoff)
+            daily_reports.append({
+                "day": d,
+                "scope": report.get("scope", {}),
+                "v2BaselineSameScope": report.get("v2BaselineSameScope", {}),
+                "v3ShadowConservative": report.get("v3ShadowConservative", {}),
+                "byDecision": report.get("byDecision", {}),
+            })
+            v2 = report.get("v2BaselineSameScope", {}) or {}
+            v3 = report.get("v3ShadowConservative", {}) or {}
+            v2_profit += _f(v2.get("profitEur"), 0.0)
+            v2_staked += _f(v2.get("stakedEur"), 0.0)
+            v3_profit += _f(v3.get("profitEur"), 0.0)
+            v3_staked += _f(v3.get("stakedEur"), 0.0)
+            for perf in report.get("byPrimaryRule", []) or []:
+                rid = _s(perf.get("ruleId"))
+                if not rid:
+                    continue
+                row = dict(perf)
+                row["day"] = d
+                rule_daily.setdefault(rid, []).append(row)
+
+        actions: List[Dict[str, Any]] = []
+        updates: List[Tuple[Any, ...]] = []
+        counts = {
+            "evaluated": 0,
+            "observed": 0,
+            "stableCandidates": 0,
+            "reinforced": 0,
+            "warning": 0,
+            "quarantined": 0,
+            "locked": 0,
+        }
+
+        for rule_id, day_rows in rule_daily.items():
+            rule = rules.get(rule_id, {"ruleId": rule_id, "name": rule_id, "status": "unknown", "action": ""})
+            action = _s(rule.get("action")).upper()
+            old_status = _s(rule.get("status") or "shadow").lower()
+            days_seen = len(day_rows)
+            days_with_settled = sum(1 for x in day_rows if int(x.get("settled", 0) or 0) > 0)
+            settled = sum(int(x.get("settled", 0) or 0) for x in day_rows)
+            wins = sum(int(x.get("wins", 0) or 0) for x in day_rows)
+            losses = sum(int(x.get("losses", 0) or 0) for x in day_rows)
+            staked = sum(_f(x.get("stakedEur"), 0.0) for x in day_rows)
+            profit = sum(_f(x.get("profitIfPlayedEur"), 0.0) for x in day_rows)
+            delta = sum(_f(x.get("deltaVsV2IfAppliedEur"), 0.0) for x in day_rows)
+            roi = (profit / staked * 100.0) if staked > 0 else 0.0
+            positive_profit_days = sum(1 for x in day_rows if int(x.get("settled", 0) or 0) > 0 and _f(x.get("profitIfPlayedEur"), 0.0) > 0)
+            negative_profit_days = sum(1 for x in day_rows if int(x.get("settled", 0) or 0) > 0 and _f(x.get("profitIfPlayedEur"), 0.0) < 0)
+            positive_delta_days = sum(1 for x in day_rows if int(x.get("settled", 0) or 0) > 0 and _f(x.get("deltaVsV2IfAppliedEur"), 0.0) > 0)
+            negative_delta_days = sum(1 for x in day_rows if int(x.get("settled", 0) or 0) > 0 and _f(x.get("deltaVsV2IfAppliedEur"), 0.0) < 0)
+            train_roi = _f(rule.get("trainRoiPct"), 0.0)
+            train_settled = int(rule.get("trainSettled", 0) or 0)
+            train_profit = _f(rule.get("trainProfitEur"), 0.0)
+
+            verdict = "OBSERVE_NOT_ENOUGH_OUT_OF_SAMPLE"
+            validation_status = "oos_observe"
+            new_status = old_status
+            message = (
+                f"Observation OOS : {days_with_settled} jour(s) avec résultat, {settled} match(s) réglé(s). "
+                f"Seuils requis : {min_test_days} jour(s) et {min_test_settled} réglés."
+            )
+
+            enough = days_with_settled >= int(min_test_days) and settled >= int(min_test_settled)
+            if enough:
+                if action == "PROMOTE_SHADOW":
+                    if roi < promote_quarantine_roi_below and profit < promote_quarantine_profit_below:
+                        verdict = "QUARANTINE_PROMOTE_FAILED_MULTI_DAY_OOS"
+                        validation_status = "oos_quarantined"
+                        new_status = "quarantine"
+                        message = (
+                            f"Quarantaine OOS : règle PROMOTE perdante sur plusieurs jours "
+                            f"({days_with_settled} jours, {settled} réglés, ROI {roi:.2f}%, profit {profit:.2f}€)."
+                        )
+                        counts["quarantined"] += 1
+                    elif roi >= min_test_roi_pct and profit > 0 and positive_profit_days >= int(min_positive_days):
+                        verdict = "STABLE_PROMOTE_CANDIDATE_MULTI_DAY_OOS"
+                        validation_status = "oos_pass_candidate"
+                        new_status = "shadow"
+                        message = (
+                            f"Candidat stable OOS : règle PROMOTE positive sur plusieurs jours "
+                            f"({days_with_settled} jours, {settled} réglés, ROI {roi:.2f}%, profit {profit:.2f}€). "
+                            f"Aucune promotion officielle automatique."
+                        )
+                        counts["stableCandidates"] += 1
+                    elif negative_profit_days > positive_profit_days:
+                        verdict = "WARNING_PROMOTE_UNSTABLE_MULTI_DAY_OOS"
+                        validation_status = "oos_warning_unstable"
+                        new_status = "warning"
+                        message = (
+                            f"Warning OOS : règle PROMOTE instable ({positive_profit_days} jour(s) positif(s), "
+                            f"{negative_profit_days} jour(s) négatif(s), ROI {roi:.2f}%)."
+                        )
+                        counts["warning"] += 1
+                    else:
+                        verdict = "OBSERVE_PROMOTE_NEUTRAL_MULTI_DAY_OOS"
+                        validation_status = "oos_observe_neutral"
+                        new_status = "shadow"
+                        message = f"Observation OOS : PROMOTE non décisif ({settled} réglés, ROI {roi:.2f}%, profit {profit:.2f}€)."
+                        counts["observed"] += 1
+                elif action == "DOWNGRADE_SHADOW":
+                    if delta > strengthen_delta_above and positive_delta_days >= int(min_positive_days):
+                        verdict = "REINFORCE_DOWNGRADE_AVOIDED_LOSSES_MULTI_DAY_OOS"
+                        validation_status = "oos_reinforced"
+                        new_status = "shadow"
+                        message = (
+                            f"Renforcement OOS : règle DOWNGRADE utile sur plusieurs jours, pertes évitées "
+                            f"delta +{delta:.2f}€ sur {days_with_settled} jours et {settled} réglés."
+                        )
+                        counts["reinforced"] += 1
+                    elif delta < downgrade_warning_delta_below:
+                        verdict = "WARNING_DOWNGRADE_SKIPPED_PROFIT_MULTI_DAY_OOS"
+                        validation_status = "oos_warning"
+                        new_status = "warning"
+                        message = (
+                            f"Warning OOS : règle DOWNGRADE a évité des gains au lieu de pertes "
+                            f"delta {delta:.2f}€ sur {settled} réglés."
+                        )
+                        counts["warning"] += 1
+                    else:
+                        verdict = "OBSERVE_DOWNGRADE_NEUTRAL_MULTI_DAY_OOS"
+                        validation_status = "oos_observe_neutral"
+                        new_status = "shadow"
+                        message = f"Observation OOS : DOWNGRADE non décisif (delta {delta:.2f}€, {settled} réglés)."
+                        counts["observed"] += 1
+                else:
+                    verdict = "OBSERVE_UNKNOWN_ACTION_MULTI_DAY_OOS"
+                    validation_status = "oos_observe"
+                    new_status = "shadow" if old_status == "shadow" else old_status
+                    counts["observed"] += 1
+            else:
+                counts["observed"] += 1
+
+            # Never automatically reactivate quarantine/warning rules from a later OOS pass.
+            if old_status in {"quarantine", "warning"} and new_status == "shadow":
+                new_status = old_status
+                validation_status = "oos_locked_not_reactivated"
+                verdict = "LOCKED_NOT_REACTIVATED_AUTOMATICALLY"
+                message = message + " | Règle déjà en quarantine/warning : pas de réactivation automatique."
+                counts["locked"] += 1
+
+            counts["evaluated"] += 1
+            payload = {
+                "version": V3_VERSION,
+                "validatedAt": datetime.utcnow().isoformat() + "Z",
+                "days": days,
+                "verdict": verdict,
+                "oldStatus": old_status,
+                "newStatus": new_status,
+                "action": action,
+                "daysSeen": days_seen,
+                "daysWithSettled": days_with_settled,
+                "settled": settled,
+                "wins": wins,
+                "losses": losses,
+                "stakedEur": round(staked, 2),
+                "profitIfPlayedEur": round(profit, 2),
+                "roiIfPlayedPct": round(roi, 2),
+                "deltaVsV2IfAppliedEur": round(delta, 2),
+                "positiveProfitDays": positive_profit_days,
+                "negativeProfitDays": negative_profit_days,
+                "positiveDeltaDays": positive_delta_days,
+                "negativeDeltaDays": negative_delta_days,
+                "train": {"settled": train_settled, "roiPct": train_roi, "profitEur": train_profit},
+                "testVsTrainRoiDeltaPct": round(roi - train_roi, 2),
+                "message": message,
+            }
+            actions.append({
+                "ruleId": rule_id,
+                "ruleName": rule.get("name") or rule_id,
+                "action": action,
+                "oldStatus": old_status,
+                "newStatus": new_status,
+                "validationStatus": validation_status,
+                "verdict": verdict,
+                "message": message,
+                "daysSeen": days_seen,
+                "daysWithSettled": days_with_settled,
+                "settled": settled,
+                "wins": wins,
+                "losses": losses,
+                "stakedEur": round(staked, 2),
+                "profitIfPlayedEur": round(profit, 2),
+                "roiIfPlayedPct": round(roi, 2),
+                "deltaVsV2IfAppliedEur": round(delta, 2),
+                "positiveProfitDays": positive_profit_days,
+                "negativeProfitDays": negative_profit_days,
+                "positiveDeltaDays": positive_delta_days,
+                "negativeDeltaDays": negative_delta_days,
+                "trainSettled": train_settled,
+                "trainRoiPct": train_roi,
+                "trainProfitEur": train_profit,
+                "testVsTrainRoiDeltaPct": round(roi - train_roi, 2),
+            })
+            updates.append((
+                new_status,
+                validation_status,
+                message,
+                days_with_settled,
+                settled,
+                wins,
+                losses,
+                profit,
+                roi,
+                delta,
+                _json_dumps(payload),
+                rule_id,
+            ))
+
+        written = 0
+        if updates and not dry_run:
+            with self._connect() as conn:
+                with conn.cursor() as cur:
+                    for values in updates:
+                        cur.execute(
+                            f"""
+                            UPDATE {self.RULES_TABLE}
+                            SET status = %s,
+                                oos_validation_status = %s,
+                                reason = %s,
+                                oos_days = %s,
+                                oos_settled = %s,
+                                oos_wins = %s,
+                                oos_losses = %s,
+                                oos_profit_eur = %s,
+                                oos_roi_pct = %s,
+                                oos_delta_vs_v2_eur = %s,
+                                oos_validation_payload_json = %s,
+                                last_oos_validated_at = NOW(),
+                                updated_at = NOW()
+                            WHERE rule_id = %s
+                            """,
+                            values,
+                        )
+                        written += int(cur.rowcount or 0)
+                conn.commit()
+
+        actions.sort(key=lambda x: (
+            0 if x.get("validationStatus") in {"oos_quarantined", "oos_warning", "oos_warning_unstable"} else
+            1 if x.get("validationStatus") in {"oos_pass_candidate", "oos_reinforced"} else 2,
+            -abs(_f(x.get("deltaVsV2IfAppliedEur"), 0.0)),
+            -abs(_f(x.get("profitIfPlayedEur"), 0.0)),
+        ))
+
+        return {
+            "status": "ok",
+            "version": V3_VERSION,
+            "dryRun": bool(dry_run),
+            "days": days,
+            "scope": {
+                "daysEvaluated": len(days),
+                "rulesWithShadowResults": len(actions),
+                "v2ProfitEur": round(v2_profit, 2),
+                "v2StakedEur": round(v2_staked, 2),
+                "v2RoiPct": round((v2_profit / v2_staked * 100.0) if v2_staked else 0.0, 2),
+                "v3ConservativeProfitEur": round(v3_profit, 2),
+                "v3ConservativeStakedEur": round(v3_staked, 2),
+                "v3ConservativeRoiPct": round((v3_profit / v3_staked * 100.0) if v3_staked else 0.0, 2),
+                "deltaV3VsV2Eur": round(v3_profit - v2_profit, 2),
+            },
+            "thresholds": {
+                "minTestDays": int(min_test_days),
+                "minTestSettled": int(min_test_settled),
+                "minPositiveDays": int(min_positive_days),
+                "minTestRoiPct": min_test_roi_pct,
+                "promoteQuarantineRoiBelow": promote_quarantine_roi_below,
+                "promoteQuarantineProfitBelow": promote_quarantine_profit_below,
+                "downgradeWarningDeltaBelow": downgrade_warning_delta_below,
+                "strengthenDeltaAbove": strengthen_delta_above,
+            },
+            "counts": counts,
+            "rulesUpdated": written,
+            "actions": actions,
+            "dailyReports": daily_reports,
+            "policy": "V3.3 : validation hors échantillon multi-jours. Une seule journée ne peut jamais officialiser une règle. Aucune promotion officielle automatique de STEP56/STEP62.",
         }
 
 

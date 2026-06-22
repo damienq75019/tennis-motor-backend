@@ -2450,7 +2450,7 @@ def v3_status() -> Dict[str, Any]:
     return {
         "status": "ok",
         "version": V3_VERSION,
-        "mode": "learning_memory_priority_shadow_rules_result_tracker_validator",
+        "mode": "daily_runner_learning_memory_shadow_tracker_validator_oos_multiday",
         "databaseConfigured": history_store.enabled,
         "historyTable": history_store.TABLE,
         "v3": v3_status_payload,
@@ -2466,8 +2466,12 @@ def v3_status() -> Dict[str, Any]:
             "/v3/shadow/performance?day=today",
             "/v3/shadow/cleanup?day=today&dry_run=true",
             "/v3/rules/validate?day=today&sync_results=true&dry_run=false",
+            "/v3/rules/oos-validate?last_days=14&min_test_days=2&min_test_settled=10&dry_run=true",
+            "/v3/daily/run?phase=pre_match&day=today",
+            "/v3/daily/run?phase=post_match&day=today",
+            "/v3/daily/run?phase=full&day=today",
         ],
-        "policy": "V3 apprend, corrige la qualification, priorise les règles shadow, suit leurs résultats, met en quarantaine les règles shadow qui échouent, et exclut les cotes invalides du ROI/stake. Elle ne remplace jamais STEP56/STEP62 sans validation hors échantillon.",
+        "policy": "V3 apprend, corrige la qualification, priorise les règles shadow, suit leurs résultats, met en quarantaine les règles shadow qui échouent, exclut les cotes invalides du ROI/stake, valide les règles sur plusieurs jours hors échantillon, et peut être lancée quotidiennement via /v3/daily/run. Elle ne remplace jamais STEP56/STEP62 sans validation hors échantillon propre.",
     }
 
 
@@ -2703,7 +2707,7 @@ def v3_shadow_daily(
             "rulesLoaded": len(rules),
             "persisted": write_info,
             "shadow": shadow,
-            "policy": "Shadow seulement : aucune décision officielle n'est remplacée. V3.2.3 persiste une seule décision active par match et exclut les cotes invalides du ROI/stake.",
+            "policy": "Shadow seulement : aucune décision officielle n'est remplacée. V3.3 conserve une seule décision active par match, exclut les cotes invalides du ROI/stake, puis valide les règles sur plusieurs jours.",
         }
     except Exception as exc:
         return {"status": "error", "version": V3_VERSION, "error": f"{type(exc).__name__}: {exc}"}
@@ -2841,6 +2845,318 @@ def v3_rules_validate(
         }
     except Exception as exc:
         return {"status": "error", "version": V3_VERSION, "error": f"{type(exc).__name__}: {exc}"}
+
+
+@app.get("/v3/rules/oos-validate")
+def v3_rules_oos_validate(
+    start_day: str = Query("", description="YYYY-MM-DD optionnel"),
+    end_day: str = Query("", description="YYYY-MM-DD optionnel"),
+    last_days: int = Query(14, ge=1, le=365),
+    category: str = Query("all"),
+    limit: int = Query(50000, ge=1, le=100000),
+    odds_cutoff: float = Query(1.90, ge=1.01, le=100.0),
+    min_test_days: int = Query(2, ge=1, le=100),
+    min_test_settled: int = Query(10, ge=1, le=10000),
+    min_positive_days: int = Query(2, ge=1, le=100),
+    min_test_roi_pct: float = Query(3.0),
+    sync_memory: bool = Query(True),
+    sync_results: bool = Query(True),
+    dry_run: bool = Query(True),
+) -> Dict[str, Any]:
+    """STEP V3.3 — out-of-sample multi-day validation.
+
+    This endpoint validates shadow rules across several real days:
+    - one day alone never validates a rule;
+    - compares training stats vs real shadow test stats;
+    - quarantines bad PROMOTE rules across several days;
+    - warns bad DOWNGRADE rules;
+    - marks stable candidates but never promotes them officially.
+    """
+    v3_store = V3LearningMemoryStore()
+    try:
+        memory_sync = None
+        tracking_report = None
+        if sync_memory:
+            memory_sync = v3_memory_sync(category=category, limit=limit, odds_cutoff=odds_cutoff)
+        if sync_results:
+            tracking_report = v3_store.track_shadow_results(day="", limit=limit, odds_cutoff=odds_cutoff)
+        validation = v3_store.validate_shadow_rules_multiday(
+            start_day=start_day,
+            end_day=end_day,
+            last_days=last_days,
+            limit=limit,
+            odds_cutoff=odds_cutoff,
+            min_test_days=min_test_days,
+            min_test_settled=min_test_settled,
+            min_positive_days=min_positive_days,
+            min_test_roi_pct=min_test_roi_pct,
+            dry_run=dry_run,
+        )
+        return {
+            "status": "ok" if validation.get("status") == "ok" else validation.get("status", "partial"),
+            "version": V3_VERSION,
+            "memorySync": memory_sync,
+            "tracking": {
+                "status": tracking_report.get("status") if isinstance(tracking_report, dict) else None,
+                "scope": tracking_report.get("scope") if isinstance(tracking_report, dict) else None,
+                "v2BaselineSameScope": tracking_report.get("v2BaselineSameScope") if isinstance(tracking_report, dict) else None,
+                "v3ShadowConservative": tracking_report.get("v3ShadowConservative") if isinstance(tracking_report, dict) else None,
+            } if tracking_report is not None else None,
+            "validation": validation,
+            "endpoint": "/v3/rules/oos-validate",
+            "policy": "Validation hors échantillon multi-jours : aucune règle ne devient officielle automatiquement.",
+        }
+    except Exception as exc:
+        return {"status": "error", "version": V3_VERSION, "error": f"{type(exc).__name__}: {exc}"}
+
+
+
+def _v3_step_summary(payload: Any) -> Dict[str, Any]:
+    """Keep /v3/daily/run compact enough for cron logs."""
+    if not isinstance(payload, dict):
+        return {"status": "unknown", "type": type(payload).__name__}
+    out: Dict[str, Any] = {"status": payload.get("status")}
+    for key in ("version", "day", "targetDay", "endpoint", "error"):
+        if key in payload:
+            out[key] = payload.get(key)
+    if isinstance(payload.get("daily"), dict):
+        daily_payload = payload.get("daily") or {}
+        out["daily"] = {
+            "status": daily_payload.get("status") or payload.get("status"),
+            "targetDay": daily_payload.get("targetDay"),
+            "payloadCount": daily_payload.get("payloadCount"),
+            "provider": daily_payload.get("provider"),
+            "premiumHistorySync": (daily_payload.get("premiumHistorySync") or {}).get("status") if isinstance(daily_payload.get("premiumHistorySync"), dict) else None,
+        }
+    return out
+
+
+def _v3_shadow_summary(shadow_payload: Dict[str, Any], write_info: Any = None, rules_loaded: int = 0) -> Dict[str, Any]:
+    shadow = shadow_payload if isinstance(shadow_payload, dict) else {}
+    return {
+        "status": shadow.get("status"),
+        "version": shadow.get("version"),
+        "day": shadow.get("day"),
+        "rulesLoaded": int(rules_loaded or 0),
+        "counts": shadow.get("counts", {}),
+        "decisions": len(shadow.get("decisions", []) or []),
+        "persisted": write_info,
+    }
+
+
+def _v3_tracking_summary(report: Dict[str, Any]) -> Dict[str, Any]:
+    if not isinstance(report, dict):
+        return {"status": "unknown"}
+    return {
+        "status": report.get("status"),
+        "version": report.get("version"),
+        "day": report.get("day"),
+        "scope": report.get("scope"),
+        "v2BaselineSameScope": report.get("v2BaselineSameScope"),
+        "v3ShadowConservative": report.get("v3ShadowConservative"),
+        "byDecision": report.get("byDecision"),
+        "tracking": report.get("tracking"),
+    }
+
+
+def _v3_validation_summary(validation: Dict[str, Any]) -> Dict[str, Any]:
+    if not isinstance(validation, dict):
+        return {"status": "unknown"}
+    return {
+        "status": validation.get("status"),
+        "version": validation.get("version"),
+        "dryRun": validation.get("dryRun"),
+        "counts": validation.get("counts"),
+        "actions": (validation.get("actions") or [])[:20],
+        "summary": validation.get("summary"),
+        "days": validation.get("days"),
+        "aggregate": validation.get("aggregate"),
+    }
+
+
+@app.get("/v3/daily/run")
+def v3_daily_run(
+    day: str = Query("today", description="today, yesterday, tomorrow ou YYYY-MM-DD"),
+    phase: str = Query("full", description="pre_match, post_match, full"),
+    provider: str = Query("api_tennis"),
+    auto_history: bool = Query(True),
+    persist_shadow: bool = Query(True),
+    purge_existing: bool = Query(True),
+    settle_days_back: int = Query(7, ge=1, le=60),
+    category: str = Query("all"),
+    limit: int = Query(50000, ge=1, le=100000),
+    odds_cutoff: float = Query(1.90, ge=1.01, le=100.0),
+    min_shadow_settled: int = Query(10, ge=1, le=1000),
+    oos_last_days: int = Query(14, ge=1, le=365),
+    oos_min_test_days: int = Query(2, ge=1, le=100),
+    oos_min_test_settled: int = Query(10, ge=1, le=10000),
+    apply_rule_updates: bool = Query(True, description="false = dry-run validation only"),
+    refresh_rules: bool = Query(False, description="false par défaut pour ne pas recréer chaque jour des règles déjà quarantinées"),
+) -> Dict[str, Any]:
+    """STEP V3.3.1 — daily runner for Railway cron.
+
+    pre_match:
+    - run official /daily and write normal history when auto_history=true;
+    - evaluate active V3 shadow rules;
+    - persist exactly one shadow decision per match with purge_existing=true.
+
+    post_match:
+    - settle pending history via API-Tennis;
+    - sync V3 memory;
+    - track shadow results;
+    - validate daily shadow rules;
+    - validate out-of-sample multi-day rules.
+
+    full = pre_match + post_match in one request.
+    """
+    target_day = normalize_day(day)
+    phase_key = (phase or "full").strip().lower().replace("-", "_")
+    if phase_key in {"pre", "morning", "am", "prematch"}:
+        phase_key = "pre_match"
+    elif phase_key in {"post", "evening", "night", "pm", "postmatch"}:
+        phase_key = "post_match"
+    elif phase_key in {"all", "complete", "daily"}:
+        phase_key = "full"
+    if phase_key not in {"pre_match", "post_match", "full"}:
+        raise HTTPException(status_code=400, detail="phase invalide. Utilise pre_match, post_match ou full.")
+
+    v3_store = V3LearningMemoryStore()
+    started_at = datetime.utcnow().isoformat() + "Z"
+    steps: Dict[str, Any] = {}
+    errors: List[str] = []
+
+    try:
+        # Optional: manual/weekly only. Kept disabled by default to preserve quarantined/warning rule decisions.
+        if refresh_rules:
+            try:
+                refresh_payload = v3_rules_refresh(
+                    category=category,
+                    limit=limit,
+                    min_settled=min_shadow_settled,
+                    odds_cutoff=odds_cutoff,
+                    max_rules=50,
+                    sync_memory=True,
+                )
+                steps["rulesRefresh"] = _v3_step_summary(refresh_payload)
+                steps["rulesRefresh"]["rulesGenerated"] = (refresh_payload.get("rules") or {}).get("rulesGenerated") if isinstance(refresh_payload.get("rules"), dict) else None
+                steps["rulesRefresh"]["rulesWritten"] = (refresh_payload.get("write") or {}).get("rulesWritten") if isinstance(refresh_payload.get("write"), dict) else None
+            except Exception as exc:
+                errors.append(f"rulesRefresh failed: {type(exc).__name__}: {exc}")
+                steps["rulesRefresh"] = {"status": "error", "error": f"{type(exc).__name__}: {exc}"}
+
+        if phase_key in {"pre_match", "full"}:
+            try:
+                daily_payload = daily(day=target_day, auto_history=auto_history, provider=provider)
+                matches = daily_payload.get("matches", []) or []
+                steps["officialDaily"] = _v3_step_summary(daily_payload)
+                steps["officialDaily"]["matches"] = len(matches)
+
+                rules = v3_store.list_shadow_rules(status="shadow", limit=500)
+                shadow = evaluate_shadow_matches(matches, rules, day=target_day, odds_cutoff=odds_cutoff)
+                write_info = None
+                if persist_shadow:
+                    write_info = v3_store.persist_shadow_decisions(
+                        target_day,
+                        shadow.get("decisions", []) or [],
+                        purge_existing=purge_existing,
+                    )
+                steps["shadowDaily"] = _v3_shadow_summary(shadow, write_info=write_info, rules_loaded=len(rules))
+
+                cleanup = v3_store.cleanup_shadow_decisions(
+                    day=target_day,
+                    keep_latest=True,
+                    purge_non_shadow_rules=False,
+                    dry_run=False,
+                )
+                steps["shadowCleanupLatest"] = {
+                    "status": cleanup.get("status"),
+                    "dryRun": cleanup.get("dryRun"),
+                    "beforeTotal": cleanup.get("beforeTotal"),
+                    "afterTotal": cleanup.get("afterTotal"),
+                    "duplicatesDeleted": cleanup.get("duplicatesDeleted"),
+                    "nonShadowDeleted": cleanup.get("nonShadowDeleted"),
+                }
+            except Exception as exc:
+                errors.append(f"pre_match failed: {type(exc).__name__}: {exc}")
+                steps["preMatchError"] = {"status": "error", "error": f"{type(exc).__name__}: {exc}"}
+
+        if phase_key in {"post_match", "full"}:
+            try:
+                # Settle official history first; V3 memory and tracking use this settled store.
+                settle_payload = sync_history_settle_pending(days_back=settle_days_back, dry_run=False)
+                steps["settlePending"] = _v3_step_summary(settle_payload)
+                if isinstance(settle_payload, dict):
+                    steps["settlePending"].update({
+                        "daysBack": settle_days_back,
+                        "counts": settle_payload.get("counts"),
+                        "updated": settle_payload.get("updated") or settle_payload.get("updatedRows"),
+                    })
+
+                memory_payload = v3_memory_sync(category=category, limit=limit, odds_cutoff=odds_cutoff)
+                steps["memorySync"] = _v3_step_summary(memory_payload)
+                if isinstance(memory_payload, dict):
+                    steps["memorySync"].update({
+                        "sourceRows": memory_payload.get("sourceRows"),
+                        "sync": memory_payload.get("sync"),
+                    })
+
+                track_report = v3_store.track_shadow_results(day=target_day, limit=limit, odds_cutoff=odds_cutoff)
+                steps["shadowTrack"] = _v3_tracking_summary(track_report)
+
+                dry_run = not bool(apply_rule_updates)
+                daily_validation = v3_store.validate_shadow_rules(
+                    day=target_day,
+                    limit=limit,
+                    odds_cutoff=odds_cutoff,
+                    min_shadow_settled=min_shadow_settled,
+                    dry_run=dry_run,
+                )
+                steps["rulesValidateDaily"] = _v3_validation_summary(daily_validation)
+
+                oos_validation = v3_store.validate_shadow_rules_multiday(
+                    last_days=oos_last_days,
+                    limit=limit,
+                    odds_cutoff=odds_cutoff,
+                    min_test_days=oos_min_test_days,
+                    min_test_settled=oos_min_test_settled,
+                    dry_run=dry_run,
+                )
+                steps["rulesValidateOos"] = _v3_validation_summary(oos_validation)
+            except Exception as exc:
+                errors.append(f"post_match failed: {type(exc).__name__}: {exc}")
+                steps["postMatchError"] = {"status": "error", "error": f"{type(exc).__name__}: {exc}"}
+
+        finished_at = datetime.utcnow().isoformat() + "Z"
+        return {
+            "status": "ok" if not errors else "partial",
+            "version": V3_VERSION,
+            "endpoint": "/v3/daily/run",
+            "day": target_day,
+            "phase": phase_key,
+            "startedAt": started_at,
+            "finishedAt": finished_at,
+            "applyRuleUpdates": bool(apply_rule_updates),
+            "refreshRules": bool(refresh_rules),
+            "steps": steps,
+            "errors": errors,
+            "cronExamples": {
+                "preMatchMorning": "/v3/daily/run?phase=pre_match&day=today&auto_history=true&persist_shadow=true&purge_existing=true",
+                "postMatchNight": "/v3/daily/run?phase=post_match&day=today&settle_days_back=7&apply_rule_updates=true",
+                "fullManual": "/v3/daily/run?phase=full&day=today&apply_rule_updates=true",
+            },
+            "policy": "Runner quotidien V3 : STEP56/STEP62 reste officiel. V3 écrit et valide seulement la couche shadow; les règles peuvent être quarantine/warning, jamais promues officiellement automatiquement.",
+        }
+    except Exception as exc:
+        return {
+            "status": "error",
+            "version": V3_VERSION,
+            "endpoint": "/v3/daily/run",
+            "day": target_day,
+            "phase": phase_key,
+            "error": f"{type(exc).__name__}: {exc}",
+            "steps": steps,
+            "errors": errors,
+        }
 
 
 if __name__ == "__main__":
