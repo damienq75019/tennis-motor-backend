@@ -18,6 +18,13 @@ from postgres_premium_store import PostgresPremiumStore, score_match_with_form_v
 from api_tennis_premium_sync import PremiumHistorySyncer, tracked_category
 from flashscore_odds import FlashscoreOddsProvider
 from step59_step56_audit import SERVICE_VERSION as STEP59_AUDIT_VERSION, get_step56_auditor
+from v3_learning_engine import (
+    V3_VERSION,
+    V3LearningMemoryStore,
+    build_v3_learning_report,
+    build_v3_rules_from_history,
+    evaluate_shadow_matches,
+)
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -2432,6 +2439,264 @@ def sync_daily_maintenance_run(
     out["errors"] = errors
     out["status"] = "ok" if not errors else "partial"
     return out
+
+
+@app.get("/v3/status")
+def v3_status() -> Dict[str, Any]:
+    """Tennis Motor V3.1 — learning memory + automatic shadow rules status."""
+    history_store = PostgresPremiumStore()
+    v3_store = V3LearningMemoryStore()
+    v3_status_payload = v3_store.status()
+    return {
+        "status": "ok",
+        "version": V3_VERSION,
+        "mode": "learning_memory_plus_shadow_rules",
+        "databaseConfigured": history_store.enabled,
+        "historyTable": history_store.TABLE,
+        "v3": v3_status_payload,
+        "endpoints": [
+            "/v3/status",
+            "/v3/report?category=all&limit=50000&min_settled=10",
+            "/v3/memory/status",
+            "/v3/learn/run?category=all&limit=50000&min_settled=10",
+            "/v3/rules/list?status=shadow",
+            "/v3/rules/refresh?category=all&limit=50000&min_settled=10",
+            "/v3/shadow/daily?day=today&persist=false",
+        ],
+        "policy": "V3 apprend, crée des règles shadow et les teste. Elle ne remplace jamais STEP56/STEP62 sans validation hors échantillon.",
+    }
+
+
+@app.get("/v3/report")
+def v3_report(
+    category: str = Query("all"),
+    limit: int = Query(50000, ge=1, le=100000),
+    min_settled: int = Query(10, ge=1, le=1000),
+    odds_cutoff: float = Query(1.90, ge=1.01, le=100.0),
+    dedupe: bool = Query(True),
+    include_rows: bool = Query(False),
+    source: str = Query("history", description="history ou memory"),
+) -> Dict[str, Any]:
+    """V3 report from raw history or from V3 learning memory."""
+    history_store = PostgresPremiumStore()
+    v3_store = V3LearningMemoryStore()
+    if not history_store.enabled:
+        return {
+            "status": "error",
+            "version": V3_VERSION,
+            "databaseConfigured": False,
+            "databaseStatus": "not_configured",
+            "table": history_store.TABLE,
+            "error": "DATABASE_URL absente dans le service web.",
+        }
+
+    cat_raw = (category or "all").strip().lower()
+    category_map = {
+        "all": "ALL", "tout": "ALL", "*": "ALL",
+        "premium": "PREMIUM",
+        "proche": "PROCHE", "proches": "PROCHE",
+        "veto": "VETO",
+        "refuse": "REFUSE", "refus": "REFUSE", "refuses": "REFUSE", "refusé": "REFUSE", "refusés": "REFUSE",
+    }
+    cat = category_map.get(cat_raw, "ALL")
+
+    try:
+        if (source or "history").strip().lower() == "memory":
+            v3_store.ensure_schema()
+            rows = v3_store.fetch_memory_rows(limit=limit, category=None if cat == "ALL" else cat)
+            source_mode = "v3_memory"
+        else:
+            history_store.ensure_schema()
+            rows = history_store.fetch_rows(limit=limit, category=None if cat == "ALL" else cat)
+            source_mode = "history"
+        report = build_v3_learning_report(
+            rows,
+            category=cat,
+            min_settled=min_settled,
+            odds_cutoff=odds_cutoff,
+            dedupe=dedupe,
+            include_rows=include_rows,
+        )
+        report["databaseConfigured"] = True
+        report["databaseStatus"] = "ok"
+        report["historyTable"] = history_store.TABLE
+        report["v3MemoryTable"] = v3_store.MEMORY_TABLE
+        report["sourceMode"] = source_mode
+        report["sourceRows"] = len(rows)
+        return report
+    except Exception as exc:
+        return {
+            "status": "error",
+            "version": V3_VERSION,
+            "databaseConfigured": history_store.enabled,
+            "databaseStatus": "error",
+            "table": history_store.TABLE,
+            "error": f"{type(exc).__name__}: {exc}",
+        }
+
+
+@app.get("/v3/memory/status")
+def v3_memory_status() -> Dict[str, Any]:
+    """Status for V3 persistent learning memory and shadow tables."""
+    store = V3LearningMemoryStore()
+    status_payload = store.status()
+    status_payload["version"] = V3_VERSION
+    return status_payload
+
+
+@app.get("/v3/memory/sync")
+def v3_memory_sync(
+    category: str = Query("all"),
+    limit: int = Query(50000, ge=1, le=100000),
+    odds_cutoff: float = Query(1.90, ge=1.01, le=100.0),
+) -> Dict[str, Any]:
+    """Copy normalized history rows into the persistent V3 learning memory table."""
+    history_store = PostgresPremiumStore()
+    v3_store = V3LearningMemoryStore()
+    if not history_store.enabled:
+        return {"status": "error", "version": V3_VERSION, "error": "DATABASE_URL absente"}
+
+    category_map = {
+        "all": "ALL", "tout": "ALL", "*": "ALL",
+        "premium": "PREMIUM", "proche": "PROCHE", "proches": "PROCHE", "veto": "VETO",
+        "refuse": "REFUSE", "refus": "REFUSE", "refuses": "REFUSE", "refusé": "REFUSE", "refusés": "REFUSE",
+    }
+    cat = category_map.get((category or "all").strip().lower(), "ALL")
+    try:
+        history_store.ensure_schema()
+        rows = history_store.fetch_rows(limit=limit, category=None if cat == "ALL" else cat)
+        sync_info = v3_store.upsert_memory_rows(rows, odds_cutoff=odds_cutoff)
+        return {
+            "status": "ok",
+            "version": V3_VERSION,
+            "category": cat,
+            "sourceRows": len(rows),
+            "sync": sync_info,
+            "v3": v3_store.status(),
+        }
+    except Exception as exc:
+        return {"status": "error", "version": V3_VERSION, "error": f"{type(exc).__name__}: {exc}"}
+
+
+@app.get("/v3/rules/refresh")
+def v3_rules_refresh(
+    category: str = Query("all"),
+    limit: int = Query(50000, ge=1, le=100000),
+    min_settled: int = Query(10, ge=1, le=1000),
+    odds_cutoff: float = Query(1.90, ge=1.01, le=100.0),
+    max_rules: int = Query(50, ge=1, le=500),
+    sync_memory: bool = Query(True),
+) -> Dict[str, Any]:
+    """Generate and persist automatic V3 shadow rules from historical learning segments."""
+    history_store = PostgresPremiumStore()
+    v3_store = V3LearningMemoryStore()
+    if not history_store.enabled:
+        return {"status": "error", "version": V3_VERSION, "error": "DATABASE_URL absente"}
+
+    category_map = {
+        "all": "ALL", "tout": "ALL", "*": "ALL",
+        "premium": "PREMIUM", "proche": "PROCHE", "proches": "PROCHE", "veto": "VETO",
+        "refuse": "REFUSE", "refus": "REFUSE", "refuses": "REFUSE", "refusé": "REFUSE", "refusés": "REFUSE",
+    }
+    cat = category_map.get((category or "all").strip().lower(), "ALL")
+    try:
+        history_store.ensure_schema()
+        rows = history_store.fetch_rows(limit=limit, category=None if cat == "ALL" else cat)
+        sync_info = None
+        if sync_memory:
+            sync_info = v3_store.upsert_memory_rows(rows, odds_cutoff=odds_cutoff)
+        rules_payload = build_v3_rules_from_history(
+            rows,
+            category=cat,
+            min_settled=min_settled,
+            odds_cutoff=odds_cutoff,
+            max_rules=max_rules,
+        )
+        write_info = v3_store.upsert_shadow_rules(rules_payload.get("rules", []))
+        return {
+            "status": "ok",
+            "version": V3_VERSION,
+            "category": cat,
+            "sourceRows": len(rows),
+            "memorySync": sync_info,
+            "rulesGenerated": rules_payload.get("rulesCount", 0),
+            "rulesWritten": write_info.get("rulesWritten", 0),
+            "rules": rules_payload.get("rules", []),
+            "learningSummary": rules_payload.get("learningReport", {}).get("summary", {}),
+        }
+    except Exception as exc:
+        return {"status": "error", "version": V3_VERSION, "error": f"{type(exc).__name__}: {exc}"}
+
+
+@app.get("/v3/rules/list")
+def v3_rules_list(
+    status: str = Query("shadow"),
+    limit: int = Query(200, ge=1, le=1000),
+) -> Dict[str, Any]:
+    """List persisted V3 shadow rules."""
+    store = V3LearningMemoryStore()
+    try:
+        rules = store.list_shadow_rules(status=status, limit=limit)
+        return {"status": "ok", "version": V3_VERSION, "rulesCount": len(rules), "rules": rules}
+    except Exception as exc:
+        return {"status": "error", "version": V3_VERSION, "error": f"{type(exc).__name__}: {exc}"}
+
+
+@app.get("/v3/learn/run")
+def v3_learn_run(
+    category: str = Query("all"),
+    limit: int = Query(50000, ge=1, le=100000),
+    min_settled: int = Query(10, ge=1, le=1000),
+    odds_cutoff: float = Query(1.90, ge=1.01, le=100.0),
+    max_rules: int = Query(50, ge=1, le=500),
+) -> Dict[str, Any]:
+    """One-click V3 learning run: sync memory + refresh automatic shadow rules."""
+    memory = v3_memory_sync(category=category, limit=limit, odds_cutoff=odds_cutoff)
+    rules = v3_rules_refresh(category=category, limit=limit, min_settled=min_settled, odds_cutoff=odds_cutoff, max_rules=max_rules, sync_memory=False)
+    return {
+        "status": "ok" if memory.get("status") == "ok" and rules.get("status") == "ok" else "partial",
+        "version": V3_VERSION,
+        "memory": memory,
+        "rules": rules,
+        "policy": "Les règles générées sont en shadow mode. Elles apprennent et testent; elles ne changent pas encore les décisions officielles.",
+    }
+
+
+@app.get("/v3/shadow/daily")
+def v3_shadow_daily(
+    day: str = Query("today"),
+    provider: str = Query("api_tennis"),
+    status: str = Query("shadow"),
+    persist: bool = Query(False),
+    odds_cutoff: float = Query(1.90, ge=1.01, le=100.0),
+) -> Dict[str, Any]:
+    """Run V3 shadow rules against today's/tomorrow's current daily matches.
+
+    This endpoint reads the official /daily payload with auto_history=false and adds V3
+    shadow decisions. It does not alter official STEP56/STEP62 decisions.
+    """
+    v3_store = V3LearningMemoryStore()
+    try:
+        daily_payload = daily(day=day, auto_history=False, provider=provider)
+        matches = daily_payload.get("matches", []) or []
+        rules = v3_store.list_shadow_rules(status=status, limit=500)
+        shadow = evaluate_shadow_matches(matches, rules, day=normalize_day(day), odds_cutoff=odds_cutoff)
+        write_info = None
+        if persist:
+            write_info = v3_store.persist_shadow_decisions(normalize_day(day), shadow.get("decisions", []))
+        return {
+            "status": "ok",
+            "version": V3_VERSION,
+            "day": normalize_day(day),
+            "provider": provider,
+            "officialDailyStatus": daily_payload.get("status"),
+            "rulesLoaded": len(rules),
+            "persisted": write_info,
+            "shadow": shadow,
+            "policy": "Shadow seulement : aucune décision officielle n'est remplacée.",
+        }
+    except Exception as exc:
+        return {"status": "error", "version": V3_VERSION, "error": f"{type(exc).__name__}: {exc}"}
 
 
 if __name__ == "__main__":
