@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Tennis Motor — V3.1 Learning Engine
+Tennis Motor — V3.1.1 Learning Engine
 
 Non-destructive intelligent layer above STEP56/STEP62.
 
-V3.1 adds the missing pieces from V3.0:
+V3.1.1 fixes the first V3.1 shadow audit:
 - persistent learning memory table from PostgreSQL history;
 - automatic shadow-rule generation from historical segments;
 - shadow evaluation for daily/live candidates;
@@ -34,7 +34,7 @@ FINAL_WIN = "win"
 FINAL_LOSS = "loss"
 FINAL_VOID = "void"
 FINAL_PENDING = "pending"
-V3_VERSION = "v3.1-learning-memory-shadow-rules"
+V3_VERSION = "v3.1.1-qualification-priority-shadow-rules"
 
 
 def _s(value: Any) -> str:
@@ -179,53 +179,110 @@ def row_profit(row: Dict[str, Any], stake: float = STAKE_EUR) -> Tuple[float, fl
     return (0.0, 0.0)
 
 
-def collect_text_fields(row: Dict[str, Any]) -> str:
-    parts: List[str] = []
-    for key in ["round", "tournament", "seasonName", "source", "oddsSource", "eventName", "competitionName"]:
-        if row.get(key):
-            parts.append(_s(row.get(key)))
+def _get_nested(row: Dict[str, Any], key: str) -> Any:
+    if key in row:
+        return row.get(key)
     raw = row.get("raw") or {}
     if isinstance(raw, dict):
-        for key in [
-            "round", "tournament", "seasonName", "league", "leagueName", "eventName",
-            "stage", "phase", "type", "competition", "competitionName", "tourney_name",
-            "tourney_level", "draw", "category", "roundName", "round_name",
-        ]:
-            if raw.get(key):
-                parts.append(_s(raw.get(key)))
+        return raw.get(key)
+    return None
+
+
+def collect_text_fields(row: Dict[str, Any]) -> str:
+    parts: List[str] = []
+    direct_keys = [
+        "round", "roundName", "round_name", "tournament", "seasonName", "source",
+        "oddsSource", "eventName", "competitionName", "stage", "phase", "type",
+        "league", "leagueName", "draw", "tourney_name", "tourney_level",
+        "qualifierDetectorPolicy", "tournamentWinsPolicy",
+    ]
+    for key in direct_keys:
+        value = row.get(key)
+        if value:
+            parts.append(_s(value))
+    raw = row.get("raw") or {}
+    if isinstance(raw, dict):
+        for key in direct_keys:
+            value = raw.get(key)
+            if value:
+                parts.append(_s(value))
     return " | ".join(parts)
 
 
-def is_qualification(row: Dict[str, Any]) -> bool:
+def qualification_signals(row: Dict[str, Any]) -> List[str]:
+    """Return explicit signals proving or strongly indicating a qualification draw.
+
+    STEP V3.1 was too conservative and missed API-Tennis cases where the
+    event is globally a qualification event but the round string is rendered as
+    e.g. "ATP Wimbledon - Quarter-finals".  V3.1.1 treats those audit-candidate
+    qualification flags as draw-level qualification signals while keeping them
+    separate from the old clay veto policy.
+    """
+    signals: List[str] = []
     text = _norm(collect_text_fields(row))
-    positive_patterns = [
-        r"\bqualification\b",
-        r"\bqualifications\b",
-        r"\bqualifying\b",
-        r"\bqualifier\b",
-        r"\bqualif\b",
-        r"\bqualifs\b",
-        r"\bgentlemen s qualifying singles\b",
-        r"\bmen s qualification\b",
-        r"\bmens qualification\b",
-        r"\bq[123]\b",
+
+    text_patterns = [
+        (r"\bqualification\b", "text:qualification"),
+        (r"\bqualifications\b", "text:qualifications"),
+        (r"\bqualifying\b", "text:qualifying"),
+        (r"\bqualifier\b", "text:qualifier"),
+        (r"\bqualif\b", "text:qualif"),
+        (r"\bqualifs\b", "text:qualifs"),
+        (r"\bgentlemen s qualifying singles\b", "text:wimbledon_qualifying"),
+        (r"\bmen s qualification\b", "text:mens_qualification"),
+        (r"\bmens qualification\b", "text:mens_qualification"),
+        (r"\bq[123]\b", "text:q_round"),
     ]
-    if any(re.search(p, text) for p in positive_patterns):
-        return True
-    round_text = _s(row.get("round") or row.get("roundName") or "")
-    if re.fullmatch(r"\s*Q[123]\s*", round_text, flags=re.IGNORECASE):
-        return True
-    raw = row.get("raw") or {}
-    if isinstance(raw, dict):
-        raw_round = _s(raw.get("round") or raw.get("roundName") or raw.get("stage") or raw.get("round_name") or "")
-        if re.fullmatch(r"\s*Q[123]\s*", raw_round, flags=re.IGNORECASE):
-            return True
-    return False
+    for pattern, label in text_patterns:
+        if re.search(pattern, text):
+            signals.append(label)
+
+    # Direct round codes when provider gives clean Q1/Q2/Q3.
+    for key in ["round", "roundName", "round_name", "stage"]:
+        round_text = _s(_get_nested(row, key))
+        if re.fullmatch(r"\s*Q[123]\s*", round_text, flags=re.IGNORECASE):
+            signals.append(f"round_code:{round_text.strip().upper()}")
+
+    # API/engine qualification source.  IMPORTANT: a player can be a qualifier
+    # inside a main draw; that alone is not enough to tag the match as a
+    # qualification-round match.  We require a provider/source signal about the
+    # event or phase, not merely player_a_is_qualifier=true.
+    for side in ["a", "b"]:
+        conf = _norm(_get_nested(row, f"player_{side}_qualifier_detection_confidence"))
+        source = _norm(_get_nested(row, f"player_{side}_qualifier_source"))
+        negative_source = (
+            "no qualification flag" in source
+            or "not detected" in source
+            or source in {"", "api tennis no qualification flag"}
+        )
+        strong_source = (
+            "event qualification global" in source
+            or "qualification global" in source
+            or "qualifying draw" in source
+            or "qualification draw" in source
+            or "qualification round" in source
+        )
+        if not negative_source and strong_source:
+            signals.append(f"source:player_{side}_event_qualification")
+            if "audit candidate" in conf or conf == "audit candidate" or conf == "audit_candidate":
+                signals.append(f"audit_candidate:player_{side}")
+
+    # API-Tennis sometimes marks an event as qualification globally, without a
+    # player-level flag; the source string below is exactly the case seen in the
+    # user's 22/06 logs.
+    if "api tennis event qualification global" in text:
+        signals.append("api_tennis:event_qualification_global")
+
+    # De-duplicate while preserving order.
+    return list(dict.fromkeys(signals))
+
+
+def is_qualification(row: Dict[str, Any]) -> bool:
+    return bool(qualification_signals(row))
 
 
 def draw_type(row: Dict[str, Any]) -> str:
     return "QUALIFICATION" if is_qualification(row) else "MAIN_OR_UNKNOWN"
-
 
 def parse_score_sets(score: Any) -> List[Tuple[int, int]]:
     score_text = _s(score)
@@ -506,6 +563,7 @@ def compact_learning_row(row: Dict[str, Any]) -> Dict[str, Any]:
         "category": row_category(row),
         "drawType": draw_type(row),
         "isQualification": is_qualification(row),
+        "qualificationSignals": qualification_signals(row),
         "playerA": row.get("predictedWinner") or row.get("sourcePlayerA") or row.get("playerA"),
         "playerB": row.get("opponent") or row.get("sourcePlayerB") or row.get("playerB"),
         "surface": row.get("surface"),
@@ -791,8 +849,20 @@ class V3LearningMemoryStore:
     def upsert_shadow_rules(self, rules: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
         self.ensure_schema()
         written = 0
+        deprecated = 0
         with self._connect() as conn:
             with conn.cursor() as cur:
+                # V3.1.1 cleanup: old automatic rules such as DRAW_MAIN_OR_UNKNOWN
+                # must not stay active forever.  Deactivate all v3_auto_* rules,
+                # then reactivate only the freshly generated rule set below.
+                cur.execute(
+                    f"""
+                    UPDATE {self.RULES_TABLE}
+                    SET status = 'deprecated', updated_at = NOW()
+                    WHERE rule_id LIKE 'v3_auto_%' AND status = 'shadow'
+                    """
+                )
+                deprecated = int(cur.rowcount or 0)
                 for rule in rules:
                     cur.execute(
                         f"""
@@ -837,7 +907,7 @@ class V3LearningMemoryStore:
                     )
                     written += 1
             conn.commit()
-        return {"status": "ok", "rulesWritten": written}
+        return {"status": "ok", "rulesWritten": written, "autoRulesDeprecatedBeforeRefresh": deprecated}
 
     def list_shadow_rules(self, status: str = "shadow", limit: int = 200) -> List[Dict[str, Any]]:
         self.ensure_schema()
@@ -946,14 +1016,20 @@ def category_from_segment(segment: str) -> str:
 
 def is_rule_candidate_segment(segment: str) -> bool:
     # Avoid rules that are too broad or purely descriptive. Keep actionable segments.
-    if segment in {"ALL", "ODDS_AVAILABLE", "ODDS_MISSING"}:
+    # V3.1 generated DRAW_MAIN_OR_UNKNOWN rules; they were too generic and created
+    # confusing explanations.  V3.1.1 keeps qualification as a useful segment but
+    # no longer creates standalone rules for MAIN_OR_UNKNOWN.
+    if segment in {
+        "ALL", "ODDS_AVAILABLE", "ODDS_MISSING", "DRAW_MAIN_OR_UNKNOWN",
+        "TIEBREAK_ANY", "FIRST_SET_TIEBREAK", "BEST_OF_5_LIKE",
+    }:
         return False
     allowed_prefixes = (
         "PREMIUM_", "REFUSE_", "PROCHE_", "VETO_",
         "CATEGORY_PREMIUM", "CATEGORY_REFUSE",
-        "DRAW_QUALIFICATION", "DRAW_MAIN_OR_UNKNOWN",
+        "DRAW_QUALIFICATION",
     )
-    return segment.startswith(allowed_prefixes) or segment in {"TIEBREAK_ANY", "FIRST_SET_TIEBREAK", "BEST_OF_5_LIKE"}
+    return segment.startswith(allowed_prefixes)
 
 
 def make_shadow_rules_from_report(report: Dict[str, Any], *, min_settled: int = 10, max_rules: int = 50) -> List[Dict[str, Any]]:
@@ -1025,6 +1101,11 @@ def build_v3_rules_from_history(
 
 
 def rule_matches_row(rule: Dict[str, Any], row: Dict[str, Any], odds_cutoff: float = DEFAULT_ODDS_CUTOFF) -> bool:
+    if _s(rule.get("status")).lower() == "deprecated":
+        return False
+    source_segment = _s(rule.get("sourceSegment")).upper()
+    if source_segment in {"DRAW_MAIN_OR_UNKNOWN", "TIEBREAK_ANY", "FIRST_SET_TIEBREAK", "BEST_OF_5_LIKE"}:
+        return False
     cat = _s(rule.get("category")).upper()
     if cat and row_category(row) != cat:
         return False
@@ -1062,6 +1143,110 @@ def match_key_for_daily(row: Dict[str, Any], day: str = "") -> str:
     return "fallback:" + _s(day or row.get("date")) + ":" + names + ":" + _norm(row.get("tournament") or row.get("seasonName"))
 
 
+def _confidence_weight(rule: Dict[str, Any]) -> int:
+    conf = _s(rule.get("confidence")).upper()
+    if conf == "HIGH":
+        return 3
+    if conf == "MEDIUM":
+        return 2
+    if conf == "LOW":
+        return 1
+    return 0
+
+
+def _segment_specificity(segment: str) -> int:
+    seg = _s(segment).upper()
+    if not seg:
+        return 0
+    score = 0
+    # Category-specific rules are more actionable than global rules.
+    if seg.startswith(("PREMIUM_", "REFUSE_", "PROCHE_", "VETO_")):
+        score += 30
+    if "ODDS" in seg:
+        score += 25
+    if "QUALIFICATION" in seg:
+        score += 20
+    if "MAIN_OR_UNKNOWN" in seg:
+        score += 10
+    if "PCT_" in seg:
+        score += 18
+    if "VALUE" in seg or "COTE_180" in seg:
+        score += 18
+    if "SURFACE" in seg:
+        score += 12
+    if "TIEBREAK" in seg:
+        score += 8
+    if seg.startswith("CATEGORY_"):
+        score -= 12
+    if seg in {"DRAW_MAIN_OR_UNKNOWN", "TIEBREAK_ANY"}:
+        score -= 25
+    score += min(seg.count("_"), 8)
+    return score
+
+
+def rule_specificity(rule: Dict[str, Any]) -> int:
+    include = rule.get("includeSegments") or []
+    if not include:
+        return 0
+    return max(_segment_specificity(_s(seg)) for seg in include)
+
+
+def sort_shadow_rules_for_decision(rules: Sequence[Dict[str, Any]], *, prefer_action: str = "") -> List[Dict[str, Any]]:
+    prefer = _s(prefer_action).upper()
+
+    def key(rule: Dict[str, Any]) -> Tuple[int, int, int, float, int]:
+        action = _s(rule.get("action")).upper()
+        action_boost = 1 if prefer and action == prefer else 0
+        return (
+            action_boost,
+            rule_specificity(rule),
+            _confidence_weight(rule),
+            abs(_f(rule.get("trainRoiPct"), 0.0)),
+            int(rule.get("trainSettled", 0) or 0),
+        )
+
+    return sorted(list(rules or []), key=key, reverse=True)
+
+
+def split_shadow_rules(rules: Sequence[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], List[Dict[str, Any]]]:
+    positives: List[Dict[str, Any]] = []
+    negatives: List[Dict[str, Any]] = []
+    neutral: List[Dict[str, Any]] = []
+    for r in rules or []:
+        action = _s(r.get("action")).upper()
+        if action == "DOWNGRADE_SHADOW":
+            negatives.append(r)
+        elif action == "PROMOTE_SHADOW":
+            positives.append(r)
+        else:
+            neutral.append(r)
+    return (
+        sort_shadow_rules_for_decision(positives, prefer_action="PROMOTE_SHADOW"),
+        sort_shadow_rules_for_decision(negatives, prefer_action="DOWNGRADE_SHADOW"),
+        sort_shadow_rules_for_decision(neutral),
+    )
+
+
+def decide_shadow_from_rules(matched: Sequence[Dict[str, Any]]) -> Tuple[str, str, Dict[str, Any]]:
+    positives, negatives, neutral = split_shadow_rules(matched)
+    if negatives:
+        top_neg = negatives[0]
+        top_pos = positives[0] if positives else None
+        # Negative rules are protective.  If a specific negative segment exists,
+        # it wins over broad positive segments.  This fixes the V3.1 problem where
+        # the decision was DOWNGRADE but the reason displayed DRAW_MAIN_OR_UNKNOWN.
+        if top_pos and rule_specificity(top_pos) > rule_specificity(top_neg) + 20:
+            return "V3_SHADOW_WATCH_CONFLICT", shadow_reason("V3_SHADOW_WATCH_CONFLICT", [top_neg, top_pos]), top_neg
+        return "V3_SHADOW_DOWNGRADE", shadow_reason("V3_SHADOW_DOWNGRADE", [top_neg]), top_neg
+    if positives:
+        top_pos = positives[0]
+        return "V3_SHADOW_PROMOTE", shadow_reason("V3_SHADOW_PROMOTE", [top_pos]), top_pos
+    if neutral:
+        top = neutral[0]
+        return "V3_SHADOW_WATCH", shadow_reason("V3_SHADOW_WATCH", [top]), top
+    return "V3_NO_SIGNAL", shadow_reason("V3_NO_SIGNAL", []), {}
+
+
 def evaluate_shadow_matches(
     matches: Sequence[Dict[str, Any]],
     rules: Sequence[Dict[str, Any]],
@@ -1070,31 +1255,37 @@ def evaluate_shadow_matches(
     odds_cutoff: float = DEFAULT_ODDS_CUTOFF,
 ) -> Dict[str, Any]:
     decisions: List[Dict[str, Any]] = []
-    counts = {"promote": 0, "downgrade": 0, "watch": 0, "noSignal": 0}
+    counts = {"promote": 0, "downgrade": 0, "watch": 0, "noSignal": 0, "conflict": 0}
     for m in matches or []:
-        matched = [r for r in rules if rule_matches_row(r, m, odds_cutoff=odds_cutoff)]
-        action_set = {_s(r.get("action")) for r in matched}
-        if "DOWNGRADE_SHADOW" in action_set:
-            decision = "V3_SHADOW_DOWNGRADE"
+        matched_raw = [r for r in rules if rule_matches_row(r, m, odds_cutoff=odds_cutoff)]
+        positives, negatives, neutral = split_shadow_rules(matched_raw)
+        matched = negatives + positives + neutral
+        decision, reason, primary_rule = decide_shadow_from_rules(matched)
+        if decision == "V3_SHADOW_DOWNGRADE":
             counts["downgrade"] += 1
-        elif "PROMOTE_SHADOW" in action_set:
-            decision = "V3_SHADOW_PROMOTE"
+        elif decision == "V3_SHADOW_PROMOTE":
             counts["promote"] += 1
-        elif matched:
-            decision = "V3_SHADOW_WATCH"
+        elif decision == "V3_SHADOW_WATCH_CONFLICT":
+            counts["watch"] += 1
+            counts["conflict"] += 1
+        elif decision == "V3_SHADOW_WATCH":
             counts["watch"] += 1
         else:
-            decision = "V3_NO_SIGNAL"
             counts["noSignal"] += 1
         decisions.append({
             "matchKey": match_key_for_daily(m, day=day),
             "shadowDecision": decision,
-            "reason": shadow_reason(decision, matched),
+            "reason": reason,
+            "primaryRule": primary_rule,
             "match": m,
             "category": row_category(m),
             "drawType": draw_type(m),
+            "isQualification": is_qualification(m),
+            "qualificationSignals": qualification_signals(m),
             "segments": row_segments(m, odds_cutoff=odds_cutoff),
             "matchedRules": matched,
+            "positiveRules": positives,
+            "negativeRules": negatives,
         })
     return {"status": "ok", "version": V3_VERSION, "day": day, "counts": counts, "decisions": decisions}
 
@@ -1103,8 +1294,14 @@ def shadow_reason(decision: str, rules: Sequence[Dict[str, Any]]) -> str:
     if not rules:
         return "Aucune règle V3 shadow ne correspond à ce match."
     top = rules[0]
+    segment = _s(top.get("sourceSegment"))
+    roi = _f(top.get("trainRoiPct"), 0.0)
+    settled = int(top.get("trainSettled", 0) or 0)
     if decision == "V3_SHADOW_DOWNGRADE":
-        return "Une règle V3 négative correspond au match : " + _s(top.get("sourceSegment"))
+        return f"Downgrade V3 : segment négatif prioritaire {segment} | ROI entraînement {roi:.2f}% sur {settled} matchs réglés."
     if decision == "V3_SHADOW_PROMOTE":
-        return "Une règle V3 positive correspond au match : " + _s(top.get("sourceSegment"))
-    return "Règle V3 en observation : " + _s(top.get("sourceSegment"))
+        return f"Promote V3 : segment positif prioritaire {segment} | ROI entraînement {roi:.2f}% sur {settled} matchs réglés."
+    if decision == "V3_SHADOW_WATCH_CONFLICT":
+        second = rules[1] if len(rules) > 1 else {}
+        return "Conflit V3 : négatif " + segment + " contre positif " + _s(second.get("sourceSegment")) + ". À surveiller, pas de validation automatique."
+    return "Règle V3 en observation : " + segment

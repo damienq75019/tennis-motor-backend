@@ -2443,14 +2443,14 @@ def sync_daily_maintenance_run(
 
 @app.get("/v3/status")
 def v3_status() -> Dict[str, Any]:
-    """Tennis Motor V3.1 — learning memory + automatic shadow rules status."""
+    """Tennis Motor V3.1.1 — qualification detection + prioritized shadow rules status."""
     history_store = PostgresPremiumStore()
     v3_store = V3LearningMemoryStore()
     v3_status_payload = v3_store.status()
     return {
         "status": "ok",
         "version": V3_VERSION,
-        "mode": "learning_memory_plus_shadow_rules",
+        "mode": "learning_memory_plus_priority_shadow_rules",
         "databaseConfigured": history_store.enabled,
         "historyTable": history_store.TABLE,
         "v3": v3_status_payload,
@@ -2463,7 +2463,7 @@ def v3_status() -> Dict[str, Any]:
             "/v3/rules/refresh?category=all&limit=50000&min_settled=10",
             "/v3/shadow/daily?day=today&persist=false",
         ],
-        "policy": "V3 apprend, crée des règles shadow et les teste. Elle ne remplace jamais STEP56/STEP62 sans validation hors échantillon.",
+        "policy": "V3 apprend, corrige la qualification, priorise les règles shadow et les teste. Elle ne remplace jamais STEP56/STEP62 sans validation hors échantillon.",
     }
 
 
@@ -2621,6 +2621,7 @@ def v3_rules_refresh(
             "memorySync": sync_info,
             "rulesGenerated": rules_payload.get("rulesCount", 0),
             "rulesWritten": write_info.get("rulesWritten", 0),
+            "autoRulesDeprecatedBeforeRefresh": write_info.get("autoRulesDeprecatedBeforeRefresh", 0),
             "rules": rules_payload.get("rules", []),
             "learningSummary": rules_payload.get("learningReport", {}).get("summary", {}),
         }
