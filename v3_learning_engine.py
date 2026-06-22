@@ -1,20 +1,22 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Tennis Motor — V3.1.2 Learning Engine
+Tennis Motor — V3.2 Shadow Result Tracker
 
 Non-destructive intelligent layer above STEP56/STEP62.
 
-V3.1.2 adds the Conflict Resolver after the first V3.1.1 audit:
+V3.2 adds the Shadow Result Tracker after the V3.1.2 Conflict Resolver:
 - persistent learning memory table from PostgreSQL history;
 - automatic shadow-rule generation from historical segments;
 - shadow evaluation for daily/live candidates;
 - conflict resolution between positive and negative shadow rules;
+- tracking of shadow decisions against settled results;
+- V2 vs V3 shadow performance comparison;
 - zero replacement of the official motor until out-of-sample validation.
 
 Policy:
 - V2/STEP56 remains the official prediction engine.
-- V3.1.2 learns, writes memory, creates shadow rules, resolves conflicts, and tests them.
+- V3.2 learns, writes memory, creates shadow rules, resolves conflicts, tests them, and tracks settled shadow results.
 - V3.1.2 does not change a bet decision automatically.
 """
 from __future__ import annotations
@@ -35,7 +37,7 @@ FINAL_WIN = "win"
 FINAL_LOSS = "loss"
 FINAL_VOID = "void"
 FINAL_PENDING = "pending"
-V3_VERSION = "v3.1.2-conflict-resolver-shadow-rules"
+V3_VERSION = "v3.2-shadow-result-tracker"
 
 
 def _s(value: Any) -> str:
@@ -178,6 +180,134 @@ def row_profit(row: Dict[str, Any], stake: float = STAKE_EUR) -> Tuple[float, fl
     if result == FINAL_LOSS:
         return (-stake, stake)
     return (0.0, 0.0)
+
+
+
+def result_delta_if_skipped(row: Dict[str, Any], stake: float = STAKE_EUR) -> Tuple[float, float]:
+    """Return (delta_vs_playing, baseline_stake) if a V3 downgrade skips the match.
+
+    If the official pick would have lost, skipping saves +stake.
+    If it would have won, skipping misses the profit and returns a negative delta.
+    Void/pending rows have zero effect.
+    """
+    profit, staked = row_profit(row, stake=stake)
+    if staked <= 0:
+        return 0.0, 0.0
+    return -profit, staked
+
+
+def empty_result_bucket() -> Dict[str, Any]:
+    return {
+        "total": 0,
+        "settled": 0,
+        "wins": 0,
+        "losses": 0,
+        "voids": 0,
+        "pending": 0,
+        "notFound": 0,
+        "stakedEur": 0.0,
+        "profitIfPlayedEur": 0.0,
+        "roiIfPlayedPct": 0.0,
+        "deltaVsV2IfAppliedEur": 0.0,
+        "avgOdd": 0.0,
+        "_oddSum": 0.0,
+        "_oddCount": 0,
+    }
+
+
+def add_row_to_bucket(bucket: Dict[str, Any], row: Optional[Dict[str, Any]], *, shadow_decision: str = "") -> None:
+    bucket["total"] += 1
+    if not row:
+        bucket["notFound"] += 1
+        return
+    result = row_result(row)
+    odd = row_odd(row)
+    if odd > 1.0:
+        bucket["_oddSum"] += odd
+        bucket["_oddCount"] += 1
+    if result == FINAL_WIN:
+        bucket["wins"] += 1
+        bucket["settled"] += 1
+    elif result == FINAL_LOSS:
+        bucket["losses"] += 1
+        bucket["settled"] += 1
+    elif result == FINAL_VOID:
+        bucket["voids"] += 1
+    else:
+        bucket["pending"] += 1
+
+    profit, staked = row_profit(row)
+    bucket["profitIfPlayedEur"] += profit
+    bucket["stakedEur"] += staked
+    if _s(shadow_decision).upper() == "V3_SHADOW_DOWNGRADE":
+        delta, _ = result_delta_if_skipped(row)
+        bucket["deltaVsV2IfAppliedEur"] += delta
+    elif _s(shadow_decision).upper() == "V3_SHADOW_PROMOTE":
+        bucket["deltaVsV2IfAppliedEur"] += profit
+
+
+def finish_result_bucket(bucket: Dict[str, Any]) -> Dict[str, Any]:
+    out = dict(bucket)
+    out.pop("_oddSum", None)
+    out.pop("_oddCount", None)
+    settled = int(bucket.get("settled", 0) or 0)
+    wins = int(bucket.get("wins", 0) or 0)
+    staked = float(bucket.get("stakedEur", 0.0) or 0.0)
+    odd_count = int(bucket.get("_oddCount", 0) or 0)
+    odd_sum = float(bucket.get("_oddSum", 0.0) or 0.0)
+    out["winRatePct"] = round((wins / settled * 100.0) if settled else 0.0, 2)
+    out["profitIfPlayedEur"] = round(float(bucket.get("profitIfPlayedEur", 0.0) or 0.0), 2)
+    out["stakedEur"] = round(staked, 2)
+    out["roiIfPlayedPct"] = round((float(bucket.get("profitIfPlayedEur", 0.0) or 0.0) / staked * 100.0) if staked else 0.0, 2)
+    out["deltaVsV2IfAppliedEur"] = round(float(bucket.get("deltaVsV2IfAppliedEur", 0.0) or 0.0), 2)
+    out["avgOdd"] = round((odd_sum / odd_count) if odd_count else 0.0, 3)
+    return out
+
+
+def primary_rule_id_from_payload(payload: Dict[str, Any], fallback_rule_id: str = "") -> str:
+    primary = payload.get("primaryRule") if isinstance(payload, dict) else None
+    if isinstance(primary, dict):
+        return _s(primary.get("ruleId") or primary.get("rule_id") or fallback_rule_id)
+    return _s(fallback_rule_id)
+
+
+def primary_rule_name_from_payload(payload: Dict[str, Any], fallback_rule_id: str = "") -> str:
+    primary = payload.get("primaryRule") if isinstance(payload, dict) else None
+    if isinstance(primary, dict):
+        return _s(primary.get("name") or primary.get("sourceSegment") or primary.get("ruleId") or fallback_rule_id)
+    return _s(fallback_rule_id)
+
+
+def compact_shadow_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
+    if not isinstance(payload, dict):
+        return {}
+    match = payload.get("match") if isinstance(payload.get("match"), dict) else {}
+    primary = payload.get("primaryRule") if isinstance(payload.get("primaryRule"), dict) else {}
+    return {
+        "matchKey": payload.get("matchKey"),
+        "shadowDecision": payload.get("shadowDecision"),
+        "reason": payload.get("reason"),
+        "primaryRule": {
+            "ruleId": primary.get("ruleId"),
+            "name": primary.get("name"),
+            "sourceSegment": primary.get("sourceSegment"),
+            "action": primary.get("action"),
+            "trainSettled": primary.get("trainSettled"),
+            "trainRoiPct": primary.get("trainRoiPct"),
+            "trainProfitEur": primary.get("trainProfitEur"),
+        },
+        "match": {
+            "playerA": match.get("playerA") or match.get("sourcePlayerA") or match.get("predictedWinner"),
+            "playerB": match.get("playerB") or match.get("sourcePlayerB") or match.get("opponent"),
+            "surface": match.get("surface"),
+            "tournament": match.get("tournament") or match.get("seasonName"),
+            "round": match.get("round"),
+            "premiumPct": match.get("premiumPct"),
+            "odd": row_odd(match),
+            "category": row_category(match),
+            "drawType": draw_type(match),
+        },
+    }
 
 
 def _get_nested(row: Dict[str, Any], key: str) -> Any:
@@ -700,6 +830,18 @@ class V3LearningMemoryStore:
                 )
                 cur.execute(f"CREATE INDEX IF NOT EXISTS idx_{self.DECISIONS_TABLE}_day ON {self.DECISIONS_TABLE}(day)")
                 cur.execute(f"CREATE INDEX IF NOT EXISTS idx_{self.DECISIONS_TABLE}_rule_id ON {self.DECISIONS_TABLE}(rule_id)")
+                cur.execute(f"CREATE INDEX IF NOT EXISTS idx_{self.DECISIONS_TABLE}_match_key ON {self.DECISIONS_TABLE}(match_key)")
+
+                # STEP V3.2: add result-tracking columns without breaking older V3.1.x deployments.
+                cur.execute(f"ALTER TABLE {self.DECISIONS_TABLE} ADD COLUMN IF NOT EXISTS primary_rule_id TEXT")
+                cur.execute(f"ALTER TABLE {self.DECISIONS_TABLE} ADD COLUMN IF NOT EXISTS final_result TEXT NOT NULL DEFAULT 'pending'")
+                cur.execute(f"ALTER TABLE {self.DECISIONS_TABLE} ADD COLUMN IF NOT EXISTS final_profit_eur DOUBLE PRECISION NOT NULL DEFAULT 0")
+                cur.execute(f"ALTER TABLE {self.DECISIONS_TABLE} ADD COLUMN IF NOT EXISTS final_staked_eur DOUBLE PRECISION NOT NULL DEFAULT 0")
+                cur.execute(f"ALTER TABLE {self.DECISIONS_TABLE} ADD COLUMN IF NOT EXISTS delta_vs_v2_eur DOUBLE PRECISION NOT NULL DEFAULT 0")
+                cur.execute(f"ALTER TABLE {self.DECISIONS_TABLE} ADD COLUMN IF NOT EXISTS settled_at TIMESTAMPTZ")
+                cur.execute(f"ALTER TABLE {self.DECISIONS_TABLE} ADD COLUMN IF NOT EXISTS tracking_payload_json TEXT NOT NULL DEFAULT '{{}}'")
+                cur.execute(f"CREATE INDEX IF NOT EXISTS idx_{self.DECISIONS_TABLE}_final_result ON {self.DECISIONS_TABLE}(final_result)")
+                cur.execute(f"CREATE INDEX IF NOT EXISTS idx_{self.DECISIONS_TABLE}_primary_rule ON {self.DECISIONS_TABLE}(primary_rule_id)")
             conn.commit()
 
     def status(self) -> Dict[str, Any]:
@@ -980,26 +1122,348 @@ class V3LearningMemoryStore:
                         cur.execute(
                             f"""
                             INSERT INTO {self.DECISIONS_TABLE} (
-                                decision_id, rule_id, match_key, day, player_a, player_b, category,
-                                shadow_decision, reason, result, source_payload_json, updated_at
-                            ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,NOW())
+                                decision_id, rule_id, primary_rule_id, match_key, day, player_a, player_b, category,
+                                shadow_decision, reason, result, final_result, source_payload_json, tracking_payload_json, updated_at
+                            ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,NOW())
                             ON CONFLICT (decision_id) DO UPDATE SET
+                                primary_rule_id = EXCLUDED.primary_rule_id,
                                 shadow_decision = EXCLUDED.shadow_decision,
                                 reason = EXCLUDED.reason,
                                 result = EXCLUDED.result,
                                 source_payload_json = EXCLUDED.source_payload_json,
+                                tracking_payload_json = EXCLUDED.tracking_payload_json,
                                 updated_at = NOW()
                             """,
                             (
-                                decision_id, rule.get("ruleId"), d.get("matchKey"), day,
+                                decision_id, rule.get("ruleId"), primary_rule_id_from_payload(d, rule.get("ruleId")), d.get("matchKey"), day,
                                 _s(match.get("playerA") or match.get("sourcePlayerA") or match.get("predictedWinner")),
                                 _s(match.get("playerB") or match.get("sourcePlayerB") or match.get("opponent")),
-                                row_category(match), d.get("shadowDecision"), d.get("reason", ""), "pending", _json_dumps(d),
+                                row_category(match), d.get("shadowDecision"), d.get("reason", ""), "pending", "pending", _json_dumps(d), _json_dumps(compact_shadow_payload(d)),
                             ),
                         )
                         written += 1
             conn.commit()
         return {"status": "ok", "shadowDecisionsWritten": written}
+
+
+    def fetch_shadow_decisions(self, day: str = "", limit: int = 50000, status: str = "all") -> List[Dict[str, Any]]:
+        self.ensure_schema()
+        params: List[Any] = []
+        where_parts: List[str] = []
+        if day and _s(day).lower() not in {"all", "*"}:
+            where_parts.append("day = %s")
+            params.append(_s(day))
+        if status and _s(status).lower() not in {"all", "*"}:
+            where_parts.append("shadow_decision = %s")
+            params.append(_s(status))
+        where = (" WHERE " + " AND ".join(where_parts)) if where_parts else ""
+        sql = f"""
+            SELECT decision_id, rule_id, primary_rule_id, match_key, day, player_a, player_b, category,
+                   shadow_decision, reason, result, final_result, final_profit_eur, final_staked_eur,
+                   delta_vs_v2_eur, source_payload_json, tracking_payload_json, created_at, updated_at
+            FROM {self.DECISIONS_TABLE}{where}
+            ORDER BY updated_at DESC
+            LIMIT %s
+        """
+        params.append(int(limit))
+        out: List[Dict[str, Any]] = []
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(sql, tuple(params))
+                cols = [d[0] for d in cur.description]
+                for db_row in cur.fetchall():
+                    r = dict(zip(cols, db_row))
+                    payload = _json_loads(r.get("source_payload_json"), {})
+                    tracking = _json_loads(r.get("tracking_payload_json"), {})
+                    out.append({
+                        "decisionId": r.get("decision_id"),
+                        "ruleId": r.get("rule_id"),
+                        "primaryRuleId": r.get("primary_rule_id") or primary_rule_id_from_payload(payload, r.get("rule_id")),
+                        "primaryRuleName": primary_rule_name_from_payload(payload, r.get("rule_id")),
+                        "matchKey": r.get("match_key"),
+                        "day": r.get("day"),
+                        "playerA": r.get("player_a"),
+                        "playerB": r.get("player_b"),
+                        "category": r.get("category"),
+                        "shadowDecision": r.get("shadow_decision"),
+                        "reason": r.get("reason"),
+                        "result": r.get("result"),
+                        "finalResult": r.get("final_result"),
+                        "finalProfitEur": r.get("final_profit_eur"),
+                        "finalStakedEur": r.get("final_staked_eur"),
+                        "deltaVsV2Eur": r.get("delta_vs_v2_eur"),
+                        "sourcePayload": payload,
+                        "trackingPayload": tracking,
+                    })
+        return out
+
+    def track_shadow_results(
+        self,
+        *,
+        day: str = "",
+        memory_rows: Optional[Sequence[Dict[str, Any]]] = None,
+        limit: int = 50000,
+        odds_cutoff: float = DEFAULT_ODDS_CUTOFF,
+    ) -> Dict[str, Any]:
+        """Update shadow decisions with settled outcomes and return a deduped performance report.
+
+        The decisions table stores one row per matched rule. For performance we
+        count each match once, using the primary rule chosen by the conflict
+        resolver. This prevents a match with 6 matched rules from counting 6
+        times.
+        """
+        self.ensure_schema()
+        rows = list(memory_rows) if memory_rows is not None else self.fetch_memory_rows(limit=limit)
+        memory_by_key: Dict[str, Dict[str, Any]] = {}
+        for row in rows:
+            key = match_key_for_daily(row, day=_s(row.get("date")))
+            memory_by_key[key] = row
+            # Also index by raw event id if present in provider-specific fields.
+            event_id = _s(row.get("sportradarSportEventId") or row.get("sportEventId") or row.get("sport_event_id") or row.get("id"))
+            if event_id:
+                memory_by_key["event:" + event_id] = row
+
+        decisions = self.fetch_shadow_decisions(day=day, limit=limit, status="all")
+        updated = 0
+        found = 0
+        settled = 0
+        pending = 0
+        not_found = 0
+        update_rows: List[Tuple[Any, ...]] = []
+
+        # First update every persisted row, even if later summaries are deduped.
+        for d in decisions:
+            match_key = _s(d.get("matchKey"))
+            memory_row = memory_by_key.get(match_key)
+            if not memory_row:
+                payload = d.get("sourcePayload") or {}
+                match = payload.get("match") if isinstance(payload, dict) else {}
+                if isinstance(match, dict):
+                    memory_row = memory_by_key.get(match_key_for_daily(match, day=_s(d.get("day"))))
+            if not memory_row:
+                not_found += 1
+                continue
+            found += 1
+            final = row_result(memory_row)
+            profit, staked = row_profit(memory_row)
+            delta, _ = result_delta_if_skipped(memory_row)
+            shadow_decision = _s(d.get("shadowDecision")).upper()
+            effective_delta = delta if shadow_decision == "V3_SHADOW_DOWNGRADE" else (profit if shadow_decision == "V3_SHADOW_PROMOTE" else 0.0)
+            if final == FINAL_PENDING:
+                pending += 1
+            else:
+                settled += 1
+            tracking_payload = {
+                "matchedMemoryKey": match_key,
+                "finalCompactRow": compact_learning_row(memory_row),
+                "profitIfPlayedEur": round(profit, 2),
+                "stakedEur": round(staked, 2),
+                "deltaVsV2IfAppliedEur": round(effective_delta, 2),
+                "trackedAt": datetime.utcnow().isoformat() + "Z",
+            }
+            update_rows.append((
+                final,
+                final,
+                profit,
+                staked,
+                effective_delta,
+                _json_dumps(tracking_payload),
+                d.get("decisionId"),
+            ))
+
+        if update_rows:
+            with self._connect() as conn:
+                with conn.cursor() as cur:
+                    for values in update_rows:
+                        final = values[0]
+                        settled_expr = "NOW()" if final != FINAL_PENDING else "NULL"
+                        cur.execute(
+                            f"""
+                            UPDATE {self.DECISIONS_TABLE}
+                            SET result = %s,
+                                final_result = %s,
+                                final_profit_eur = %s,
+                                final_staked_eur = %s,
+                                delta_vs_v2_eur = %s,
+                                tracking_payload_json = %s,
+                                settled_at = {settled_expr},
+                                updated_at = NOW()
+                            WHERE decision_id = %s
+                            """,
+                            values,
+                        )
+                        updated += int(cur.rowcount or 0)
+                conn.commit()
+
+        report = self.build_shadow_performance_report(day=day, limit=limit, memory_rows=rows, odds_cutoff=odds_cutoff)
+        report["tracking"] = {
+            "decisionsRead": len(decisions),
+            "matchedWithMemory": found,
+            "updatedRows": updated,
+            "settledRows": settled,
+            "pendingRows": pending,
+            "notFoundRows": not_found,
+        }
+        return report
+
+    def build_shadow_performance_report(
+        self,
+        *,
+        day: str = "",
+        limit: int = 50000,
+        memory_rows: Optional[Sequence[Dict[str, Any]]] = None,
+        odds_cutoff: float = DEFAULT_ODDS_CUTOFF,
+    ) -> Dict[str, Any]:
+        self.ensure_schema()
+        rows = list(memory_rows) if memory_rows is not None else self.fetch_memory_rows(limit=limit)
+        memory_by_key: Dict[str, Dict[str, Any]] = {}
+        for row in rows:
+            memory_by_key[match_key_for_daily(row, day=_s(row.get("date")))] = row
+            event_id = _s(row.get("sportradarSportEventId") or row.get("sportEventId") or row.get("sport_event_id") or row.get("id"))
+            if event_id:
+                memory_by_key["event:" + event_id] = row
+
+        decisions = self.fetch_shadow_decisions(day=day, limit=limit, status="all")
+
+        # Deduplicate: one effective V3 decision per match, choosing the row whose
+        # rule_id is the primary rule whenever possible.
+        by_match: Dict[str, Dict[str, Any]] = {}
+        for d in decisions:
+            key = _s(d.get("matchKey"))
+            if not key:
+                continue
+            existing = by_match.get(key)
+            current_is_primary = _s(d.get("ruleId")) == _s(d.get("primaryRuleId"))
+            existing_is_primary = bool(existing and _s(existing.get("ruleId")) == _s(existing.get("primaryRuleId")))
+            if existing is None or (current_is_primary and not existing_is_primary):
+                by_match[key] = d
+
+        all_bucket = empty_result_bucket()
+        promote_bucket = empty_result_bucket()
+        downgrade_bucket = empty_result_bucket()
+        watch_bucket = empty_result_bucket()
+        no_signal_bucket = empty_result_bucket()
+        by_primary_rule: Dict[str, Dict[str, Any]] = {}
+        by_segment: Dict[str, Dict[str, Any]] = {}
+
+        v2_scope_profit = 0.0
+        v2_scope_staked = 0.0
+        v3_shadow_profit = 0.0
+        v3_shadow_staked = 0.0
+        settled_scope = 0
+        pending_scope = 0
+        not_found_scope = 0
+
+        examples: List[Dict[str, Any]] = []
+        for match_key, d in by_match.items():
+            row = memory_by_key.get(match_key)
+            if not row:
+                payload = d.get("sourcePayload") or {}
+                match = payload.get("match") if isinstance(payload, dict) else {}
+                if isinstance(match, dict):
+                    row = memory_by_key.get(match_key_for_daily(match, day=_s(d.get("day"))))
+            decision = _s(d.get("shadowDecision")).upper()
+            primary_id = _s(d.get("primaryRuleId") or d.get("ruleId") or "NO_RULE")
+            primary_name = _s(d.get("primaryRuleName") or primary_id)
+            primary_segment = primary_name.replace("Tester positif — ", "").replace("Downgrade test — ", "")
+
+            add_row_to_bucket(all_bucket, row, shadow_decision=decision)
+            if decision == "V3_SHADOW_PROMOTE":
+                add_row_to_bucket(promote_bucket, row, shadow_decision=decision)
+            elif decision == "V3_SHADOW_DOWNGRADE":
+                add_row_to_bucket(downgrade_bucket, row, shadow_decision=decision)
+            elif decision in {"V3_SHADOW_WATCH", "V3_SHADOW_WATCH_CONFLICT"}:
+                add_row_to_bucket(watch_bucket, row, shadow_decision=decision)
+            else:
+                add_row_to_bucket(no_signal_bucket, row, shadow_decision=decision)
+
+            if primary_id not in by_primary_rule:
+                b = empty_result_bucket()
+                b["ruleId"] = primary_id
+                b["ruleName"] = primary_name
+                by_primary_rule[primary_id] = b
+            add_row_to_bucket(by_primary_rule[primary_id], row, shadow_decision=decision)
+
+            if primary_segment not in by_segment:
+                b = empty_result_bucket()
+                b["segment"] = primary_segment
+                by_segment[primary_segment] = b
+            add_row_to_bucket(by_segment[primary_segment], row, shadow_decision=decision)
+
+            if not row:
+                not_found_scope += 1
+            else:
+                result = row_result(row)
+                profit, staked = row_profit(row)
+                if result == FINAL_PENDING:
+                    pending_scope += 1
+                elif result in {FINAL_WIN, FINAL_LOSS}:
+                    settled_scope += 1
+                    v2_scope_profit += profit
+                    v2_scope_staked += staked
+                    if decision == "V3_SHADOW_PROMOTE":
+                        v3_shadow_profit += profit
+                        v3_shadow_staked += staked
+                    # downgrade/watch/no signal = no play in conservative shadow mode
+                if len(examples) < 20:
+                    examples.append({
+                        "matchKey": match_key,
+                        "shadowDecision": decision,
+                        "primaryRuleId": primary_id,
+                        "primaryRuleName": primary_name,
+                        "result": result,
+                        "profitIfPlayedEur": round(profit, 2),
+                        "deltaVsV2IfAppliedEur": round((-profit if decision == "V3_SHADOW_DOWNGRADE" else profit if decision == "V3_SHADOW_PROMOTE" else 0.0), 2),
+                        "playerA": row.get("sourcePlayerA") or row.get("playerA") or row.get("predictedWinner"),
+                        "playerB": row.get("sourcePlayerB") or row.get("playerB") or row.get("opponent"),
+                        "category": row_category(row),
+                        "drawType": draw_type(row),
+                        "odd": row_odd(row),
+                    })
+
+        v2_roi = (v2_scope_profit / v2_scope_staked * 100.0) if v2_scope_staked else 0.0
+        v3_roi = (v3_shadow_profit / v3_shadow_staked * 100.0) if v3_shadow_staked else 0.0
+        rules_out = [finish_result_bucket(b) for b in by_primary_rule.values()]
+        rules_out.sort(key=lambda x: (x.get("deltaVsV2IfAppliedEur", 0.0), x.get("profitIfPlayedEur", 0.0)), reverse=True)
+        segs_out = [finish_result_bucket(b) for b in by_segment.values()]
+        segs_out.sort(key=lambda x: (x.get("deltaVsV2IfAppliedEur", 0.0), x.get("profitIfPlayedEur", 0.0)), reverse=True)
+
+        return {
+            "status": "ok",
+            "version": V3_VERSION,
+            "day": day or "all",
+            "policy": "Performance shadow : PROMOTE = joué en V3, DOWNGRADE/WATCH/NO_SIGNAL = évité en V3. STEP56 officiel n'est pas remplacé.",
+            "scope": {
+                "rawDecisionRows": len(decisions),
+                "uniqueMatches": len(by_match),
+                "settledMatches": settled_scope,
+                "pendingMatches": pending_scope,
+                "notFoundMatches": not_found_scope,
+            },
+            "v2BaselineSameScope": {
+                "settled": settled_scope,
+                "stakedEur": round(v2_scope_staked, 2),
+                "profitEur": round(v2_scope_profit, 2),
+                "roiPct": round(v2_roi, 2),
+            },
+            "v3ShadowConservative": {
+                "playedSettledPromotes": finish_result_bucket(promote_bucket).get("settled", 0),
+                "stakedEur": round(v3_shadow_staked, 2),
+                "profitEur": round(v3_shadow_profit, 2),
+                "roiPct": round(v3_roi, 2),
+                "deltaVsV2SameScopeEur": round(v3_shadow_profit - v2_scope_profit, 2),
+            },
+            "byDecision": {
+                "all": finish_result_bucket(all_bucket),
+                "promote": finish_result_bucket(promote_bucket),
+                "downgrade": finish_result_bucket(downgrade_bucket),
+                "watch": finish_result_bucket(watch_bucket),
+                "noSignal": finish_result_bucket(no_signal_bucket),
+            },
+            "byPrimaryRule": rules_out[:50],
+            "byPrimarySegment": segs_out[:50],
+            "examples": examples,
+        }
 
 
 def confidence_from_stats(stats: Dict[str, Any]) -> str:

@@ -2450,7 +2450,7 @@ def v3_status() -> Dict[str, Any]:
     return {
         "status": "ok",
         "version": V3_VERSION,
-        "mode": "learning_memory_plus_priority_shadow_rules",
+        "mode": "learning_memory_priority_shadow_rules_plus_result_tracker",
         "databaseConfigured": history_store.enabled,
         "historyTable": history_store.TABLE,
         "v3": v3_status_payload,
@@ -2462,8 +2462,10 @@ def v3_status() -> Dict[str, Any]:
             "/v3/rules/list?status=shadow",
             "/v3/rules/refresh?category=all&limit=50000&min_settled=10",
             "/v3/shadow/daily?day=today&persist=false",
+            "/v3/shadow/track?day=today&sync_memory=true",
+            "/v3/shadow/performance?day=today",
         ],
-        "policy": "V3 apprend, corrige la qualification, priorise les règles shadow et les teste. Elle ne remplace jamais STEP56/STEP62 sans validation hors échantillon.",
+        "policy": "V3 apprend, corrige la qualification, priorise les règles shadow, les teste et suit leurs résultats réglés. Elle ne remplace jamais STEP56/STEP62 sans validation hors échantillon.",
     }
 
 
@@ -2696,6 +2698,55 @@ def v3_shadow_daily(
             "shadow": shadow,
             "policy": "Shadow seulement : aucune décision officielle n'est remplacée.",
         }
+    except Exception as exc:
+        return {"status": "error", "version": V3_VERSION, "error": f"{type(exc).__name__}: {exc}"}
+
+
+@app.get("/v3/shadow/track")
+def v3_shadow_track(
+    day: str = Query("today", description="today, yesterday, tomorrow, YYYY-MM-DD ou all"),
+    category: str = Query("all"),
+    limit: int = Query(50000, ge=1, le=100000),
+    odds_cutoff: float = Query(1.90, ge=1.01, le=100.0),
+    sync_memory: bool = Query(True),
+) -> Dict[str, Any]:
+    """STEP V3.2 — update shadow decisions with final outcomes and return performance.
+
+    This endpoint is the first real shadow validation loop:
+    - refreshes V3 memory from settled history when sync_memory=true;
+    - matches persisted shadow decisions to settled history by event/match key;
+    - updates final_result/profit/delta_vs_v2 in tennis_v3_shadow_decisions;
+    - returns V2 baseline vs V3 conservative shadow comparison.
+    """
+    v3_store = V3LearningMemoryStore()
+    try:
+        raw_day = (day or "today").strip().lower()
+        resolved_day = "" if raw_day in {"all", "*", "tout"} else normalize_day(day)
+        memory_sync = None
+        if sync_memory:
+            memory_sync = v3_memory_sync(category=category, limit=limit, odds_cutoff=odds_cutoff)
+        report = v3_store.track_shadow_results(day=resolved_day, limit=limit, odds_cutoff=odds_cutoff)
+        report["memorySync"] = memory_sync
+        report["endpoint"] = "/v3/shadow/track"
+        return report
+    except Exception as exc:
+        return {"status": "error", "version": V3_VERSION, "error": f"{type(exc).__name__}: {exc}"}
+
+
+@app.get("/v3/shadow/performance")
+def v3_shadow_performance(
+    day: str = Query("today", description="today, yesterday, tomorrow, YYYY-MM-DD ou all"),
+    limit: int = Query(50000, ge=1, le=100000),
+    odds_cutoff: float = Query(1.90, ge=1.01, le=100.0),
+) -> Dict[str, Any]:
+    """Read V3 shadow performance without updating from history."""
+    v3_store = V3LearningMemoryStore()
+    try:
+        raw_day = (day or "today").strip().lower()
+        resolved_day = "" if raw_day in {"all", "*", "tout"} else normalize_day(day)
+        report = v3_store.build_shadow_performance_report(day=resolved_day, limit=limit, odds_cutoff=odds_cutoff)
+        report["endpoint"] = "/v3/shadow/performance"
+        return report
     except Exception as exc:
         return {"status": "error", "version": V3_VERSION, "error": f"{type(exc).__name__}: {exc}"}
 
