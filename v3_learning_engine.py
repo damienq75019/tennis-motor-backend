@@ -1,20 +1,21 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Tennis Motor — V3.1.1 Learning Engine
+Tennis Motor — V3.1.2 Learning Engine
 
 Non-destructive intelligent layer above STEP56/STEP62.
 
-V3.1.1 fixes the first V3.1 shadow audit:
+V3.1.2 adds the Conflict Resolver after the first V3.1.1 audit:
 - persistent learning memory table from PostgreSQL history;
 - automatic shadow-rule generation from historical segments;
 - shadow evaluation for daily/live candidates;
+- conflict resolution between positive and negative shadow rules;
 - zero replacement of the official motor until out-of-sample validation.
 
 Policy:
 - V2/STEP56 remains the official prediction engine.
-- V3.1 learns, writes memory, creates shadow rules, and tests them.
-- V3.1 does not change a bet decision automatically.
+- V3.1.2 learns, writes memory, creates shadow rules, resolves conflicts, and tests them.
+- V3.1.2 does not change a bet decision automatically.
 """
 from __future__ import annotations
 
@@ -34,7 +35,7 @@ FINAL_WIN = "win"
 FINAL_LOSS = "loss"
 FINAL_VOID = "void"
 FINAL_PENDING = "pending"
-V3_VERSION = "v3.1.1-qualification-priority-shadow-rules"
+V3_VERSION = "v3.1.2-conflict-resolver-shadow-rules"
 
 
 def _s(value: Any) -> str:
@@ -417,9 +418,16 @@ def row_segments(row: Dict[str, Any], odds_cutoff: float = DEFAULT_ODDS_CUTOFF) 
     ]
 
     if odd > 1.0:
+        odds_band = "ODDS_GT_1_90" if odd > odds_cutoff else "ODDS_LE_1_90"
         segments.append("ODDS_AVAILABLE")
-        segments.append("ODDS_GT_1_90" if odd > odds_cutoff else "ODDS_LE_1_90")
-        segments.append(f"{cat}_ODDS_GT_1_90" if odd > odds_cutoff else f"{cat}_ODDS_LE_1_90")
+        segments.append(odds_band)
+        segments.append(f"{cat}_{odds_band}")
+        # STEP V3.1.2: composite segments let the learning engine separate,
+        # for example, PREMIUM_QUALIFICATION_ODDS_LE_1_90 from the broader
+        # PREMIUM_ODDS_LE_1_90. This prevents a weak generic odds downgrade from
+        # masking a strong qualification signal.
+        segments.append(f"{cat}_{draw}_{odds_band}")
+        segments.append(f"DRAW_{draw}_{odds_band}")
     else:
         segments.append("ODDS_MISSING")
 
@@ -531,7 +539,9 @@ def make_learning_hypotheses(segments: List[Dict[str, Any]], min_settled: int) -
         "REFUSE_VALUE_STRICT", "REFUSE_VALUE_LARGE", "REFUSE_VALUE_STRICT_QUALIFICATION", "REFUSE_VALUE_LARGE_QUALIFICATION",
         "TIEBREAK_ANY", "CATEGORY_PREMIUM", "CATEGORY_REFUSE", "PREMIUM_TIEBREAK_ANY", "REFUSE_TIEBREAK_ANY",
         "ODDS_LE_1_90", "ODDS_GT_1_90", "PREMIUM_ODDS_LE_1_90", "PREMIUM_ODDS_GT_1_90",
+        "PREMIUM_QUALIFICATION_ODDS_LE_1_90", "PREMIUM_MAIN_OR_UNKNOWN_ODDS_LE_1_90",
         "REFUSE_ODDS_LE_1_90", "REFUSE_ODDS_GT_1_90",
+        "REFUSE_QUALIFICATION_ODDS_LE_1_90", "REFUSE_MAIN_OR_UNKNOWN_ODDS_LE_1_90",
     }
     by_name = {s["segment"]: s for s in segments}
     out: List[Dict[str, Any]] = []
@@ -1227,16 +1237,146 @@ def split_shadow_rules(rules: Sequence[Dict[str, Any]]) -> Tuple[List[Dict[str, 
     )
 
 
+
+
+def rule_segment(rule: Dict[str, Any]) -> str:
+    return _s(rule.get("sourceSegment") or (rule.get("includeSegments") or [""])[0]).upper()
+
+
+def _rule_roi(rule: Dict[str, Any]) -> float:
+    return _f(rule.get("trainRoiPct"), 0.0)
+
+
+def _rule_profit(rule: Dict[str, Any]) -> float:
+    return _f(rule.get("trainProfitEur"), 0.0)
+
+
+def _rule_settled(rule: Dict[str, Any]) -> int:
+    return int(rule.get("trainSettled", 0) or 0)
+
+
+def _is_broad_positive(rule: Dict[str, Any]) -> bool:
+    seg = rule_segment(rule)
+    return seg.startswith("CATEGORY_") or seg in {"DRAW_QUALIFICATION", "SURFACE_GRASS", "SURFACE_HARD", "SURFACE_CLAY"}
+
+
+def _is_generic_odds_negative(rule: Dict[str, Any]) -> bool:
+    seg = rule_segment(rule)
+    return seg.endswith("ODDS_LE_1_90") and "QUALIFICATION_ODDS_LE_1_90" not in seg and "MAIN_OR_UNKNOWN_ODDS_LE_1_90" not in seg
+
+
+def _is_qualification_positive(rule: Dict[str, Any]) -> bool:
+    seg = rule_segment(rule)
+    return "QUALIFICATION" in seg and _rule_roi(rule) > 0 and _rule_profit(rule) > 0
+
+
+def rule_evidence_score(rule: Dict[str, Any]) -> float:
+    """Signed evidence strength used only for conflict arbitration.
+
+    It deliberately combines ROI, net profit, sample size and specificity.  A
+    narrow qualification rule with +100% ROI must be allowed to beat a weak
+    generic odds rule at -3%, while a precise main-draw negative rule must still
+    protect against broad category positives.
+    """
+    roi = abs(_rule_roi(rule))
+    profit = abs(_rule_profit(rule))
+    settled = max(1, _rule_settled(rule))
+    return (
+        roi * 2.0
+        + min(profit / 100.0, 40.0)
+        + math.log1p(settled) * 4.0
+        + rule_specificity(rule) * 0.7
+        + _confidence_weight(rule) * 5.0
+    )
+
+
+def resolve_shadow_conflict(top_pos: Dict[str, Any], top_neg: Dict[str, Any]) -> Tuple[str, Dict[str, Any], str]:
+    """Return (decision, primary_rule, resolver_note) for one positive/negative clash."""
+    pos_seg = rule_segment(top_pos)
+    neg_seg = rule_segment(top_neg)
+    pos_roi = _rule_roi(top_pos)
+    neg_roi = _rule_roi(top_neg)
+    pos_score = rule_evidence_score(top_pos)
+    neg_score = rule_evidence_score(top_neg)
+
+    # Key correction for the user's audit: Premium qualification was strongly
+    # profitable, but it was being downgraded by the broad PREMIUM_ODDS_LE_1_90
+    # rule.  Let a strong qualification rule override a generic odds downgrade.
+    if _is_qualification_positive(top_pos) and _is_generic_odds_negative(top_neg):
+        if pos_roi >= max(10.0, abs(neg_roi) + 8.0) and _rule_settled(top_pos) >= 10:
+            return (
+                "V3_SHADOW_PROMOTE",
+                top_pos,
+                f"qualification positive prioritaire {pos_seg} > négatif générique {neg_seg}",
+            )
+
+    # If the positive rule is a precise composite that includes the same risk
+    # family as the negative rule, let the better evidence win.
+    if "ODDS_LE_1_90" in pos_seg and "ODDS_LE_1_90" in neg_seg and pos_roi > 0:
+        if pos_score >= neg_score * 0.85:
+            return ("V3_SHADOW_PROMOTE", top_pos, f"composite positif prioritaire {pos_seg}")
+
+    # Broad positive rules must not cancel precise negative rules.
+    if _is_broad_positive(top_pos) and rule_specificity(top_neg) >= rule_specificity(top_pos) + 8:
+        return ("V3_SHADOW_DOWNGRADE", top_neg, f"négatif spécifique prioritaire {neg_seg}")
+
+    # Main draw/unknown negative rules are protective: they represent the exact
+    # problem found in the PDFs once qualifications were removed. Do not let a
+    # generic positive bucket like PREMIUM_PCT_80_85 cancel them.
+    if "MAIN_OR_UNKNOWN" in neg_seg and not _is_qualification_positive(top_pos):
+        return ("V3_SHADOW_DOWNGRADE", top_neg, f"main draw négatif prioritaire {neg_seg}")
+
+    # Strong negative protection remains active for odds segments when the
+    # positive rule is weaker or only broad.
+    if "ODDS_LE_1_90" in neg_seg:
+        if neg_score >= pos_score * 0.70:
+            return ("V3_SHADOW_DOWNGRADE", top_neg, f"négatif protecteur prioritaire {neg_seg}")
+
+    # Clear evidence gap.
+    if pos_score >= neg_score * 1.35:
+        return ("V3_SHADOW_PROMOTE", top_pos, f"positif plus fort {pos_seg}")
+    if neg_score >= pos_score * 1.15:
+        return ("V3_SHADOW_DOWNGRADE", top_neg, f"négatif plus fort {neg_seg}")
+
+    return ("V3_SHADOW_WATCH_CONFLICT", top_neg, f"conflit non tranché {neg_seg} vs {pos_seg}")
+
+
+def select_primary_positive(positives: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
+    positives = list(positives or [])
+    if not positives:
+        return {}
+    qualification = [r for r in positives if _is_qualification_positive(r)]
+    if qualification:
+        return sorted(qualification, key=lambda r: (rule_evidence_score(r), _rule_roi(r), _rule_profit(r)), reverse=True)[0]
+    composite_odds = [r for r in positives if "ODDS_LE_1_90" in rule_segment(r) or "ODDS_GT_1_90" in rule_segment(r)]
+    if composite_odds:
+        return sorted(composite_odds, key=lambda r: (rule_evidence_score(r), _rule_roi(r), _rule_profit(r)), reverse=True)[0]
+    return positives[0]
+
+
+def select_primary_negative(negatives: Sequence[Dict[str, Any]], positives: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
+    negatives = list(negatives or [])
+    if not negatives:
+        return {}
+    has_strong_qualification_positive = any(
+        _is_qualification_positive(r) and _rule_roi(r) >= 10.0 and _rule_settled(r) >= 10
+        for r in positives or []
+    )
+    if not has_strong_qualification_positive:
+        main_negatives = [r for r in negatives if "MAIN_OR_UNKNOWN" in rule_segment(r)]
+        if main_negatives:
+            return sorted(main_negatives, key=lambda r: (rule_evidence_score(r), abs(_rule_roi(r)), _rule_settled(r)), reverse=True)[0]
+    return negatives[0]
+
 def decide_shadow_from_rules(matched: Sequence[Dict[str, Any]]) -> Tuple[str, str, Dict[str, Any]]:
     positives, negatives, neutral = split_shadow_rules(matched)
+    if positives and negatives:
+        top_pos = select_primary_positive(positives)
+        top_neg = select_primary_negative(negatives, positives)
+        decision, primary, note = resolve_shadow_conflict(top_pos, top_neg)
+        return decision, shadow_reason(decision, [primary, top_pos if primary is top_neg else top_neg], resolver_note=note), primary
     if negatives:
         top_neg = negatives[0]
-        top_pos = positives[0] if positives else None
-        # Negative rules are protective.  If a specific negative segment exists,
-        # it wins over broad positive segments.  This fixes the V3.1 problem where
-        # the decision was DOWNGRADE but the reason displayed DRAW_MAIN_OR_UNKNOWN.
-        if top_pos and rule_specificity(top_pos) > rule_specificity(top_neg) + 20:
-            return "V3_SHADOW_WATCH_CONFLICT", shadow_reason("V3_SHADOW_WATCH_CONFLICT", [top_neg, top_pos]), top_neg
         return "V3_SHADOW_DOWNGRADE", shadow_reason("V3_SHADOW_DOWNGRADE", [top_neg]), top_neg
     if positives:
         top_pos = positives[0]
@@ -1290,18 +1430,19 @@ def evaluate_shadow_matches(
     return {"status": "ok", "version": V3_VERSION, "day": day, "counts": counts, "decisions": decisions}
 
 
-def shadow_reason(decision: str, rules: Sequence[Dict[str, Any]]) -> str:
+def shadow_reason(decision: str, rules: Sequence[Dict[str, Any]], resolver_note: str = "") -> str:
     if not rules:
         return "Aucune règle V3 shadow ne correspond à ce match."
     top = rules[0]
     segment = _s(top.get("sourceSegment"))
     roi = _f(top.get("trainRoiPct"), 0.0)
     settled = int(top.get("trainSettled", 0) or 0)
+    note = (" | Resolver : " + resolver_note) if resolver_note else ""
     if decision == "V3_SHADOW_DOWNGRADE":
-        return f"Downgrade V3 : segment négatif prioritaire {segment} | ROI entraînement {roi:.2f}% sur {settled} matchs réglés."
+        return f"Downgrade V3 : segment négatif prioritaire {segment} | ROI entraînement {roi:.2f}% sur {settled} matchs réglés." + note
     if decision == "V3_SHADOW_PROMOTE":
-        return f"Promote V3 : segment positif prioritaire {segment} | ROI entraînement {roi:.2f}% sur {settled} matchs réglés."
+        return f"Promote V3 : segment positif prioritaire {segment} | ROI entraînement {roi:.2f}% sur {settled} matchs réglés." + note
     if decision == "V3_SHADOW_WATCH_CONFLICT":
         second = rules[1] if len(rules) > 1 else {}
-        return "Conflit V3 : négatif " + segment + " contre positif " + _s(second.get("sourceSegment")) + ". À surveiller, pas de validation automatique."
-    return "Règle V3 en observation : " + segment
+        return "Conflit V3 : négatif " + segment + " contre positif " + _s(second.get("sourceSegment")) + ". À surveiller, pas de validation automatique." + note
+    return "Règle V3 en observation : " + segment + note
