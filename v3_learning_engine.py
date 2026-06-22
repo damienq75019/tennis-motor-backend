@@ -1,23 +1,25 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Tennis Motor — V3.2 Shadow Result Tracker
+Tennis Motor — V3.2.1 Rule Validator / Quarantine
 
 Non-destructive intelligent layer above STEP56/STEP62.
 
-V3.2 adds the Shadow Result Tracker after the V3.1.2 Conflict Resolver:
+V3.2.1 adds Rule Validator / Quarantine after the V3.2 Shadow Result Tracker:
 - persistent learning memory table from PostgreSQL history;
 - automatic shadow-rule generation from historical segments;
 - shadow evaluation for daily/live candidates;
 - conflict resolution between positive and negative shadow rules;
 - tracking of shadow decisions against settled results;
 - V2 vs V3 shadow performance comparison;
+- automatic validation of shadow rules;
+- automatic quarantine/warning for rules that fail in real shadow results;
 - zero replacement of the official motor until out-of-sample validation.
 
 Policy:
 - V2/STEP56 remains the official prediction engine.
-- V3.2 learns, writes memory, creates shadow rules, resolves conflicts, tests them, and tracks settled shadow results.
-- V3.1.2 does not change a bet decision automatically.
+- V3.2.1 learns, writes memory, creates shadow rules, resolves conflicts, tracks settled shadow results, then validates or quarantines rules.
+- V3.2.1 does not change a bet decision automatically.
 """
 from __future__ import annotations
 
@@ -37,7 +39,7 @@ FINAL_WIN = "win"
 FINAL_LOSS = "loss"
 FINAL_VOID = "void"
 FINAL_PENDING = "pending"
-V3_VERSION = "v3.2-shadow-result-tracker"
+V3_VERSION = "v3.2.1-rule-validator-quarantine"
 
 
 def _s(value: Any) -> str:
@@ -809,6 +811,19 @@ class V3LearningMemoryStore:
                 )
                 cur.execute(f"CREATE INDEX IF NOT EXISTS idx_{self.RULES_TABLE}_status ON {self.RULES_TABLE}(status)")
                 cur.execute(f"CREATE INDEX IF NOT EXISTS idx_{self.RULES_TABLE}_source_segment ON {self.RULES_TABLE}(source_segment)")
+
+                # STEP V3.2.1: validation/quarantine columns on rules.
+                # Existing deployments from V3.1/V3.2 are upgraded in place.
+                cur.execute(f"ALTER TABLE {self.RULES_TABLE} ADD COLUMN IF NOT EXISTS shadow_settled INTEGER NOT NULL DEFAULT 0")
+                cur.execute(f"ALTER TABLE {self.RULES_TABLE} ADD COLUMN IF NOT EXISTS shadow_wins INTEGER NOT NULL DEFAULT 0")
+                cur.execute(f"ALTER TABLE {self.RULES_TABLE} ADD COLUMN IF NOT EXISTS shadow_losses INTEGER NOT NULL DEFAULT 0")
+                cur.execute(f"ALTER TABLE {self.RULES_TABLE} ADD COLUMN IF NOT EXISTS shadow_profit_eur DOUBLE PRECISION NOT NULL DEFAULT 0")
+                cur.execute(f"ALTER TABLE {self.RULES_TABLE} ADD COLUMN IF NOT EXISTS shadow_roi_pct DOUBLE PRECISION NOT NULL DEFAULT 0")
+                cur.execute(f"ALTER TABLE {self.RULES_TABLE} ADD COLUMN IF NOT EXISTS shadow_delta_vs_v2_eur DOUBLE PRECISION NOT NULL DEFAULT 0")
+                cur.execute(f"ALTER TABLE {self.RULES_TABLE} ADD COLUMN IF NOT EXISTS shadow_validation_status TEXT NOT NULL DEFAULT 'untested'")
+                cur.execute(f"ALTER TABLE {self.RULES_TABLE} ADD COLUMN IF NOT EXISTS shadow_validation_payload_json TEXT NOT NULL DEFAULT '{{}}'")
+                cur.execute(f"ALTER TABLE {self.RULES_TABLE} ADD COLUMN IF NOT EXISTS last_validated_at TIMESTAMPTZ")
+                cur.execute(f"CREATE INDEX IF NOT EXISTS idx_{self.RULES_TABLE}_validation ON {self.RULES_TABLE}(shadow_validation_status)")
                 cur.execute(
                     f"""
                     CREATE TABLE IF NOT EXISTS {self.DECISIONS_TABLE} (
@@ -1026,7 +1041,6 @@ class V3LearningMemoryStore:
                         ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,NOW())
                         ON CONFLICT (rule_id) DO UPDATE SET
                             name = EXCLUDED.name,
-                            status = EXCLUDED.status,
                             action = EXCLUDED.action,
                             category = EXCLUDED.category,
                             include_segments_json = EXCLUDED.include_segments_json,
@@ -1044,7 +1058,14 @@ class V3LearningMemoryStore:
                             train_roi_pct = EXCLUDED.train_roi_pct,
                             train_profit_eur = EXCLUDED.train_profit_eur,
                             confidence = EXCLUDED.confidence,
-                            reason = EXCLUDED.reason,
+                            status = CASE
+                                WHEN {self.RULES_TABLE}.status IN ('quarantine', 'warning') THEN {self.RULES_TABLE}.status
+                                ELSE EXCLUDED.status
+                            END,
+                            reason = CASE
+                                WHEN {self.RULES_TABLE}.status IN ('quarantine', 'warning') THEN {self.RULES_TABLE}.reason
+                                ELSE EXCLUDED.reason
+                            END,
                             updated_at = NOW()
                         """,
                         (
@@ -1072,7 +1093,10 @@ class V3LearningMemoryStore:
             SELECT rule_id, name, status, action, category, include_segments_json, exclude_segments_json,
                    min_premium_pct, max_premium_pct, min_odd, max_odd, min_settled, source_segment,
                    train_settled, train_wins, train_losses, train_win_rate_pct, train_roi_pct,
-                   train_profit_eur, confidence, reason, created_at, updated_at
+                   train_profit_eur, confidence, reason,
+                   shadow_settled, shadow_wins, shadow_losses, shadow_profit_eur, shadow_roi_pct,
+                   shadow_delta_vs_v2_eur, shadow_validation_status, shadow_validation_payload_json,
+                   last_validated_at, created_at, updated_at
             FROM {self.RULES_TABLE}{where}
             ORDER BY train_profit_eur DESC, train_roi_pct DESC, train_settled DESC
             LIMIT %s
@@ -1107,6 +1131,14 @@ class V3LearningMemoryStore:
                         "trainProfitEur": r["train_profit_eur"],
                         "confidence": r["confidence"],
                         "reason": r["reason"],
+                        "shadowSettled": r.get("shadow_settled", 0),
+                        "shadowWins": r.get("shadow_wins", 0),
+                        "shadowLosses": r.get("shadow_losses", 0),
+                        "shadowProfitEur": r.get("shadow_profit_eur", 0.0),
+                        "shadowRoiPct": r.get("shadow_roi_pct", 0.0),
+                        "shadowDeltaVsV2Eur": r.get("shadow_delta_vs_v2_eur", 0.0),
+                        "shadowValidationStatus": r.get("shadow_validation_status", "untested"),
+                        "shadowValidationPayload": _json_loads(r.get("shadow_validation_payload_json"), {}),
                     })
         return out
 
@@ -1463,6 +1495,242 @@ class V3LearningMemoryStore:
             "byPrimaryRule": rules_out[:50],
             "byPrimarySegment": segs_out[:50],
             "examples": examples,
+        }
+
+    def validate_shadow_rules(
+        self,
+        *,
+        day: str = "",
+        limit: int = 50000,
+        odds_cutoff: float = DEFAULT_ODDS_CUTOFF,
+        min_shadow_settled: int = 10,
+        promote_quarantine_roi_below: float = 0.0,
+        promote_quarantine_profit_below: float = 0.0,
+        downgrade_warning_delta_below: float = 0.0,
+        strengthen_roi_above: float = 5.0,
+        strengthen_delta_above: float = 100.0,
+        dry_run: bool = False,
+    ) -> Dict[str, Any]:
+        """STEP V3.2.1 — validate shadow rules against real tracked results.
+
+        The validator is deliberately conservative:
+        - PROMOTE rules with enough real shadow samples and negative ROI/profit are quarantined.
+        - DOWNGRADE rules with enough real shadow samples and positive avoided-loss delta are reinforced.
+        - DOWNGRADE rules with enough real shadow samples and negative delta are moved to warning.
+        - Rules without enough settled shadow samples remain in observation.
+
+        Quarantine/warning rules are not returned by list_shadow_rules(status="shadow"), so they stop
+        influencing future /v3/shadow/daily calls unless explicitly re-enabled.
+        """
+        self.ensure_schema()
+        performance = self.build_shadow_performance_report(day=day, limit=limit, odds_cutoff=odds_cutoff)
+        rules_perf = performance.get("byPrimaryRule", []) or []
+        current_rules = {r.get("ruleId"): r for r in self.list_shadow_rules(status="all", limit=2000)}
+
+        actions: List[Dict[str, Any]] = []
+        updates: List[Tuple[str, str, str, int, int, int, float, float, float, str, str]] = []
+        counts = {
+            "keptShadow": 0,
+            "quarantined": 0,
+            "warning": 0,
+            "reinforced": 0,
+            "observed": 0,
+            "missingRule": 0,
+        }
+
+        for perf in rules_perf:
+            rule_id = _s(perf.get("ruleId"))
+            if not rule_id or rule_id == "NO_RULE":
+                continue
+            rule = current_rules.get(rule_id)
+            if not rule:
+                counts["missingRule"] += 1
+                continue
+
+            settled = int(perf.get("settled", 0) or 0)
+            wins = int(perf.get("wins", 0) or 0)
+            losses = int(perf.get("losses", 0) or 0)
+            profit = _f(perf.get("profitIfPlayedEur"), 0.0)
+            roi = _f(perf.get("roiIfPlayedPct"), 0.0)
+            delta = _f(perf.get("deltaVsV2IfAppliedEur"), 0.0)
+            action = _s(rule.get("action")).upper()
+            old_status = _s(rule.get("status") or "shadow").lower()
+            verdict = "OBSERVE_NOT_ENOUGH_SETTLED"
+            new_status = old_status
+            validation_status = "observe"
+            message = f"Observation V3 : {settled} match(s) réglé(s), seuil {min_shadow_settled}."
+
+            if settled >= int(min_shadow_settled):
+                if action == "PROMOTE_SHADOW":
+                    if roi < promote_quarantine_roi_below and profit < promote_quarantine_profit_below:
+                        new_status = "quarantine"
+                        validation_status = "quarantined"
+                        verdict = "QUARANTINE_PROMOTE_NEGATIVE_REAL_SHADOW"
+                        message = (
+                            f"Quarantaine V3 : règle PROMOTE négative en shadow réel "
+                            f"({settled} réglés, ROI {roi:.2f}%, profit {profit:.2f}€)."
+                        )
+                        counts["quarantined"] += 1
+                    elif roi >= strengthen_roi_above and profit > 0:
+                        new_status = "shadow"
+                        validation_status = "reinforced"
+                        verdict = "REINFORCE_PROMOTE_POSITIVE_REAL_SHADOW"
+                        message = (
+                            f"Renforcement V3 : règle PROMOTE positive en shadow réel "
+                            f"({settled} réglés, ROI {roi:.2f}%, profit {profit:.2f}€)."
+                        )
+                        counts["reinforced"] += 1
+                    else:
+                        new_status = "shadow"
+                        validation_status = "kept_shadow"
+                        verdict = "KEEP_PROMOTE_NEUTRAL"
+                        message = (
+                            f"Maintien shadow : règle PROMOTE neutre/non décisive "
+                            f"({settled} réglés, ROI {roi:.2f}%, profit {profit:.2f}€)."
+                        )
+                        counts["keptShadow"] += 1
+                elif action == "DOWNGRADE_SHADOW":
+                    if delta > strengthen_delta_above:
+                        new_status = "shadow"
+                        validation_status = "reinforced"
+                        verdict = "REINFORCE_DOWNGRADE_AVOIDED_LOSSES"
+                        message = (
+                            f"Renforcement V3 : règle DOWNGRADE utile, pertes évitées "
+                            f"delta +{delta:.2f}€ sur {settled} réglés."
+                        )
+                        counts["reinforced"] += 1
+                    elif delta < downgrade_warning_delta_below:
+                        new_status = "warning"
+                        validation_status = "warning"
+                        verdict = "WARNING_DOWNGRADE_SKIPPED_PROFIT"
+                        message = (
+                            f"Warning V3 : règle DOWNGRADE a évité des gains au lieu de pertes "
+                            f"delta {delta:.2f}€ sur {settled} réglés."
+                        )
+                        counts["warning"] += 1
+                    else:
+                        new_status = "shadow"
+                        validation_status = "kept_shadow"
+                        verdict = "KEEP_DOWNGRADE_NEUTRAL"
+                        message = (
+                            f"Maintien shadow : règle DOWNGRADE neutre/non décisive "
+                            f"delta {delta:.2f}€ sur {settled} réglés."
+                        )
+                        counts["keptShadow"] += 1
+                else:
+                    new_status = "shadow"
+                    validation_status = "observe"
+                    verdict = "OBSERVE_UNKNOWN_ACTION"
+                    counts["observed"] += 1
+            else:
+                counts["observed"] += 1
+
+            payload = {
+                "version": V3_VERSION,
+                "day": day or "all",
+                "validatedAt": datetime.utcnow().isoformat() + "Z",
+                "verdict": verdict,
+                "oldStatus": old_status,
+                "newStatus": new_status,
+                "action": action,
+                "minShadowSettled": int(min_shadow_settled),
+                "settled": settled,
+                "wins": wins,
+                "losses": losses,
+                "profitIfPlayedEur": round(profit, 2),
+                "roiIfPlayedPct": round(roi, 2),
+                "deltaVsV2IfAppliedEur": round(delta, 2),
+                "message": message,
+            }
+            actions.append({
+                "ruleId": rule_id,
+                "ruleName": rule.get("name") or perf.get("ruleName") or rule_id,
+                "action": action,
+                "oldStatus": old_status,
+                "newStatus": new_status,
+                "validationStatus": validation_status,
+                "verdict": verdict,
+                "message": message,
+                "settled": settled,
+                "wins": wins,
+                "losses": losses,
+                "profitIfPlayedEur": round(profit, 2),
+                "roiIfPlayedPct": round(roi, 2),
+                "deltaVsV2IfAppliedEur": round(delta, 2),
+            })
+            updates.append((
+                new_status,
+                validation_status,
+                message,
+                settled,
+                wins,
+                losses,
+                profit,
+                roi,
+                delta,
+                _json_dumps(payload),
+                rule_id,
+            ))
+
+        written = 0
+        if updates and not dry_run:
+            with self._connect() as conn:
+                with conn.cursor() as cur:
+                    for values in updates:
+                        cur.execute(
+                            f"""
+                            UPDATE {self.RULES_TABLE}
+                            SET status = %s,
+                                shadow_validation_status = %s,
+                                reason = %s,
+                                shadow_settled = %s,
+                                shadow_wins = %s,
+                                shadow_losses = %s,
+                                shadow_profit_eur = %s,
+                                shadow_roi_pct = %s,
+                                shadow_delta_vs_v2_eur = %s,
+                                shadow_validation_payload_json = %s,
+                                last_validated_at = NOW(),
+                                updated_at = NOW()
+                            WHERE rule_id = %s
+                            """,
+                            values,
+                        )
+                        written += int(cur.rowcount or 0)
+                conn.commit()
+
+        actions.sort(key=lambda x: (
+            0 if x.get("validationStatus") == "quarantined" else
+            1 if x.get("validationStatus") == "warning" else
+            2 if x.get("validationStatus") == "reinforced" else 3,
+            -abs(_f(x.get("deltaVsV2IfAppliedEur"), 0.0)),
+            -abs(_f(x.get("profitIfPlayedEur"), 0.0)),
+        ))
+
+        return {
+            "status": "ok",
+            "version": V3_VERSION,
+            "day": day or "all",
+            "dryRun": bool(dry_run),
+            "policy": "Rule Validator : quarantaine pour PROMOTE négatif, warning pour DOWNGRADE qui évite des gains, renforcement pour règles utiles. Aucune règle ne devient officielle automatiquement.",
+            "thresholds": {
+                "minShadowSettled": int(min_shadow_settled),
+                "promoteQuarantineRoiBelow": promote_quarantine_roi_below,
+                "promoteQuarantineProfitBelow": promote_quarantine_profit_below,
+                "downgradeWarningDeltaBelow": downgrade_warning_delta_below,
+                "strengthenRoiAbove": strengthen_roi_above,
+                "strengthenDeltaAbove": strengthen_delta_above,
+            },
+            "counts": counts,
+            "rulesEvaluated": len(actions),
+            "rulesUpdated": written,
+            "actions": actions,
+            "performanceSummary": {
+                "scope": performance.get("scope", {}),
+                "v2BaselineSameScope": performance.get("v2BaselineSameScope", {}),
+                "v3ShadowConservative": performance.get("v3ShadowConservative", {}),
+                "byDecision": performance.get("byDecision", {}),
+            },
         }
 
 

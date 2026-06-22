@@ -2450,7 +2450,7 @@ def v3_status() -> Dict[str, Any]:
     return {
         "status": "ok",
         "version": V3_VERSION,
-        "mode": "learning_memory_priority_shadow_rules_plus_result_tracker",
+        "mode": "learning_memory_priority_shadow_rules_result_tracker_validator",
         "databaseConfigured": history_store.enabled,
         "historyTable": history_store.TABLE,
         "v3": v3_status_payload,
@@ -2464,8 +2464,9 @@ def v3_status() -> Dict[str, Any]:
             "/v3/shadow/daily?day=today&persist=false",
             "/v3/shadow/track?day=today&sync_memory=true",
             "/v3/shadow/performance?day=today",
+            "/v3/rules/validate?day=today&sync_results=true&dry_run=false",
         ],
-        "policy": "V3 apprend, corrige la qualification, priorise les règles shadow, les teste et suit leurs résultats réglés. Elle ne remplace jamais STEP56/STEP62 sans validation hors échantillon.",
+        "policy": "V3 apprend, corrige la qualification, priorise les règles shadow, suit leurs résultats, puis met en quarantaine les règles shadow qui échouent. Elle ne remplace jamais STEP56/STEP62 sans validation hors échantillon.",
     }
 
 
@@ -2747,6 +2748,63 @@ def v3_shadow_performance(
         report = v3_store.build_shadow_performance_report(day=resolved_day, limit=limit, odds_cutoff=odds_cutoff)
         report["endpoint"] = "/v3/shadow/performance"
         return report
+    except Exception as exc:
+        return {"status": "error", "version": V3_VERSION, "error": f"{type(exc).__name__}: {exc}"}
+
+
+@app.get("/v3/rules/validate")
+def v3_rules_validate(
+    day: str = Query("today", description="today, yesterday, tomorrow, YYYY-MM-DD ou all"),
+    category: str = Query("all"),
+    limit: int = Query(50000, ge=1, le=100000),
+    odds_cutoff: float = Query(1.90, ge=1.01, le=100.0),
+    min_shadow_settled: int = Query(10, ge=1, le=1000),
+    sync_memory: bool = Query(True),
+    sync_results: bool = Query(True),
+    dry_run: bool = Query(False),
+) -> Dict[str, Any]:
+    """STEP V3.2.1 — validate shadow rules and quarantine bad ones.
+
+    Workflow:
+    - optionally sync V3 memory from history;
+    - optionally track settled shadow results;
+    - validate each primary shadow rule;
+    - quarantine negative PROMOTE rules and warn bad DOWNGRADE rules.
+
+    Quarantined/warning rules are no longer loaded by /v3/shadow/daily?status=shadow.
+    """
+    v3_store = V3LearningMemoryStore()
+    try:
+        raw_day = (day or "today").strip().lower()
+        resolved_day = "" if raw_day in {"all", "*", "tout"} else normalize_day(day)
+        memory_sync = None
+        tracking_report = None
+        if sync_memory:
+            memory_sync = v3_memory_sync(category=category, limit=limit, odds_cutoff=odds_cutoff)
+        if sync_results:
+            tracking_report = v3_store.track_shadow_results(day=resolved_day, limit=limit, odds_cutoff=odds_cutoff)
+        validation = v3_store.validate_shadow_rules(
+            day=resolved_day,
+            limit=limit,
+            odds_cutoff=odds_cutoff,
+            min_shadow_settled=min_shadow_settled,
+            dry_run=dry_run,
+        )
+        return {
+            "status": "ok" if validation.get("status") == "ok" else "partial",
+            "version": V3_VERSION,
+            "day": resolved_day or "all",
+            "memorySync": memory_sync,
+            "tracking": {
+                "status": tracking_report.get("status") if isinstance(tracking_report, dict) else None,
+                "scope": tracking_report.get("scope") if isinstance(tracking_report, dict) else None,
+                "v2BaselineSameScope": tracking_report.get("v2BaselineSameScope") if isinstance(tracking_report, dict) else None,
+                "v3ShadowConservative": tracking_report.get("v3ShadowConservative") if isinstance(tracking_report, dict) else None,
+            } if tracking_report is not None else None,
+            "validation": validation,
+            "endpoint": "/v3/rules/validate",
+            "policy": "Quarantaine/warning shadow seulement : aucune règle ne devient officielle automatiquement.",
+        }
     except Exception as exc:
         return {"status": "error", "version": V3_VERSION, "error": f"{type(exc).__name__}: {exc}"}
 
