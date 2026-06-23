@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Tennis Motor — V3.3.1 Daily Runner
+Tennis Motor — V3.3.2 Unity V3 Promotes Page
 
 Non-destructive intelligent layer above STEP56/STEP62.
 
@@ -49,7 +49,7 @@ FINAL_LOSS = "loss"
 FINAL_VOID = "void"
 FINAL_PENDING = "pending"
 FINAL_ODDS_INVALID = "odds_invalid"
-V3_VERSION = "v3.3.1-daily-runner"
+V3_VERSION = "v3.3.2-unity-promotes-page"
 
 
 def _s(value: Any) -> str:
@@ -350,11 +350,28 @@ def compact_shadow_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
         "match": {
             "playerA": match.get("playerA") or match.get("sourcePlayerA") or match.get("predictedWinner"),
             "playerB": match.get("playerB") or match.get("sourcePlayerB") or match.get("opponent"),
+            "sourcePlayerA": match.get("sourcePlayerA") or match.get("playerA"),
+            "sourcePlayerB": match.get("sourcePlayerB") or match.get("playerB"),
+            "sourceOriginalPair": match.get("sourceOriginalPair"),
             "surface": match.get("surface"),
             "tournament": match.get("tournament") or match.get("seasonName"),
+            "seasonName": match.get("seasonName"),
             "round": match.get("round"),
+            "startTime": match.get("startTime") or match.get("start_time"),
+            "status": match.get("status"),
+            "matchStatus": match.get("matchStatus"),
+            "score": match.get("score"),
             "premiumPct": match.get("premiumPct"),
+            "premium": match.get("premium"),
             "odd": row_odd(match),
+            "oddA": match.get("oddA"),
+            "oddB": match.get("oddB"),
+            "playerAOdd": match.get("playerAOdd"),
+            "playerBOdd": match.get("playerBOdd"),
+            "coteA": match.get("coteA"),
+            "coteB": match.get("coteB"),
+            "oddsSource": match.get("oddsSource"),
+            "oddsStatus": match.get("oddsStatus"),
             "category": row_category(match),
             "drawType": draw_type(match),
         },

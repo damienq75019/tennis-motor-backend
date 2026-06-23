@@ -24,6 +24,7 @@ from v3_learning_engine import (
     build_v3_learning_report,
     build_v3_rules_from_history,
     evaluate_shadow_matches,
+    row_odd,
 )
 
 
@@ -2669,6 +2670,187 @@ def v3_learn_run(
         "rules": rules,
         "policy": "Les règles générées sont en shadow mode. Elles apprennent et testent; elles ne changent pas encore les décisions officielles.",
     }
+
+
+def _v3_item_time_label(start_time: Any) -> str:
+    text = str(start_time or "").strip()
+    if not text:
+        return ""
+    # API-Tennis returns strings such as 2026-06-23T13:30:00.
+    try:
+        clean = text.replace("Z", "+00:00")
+        dt = datetime.fromisoformat(clean)
+        return dt.strftime("%H:%M")
+    except Exception:
+        m = re.search(r"T(\d{2}:\d{2})", text)
+        if m:
+            return m.group(1)
+        m = re.search(r"\b(\d{1,2}:\d{2})\b", text)
+        return m.group(1) if m else text
+
+
+def _v3_float(value: Any, default: float = 0.0) -> float:
+    try:
+        if value is None:
+            return default
+        if isinstance(value, (int, float)):
+            return float(value)
+        text = str(value).replace(",", ".").strip()
+        return float(text) if text else default
+    except Exception:
+        return default
+
+
+def _v3_primary_from_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
+    primary = payload.get("primaryRule") if isinstance(payload, dict) else None
+    return primary if isinstance(primary, dict) else {}
+
+
+def _v3_match_from_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
+    match = payload.get("match") if isinstance(payload, dict) else None
+    return match if isinstance(match, dict) else {}
+
+
+def _v3_compact_promote_item(decision: Dict[str, Any], index: int, source_mode: str) -> Dict[str, Any]:
+    """Compact JSON made for Unity: one row per V3_SHADOW_PROMOTE, read-only."""
+    payload = decision.get("sourcePayload") if isinstance(decision.get("sourcePayload"), dict) else decision
+    if not isinstance(payload, dict):
+        payload = {}
+    match = _v3_match_from_payload(payload)
+    primary = _v3_primary_from_payload(payload)
+
+    # Persisted rows expose some fields at top-level. Live rows keep everything inside payload.match.
+    player = str(match.get("playerA") or decision.get("playerA") or "").strip()
+    opponent = str(match.get("playerB") or decision.get("playerB") or "").strip()
+    tournament = str(match.get("tournament") or match.get("seasonName") or "").strip()
+    start_time = match.get("startTime") or match.get("start_time") or ""
+    try:
+        odd = float(row_odd(match))
+    except Exception:
+        odd = _v3_float(match.get("odd"), 0.0)
+
+    category = str(payload.get("category") or match.get("category") or decision.get("category") or "").strip().upper()
+    draw = str(payload.get("drawType") or match.get("drawType") or "").strip().upper()
+    rule_name = str(primary.get("name") or decision.get("primaryRuleName") or primary.get("sourceSegment") or "").strip()
+    segment = str(primary.get("sourceSegment") or decision.get("primaryRuleSegment") or "").strip()
+
+    return {
+        "index": index,
+        "matchKey": payload.get("matchKey") or decision.get("matchKey") or "",
+        "day": payload.get("day") or decision.get("day") or "",
+        "shadowDecision": payload.get("shadowDecision") or decision.get("shadowDecision") or "",
+        "player": player,
+        "opponent": opponent,
+        "sourcePlayerA": match.get("sourcePlayerA") or player,
+        "sourcePlayerB": match.get("sourcePlayerB") or opponent,
+        "sourcePair": match.get("sourceOriginalPair") or (f"{player} vs {opponent}" if player or opponent else ""),
+        "tournament": tournament,
+        "round": match.get("round") or "",
+        "startTime": start_time,
+        "time": _v3_item_time_label(start_time),
+        "surface": match.get("surface") or "",
+        "category": category,
+        "drawType": draw,
+        "premiumPct": round(_v3_float(match.get("premiumPct"), 0.0), 2),
+        "odd": round(odd, 3),
+        "oddsStatus": match.get("oddsStatus") or ("valid" if odd > 1.0 else "odds_missing"),
+        "ruleId": primary.get("ruleId") or decision.get("primaryRuleId") or "",
+        "ruleName": rule_name,
+        "sourceSegment": segment,
+        "ruleStatus": primary.get("status") or decision.get("primaryRuleStatus") or "shadow",
+        "action": primary.get("action") or "PROMOTE_SHADOW",
+        "trainSettled": int(_v3_float(primary.get("trainSettled"), 0.0)),
+        "trainRoiPct": round(_v3_float(primary.get("trainRoiPct"), 0.0), 2),
+        "trainProfitEur": round(_v3_float(primary.get("trainProfitEur"), 0.0), 2),
+        "confidence": primary.get("confidence") or "",
+        "reason": payload.get("reason") or decision.get("reason") or "",
+        "status": match.get("status") or match.get("matchStatus") or "",
+        "score": match.get("score") or "",
+        "sourceMode": source_mode,
+    }
+
+
+def _v3_sort_promote_item(item: Dict[str, Any]) -> tuple:
+    return (
+        str(item.get("startTime") or "9999"),
+        str(item.get("tournament") or ""),
+        str(item.get("player") or ""),
+    )
+
+
+@app.get("/v3/promotes")
+def v3_promotes(
+    day: str = Query("today", description="today, tomorrow, yesterday ou YYYY-MM-DD"),
+    source: str = Query("persisted", description="persisted = lecture DB sans recalcul, live = recalcul lecture seule sans écriture"),
+    provider: str = Query("api_tennis"),
+    odds_cutoff: float = Query(1.90, ge=1.01, le=100.0),
+    limit: int = Query(500, ge=1, le=5000),
+) -> Dict[str, Any]:
+    """Read-only Unity endpoint: list only V3_SHADOW_PROMOTE rows for a day.
+
+    - source=persisted reads tennis_v3_shadow_decisions and never recalculates/writes.
+    - source=live recalculates from the daily payload but never persists.
+    This endpoint is made for the Unity page "V3 Validés" so it cannot mix official STEP56 lists with V3 shadow decisions.
+    """
+    target_day = normalize_day(day)
+    source_mode = (source or "persisted").strip().lower()
+    if source_mode not in {"persisted", "db", "daily", "live"}:
+        raise HTTPException(status_code=400, detail="source invalide. Utilise persisted ou live.")
+
+    v3_store = V3LearningMemoryStore()
+    try:
+        if source_mode in {"persisted", "db"}:
+            decisions = v3_store.fetch_shadow_decisions(
+                day=target_day,
+                limit=limit,
+                status="V3_SHADOW_PROMOTE",
+                latest_only=True,
+                active_rules_only=True,
+            )
+            mode = "persisted_read_only"
+            rules_loaded = None
+        else:
+            daily_payload = daily(day=target_day, auto_history=False, provider=provider)
+            matches = daily_payload.get("matches", []) or []
+            rules = v3_store.list_shadow_rules(status="shadow", limit=500)
+            shadow = evaluate_shadow_matches(matches, rules, day=target_day, odds_cutoff=odds_cutoff)
+            decisions = [d for d in (shadow.get("decisions") or []) if d.get("shadowDecision") == "V3_SHADOW_PROMOTE"]
+            mode = "live_read_only_no_persist"
+            rules_loaded = len(rules)
+
+        items = [_v3_compact_promote_item(d, i + 1, mode) for i, d in enumerate(decisions)]
+        items.sort(key=_v3_sort_promote_item)
+        for i, item in enumerate(items, start=1):
+            item["index"] = i
+
+        by_category: Dict[str, int] = {}
+        by_rule: Dict[str, int] = {}
+        for item in items:
+            cat = str(item.get("category") or "UNKNOWN")
+            by_category[cat] = by_category.get(cat, 0) + 1
+            rule = str(item.get("sourceSegment") or item.get("ruleName") or "UNKNOWN")
+            by_rule[rule] = by_rule.get(rule, 0) + 1
+
+        return {
+            "status": "ok",
+            "version": V3_VERSION,
+            "endpoint": "/v3/promotes",
+            "day": target_day,
+            "source": source_mode,
+            "mode": mode,
+            "provider": provider,
+            "rulesLoaded": rules_loaded,
+            "totalPromotes": len(items),
+            "counts": {
+                "promote": len(items),
+                "byCategory": by_category,
+                "byRule": by_rule,
+            },
+            "items": items,
+            "policy": "Lecture seule Unity : affiche uniquement V3_SHADOW_PROMOTE. N'écrit pas en base et ne remplace pas STEP56/STEP62.",
+        }
+    except Exception as exc:
+        return {"status": "error", "version": V3_VERSION, "endpoint": "/v3/promotes", "day": target_day, "error": f"{type(exc).__name__}: {exc}"}
 
 
 @app.get("/v3/shadow/daily")
