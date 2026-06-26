@@ -27,7 +27,8 @@ from v3_learning_engine import (
     row_odd,
 )
 from tennis_motor_audit_v3 import AUDIT_VERSION as STEP63_AUDIT_VERSION, attach_audit_to_payload
-from tennis_motor_v4_lab import V4_VERSION, attach_v4_lab_to_payload, status_payload as v4_status_payload
+from tennis_motor_v4_lab import V4_VERSION as V4_FULL_VERSION, attach_v4_lab_to_payload, status_payload as v4_status_payload
+from tennis_motor_v4_legacy import V4_LEGACY_VERSION, attach_v4_legacy_to_payload, status_payload as v4_legacy_status_payload
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -38,7 +39,7 @@ PAYLOAD_DIR = OUTPUT_DIR / "payloads"
 # Règle utilisateur verrouillée : Jannik Sinner reste exclu de l'analyse.
 EXCLUDED_ANALYSIS_PLAYERS = ["Jannik Sinner"]
 
-app = FastAPI(title="Tennis Motor Backend Clean", version="step65-v4-full-candidate")
+app = FastAPI(title="Tennis Motor Backend Clean", version="step66-dual-v4-lab")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -46,6 +47,33 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+def attach_dual_v4_to_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """STEP66: conserve les deux avis V4 sans muter la v3 officielle.
+
+    - v4Legacy = ancienne V4 STEP64, contrôle value/qualité du pick v3.
+    - v4Lab = nouvelle V4 STEP65 Full Candidate, toutes catégories.
+    """
+    payload = attach_v4_legacy_to_payload(payload)
+    payload = attach_v4_lab_to_payload(payload)
+    if isinstance(payload, dict):
+        payload["v4DualSummary"] = {
+            "version": "STEP66_DUAL_V4_LAB_2026-06-26",
+            "status": "enabled",
+            "officialMutation": False,
+            "legacyV4": payload.get("v4LegacySummary", {}),
+            "fullCandidateV4": payload.get("v4Summary", {}),
+            "policy": "v4Legacy STEP64 et v4Lab STEP65 tournent en parallèle; v3/STEP56 reste seule officielle.",
+        }
+        payload.setdefault("daily", {})
+        payload["daily"]["v4DualLab"] = {
+            "status": "enabled",
+            "legacyVersion": V4_LEGACY_VERSION,
+            "fullCandidateVersion": V4_FULL_VERSION,
+            "officialMutation": False,
+        }
+    return payload
 
 
 def _paris_today() -> date:
@@ -1186,12 +1214,13 @@ def root() -> Dict[str, Any]:
     return {
         "status": "ok",
         "service": "Tennis Motor Backend Clean",
-        "version": "step65-v4-full-candidate",
+        "version": "step66-dual-v4-lab",
         "coreEngineVersion": "step56-global-direct-prediction-official-with-persistent-refuse-value",
         "auditV3Version": STEP63_AUDIT_VERSION,
-        "v4LabVersion": V4_VERSION,
-        "message": "Backend STEP65 : STEP56 officiel + Audit v3 passif + V4 Full Candidate parallèle toutes catégories, veto terre battue en audit only, aucun appel Sportradar.",
-        "endpoints": ["/health", "/calculate", "/predictions", "/state", "/history", "/daily", "/api-tennis/status", "/odds/status", "/sync/results2026/status", "/sync/results2026/run", "/sync/results2026/postgres/status", "/sync/results2026/postgres/export", "/sync/premium/status", "/sync/premium/list", "/sync/premium/reset", "/sync/premium/run", "/sync/premium/settle", "/sync/premium/settle-pending", "/sync/history/form-value", "/sync/history/list", "/sync/history/reset", "/sync/history/repair-dellien-royer", "/sync/history/repair-shelton-merida", "/sync/history/repair-wawrinka-fils-dejong", "/sync/history/repair-van-assche-kypson-gaubas", "/sync/history/settle", "/sync/history/settle-pending", "/sync/daily-maintenance/run", "/sync/refuse-value/history", "/sync/refuse-value/backfill", "/audit/step56/status", "/audit/step56/daily", "/audit/step56/calculate", "/audit/v3/status", "/audit/v3/daily", "/audit/v3/calculate", "/v4/status", "/v4/daily", "/v4/calculate"],
+        "v4LegacyVersion": V4_LEGACY_VERSION,
+        "v4LabVersion": V4_FULL_VERSION,
+        "message": "Backend STEP66 : STEP56 officiel + Audit v3 passif + V4 Legacy STEP64 + V4 Full Candidate STEP65 en parallèle, aucun appel Sportradar.",
+        "endpoints": ["/health", "/calculate", "/predictions", "/state", "/history", "/daily", "/api-tennis/status", "/odds/status", "/sync/results2026/status", "/sync/results2026/run", "/sync/results2026/postgres/status", "/sync/results2026/postgres/export", "/sync/premium/status", "/sync/premium/list", "/sync/premium/reset", "/sync/premium/run", "/sync/premium/settle", "/sync/premium/settle-pending", "/sync/history/form-value", "/sync/history/list", "/sync/history/reset", "/sync/history/repair-dellien-royer", "/sync/history/repair-shelton-merida", "/sync/history/repair-wawrinka-fils-dejong", "/sync/history/repair-van-assche-kypson-gaubas", "/sync/history/settle", "/sync/history/settle-pending", "/sync/daily-maintenance/run", "/sync/refuse-value/history", "/sync/refuse-value/backfill", "/audit/step56/status", "/audit/step56/daily", "/audit/step56/calculate", "/audit/v3/status", "/audit/v3/daily", "/audit/v3/calculate", "/v4/status", "/v4/daily", "/v4/calculate", "/v4-legacy/status", "/v4-legacy/daily", "/v4-legacy/calculate"],
         "excludedAnalysisPlayers": _excluded_analysis_names(),
     }
 
@@ -1202,10 +1231,11 @@ def health() -> Dict[str, Any]:
     return {
         "status": "ok",
         "service": "Tennis Motor Backend Clean",
-        "version": "step65-v4-full-candidate",
+        "version": "step66-dual-v4-lab",
         "coreEngineVersion": "step56-global-direct-prediction-official-with-persistent-refuse-value",
         "auditV3Version": STEP63_AUDIT_VERSION,
-        "v4LabVersion": V4_VERSION,
+        "v4LegacyVersion": V4_LEGACY_VERSION,
+        "v4LabVersion": V4_FULL_VERSION,
         "step56Official": "enabled_official_engine_refuse_value_veto_audit_only",
         "step56AuditEndpoint": "/audit/step56/daily",
         "officialDecisionEngine": "step56-global-direct-prediction",
@@ -1233,8 +1263,12 @@ def health() -> Dict[str, Any]:
         "step63AuditV3": "enabled_passive_no_decision_mutation",
         "step63AuditV3Version": STEP63_AUDIT_VERSION,
         "auditV3Policy": "explains pass/refuse/not_analyzed reasons without changing STEP56 decisions",
+        "v4Legacy": "enabled_step64_legacy_parallel_no_official_mutation",
+        "v4LegacyVersion": V4_LEGACY_VERSION,
+        "v4LegacyPolicy": "ancienne V4 conservée: contrôle value/qualité/calibration du pick v3, surtout utile pour comparer les Premium/proches picks officiels",
         "v4Lab": "enabled_full_candidate_parallel_no_official_mutation",
-        "v4LabVersion": V4_VERSION,
+        "v4LegacyVersion": V4_LEGACY_VERSION,
+        "v4LabVersion": V4_FULL_VERSION,
         "v4Policy": "full candidate all categories: validates/downgrades Premium, upgrades/watches Proche, searches Refuse Value, blocks non-analyzed; does not mutate STEP56/v3",
         "refuseValueEngine": "enabled_for_refuse_only_persistent_history",
         "refuseValueHistory": "postgres_columns_plus_history_endpoint",
@@ -1250,7 +1284,7 @@ async def calculate(request: Request) -> Dict[str, Any]:
     result.setdefault("daily", {})
     result["daily"]["source"] = "manual_payload"
     result = attach_audit_to_payload(result, require_timestamps=False, include_market_check=True)
-    result = attach_v4_lab_to_payload(result)
+    result = attach_dual_v4_to_payload(result)
     result["status"] = result.get("status", "ok")
     return result
 
@@ -1299,7 +1333,7 @@ def daily(day: str = Query("today"), auto_history: bool = Query(True), provider:
             "apiKeyConfigured": provider_key_configured,
         })
         response = attach_audit_to_payload(response, require_timestamps=False, include_market_check=False)
-        response = attach_v4_lab_to_payload(response)
+        response = attach_dual_v4_to_payload(response)
         response["status"] = built.get("status") or "error"
         return response
 
@@ -1365,7 +1399,7 @@ def daily(day: str = Query("today"), auto_history: bool = Query(True), provider:
 
     # STEP65 : V4 Full Candidate passif.
     # La V4 ne remplace pas STEP56 : elle analyse Premium, Proche, Refusé et Non analysé séparément.
-    response = attach_v4_lab_to_payload(response)
+    response = attach_dual_v4_to_payload(response)
 
     # STEP25 : sauvegarde automatique historique moteur catégorisé.
     # Les jours futurs ne sont jamais enregistrés pour éviter de polluer l'historique.
@@ -1434,7 +1468,7 @@ async def audit_v3_calculate(request: Request) -> Dict[str, Any]:
     response["daily"]["source"] = "manual_payload_audit_v3"
     response["daily"]["historyWrite"] = False
     response = attach_audit_to_payload(response, require_timestamps=False, include_market_check=True)
-    response = attach_v4_lab_to_payload(response)
+    response = attach_dual_v4_to_payload(response)
     response["status"] = "ok"
     return response
 
@@ -1450,6 +1484,34 @@ def audit_v3_daily(day: str = Query("today"), provider: str = Query("api_tennis"
     return response
 
 
+
+@app.get("/v4-legacy/status")
+def v4_legacy_status() -> Dict[str, Any]:
+    return v4_legacy_status_payload()
+
+
+@app.post("/v4-legacy/calculate")
+async def v4_legacy_calculate(request: Request) -> Dict[str, Any]:
+    matches = await _read_request_matches(request)
+    response = calculate_from_matches(matches)
+    response.setdefault("daily", {})
+    response["daily"]["source"] = "manual_payload_v4_legacy"
+    response["daily"]["historyWrite"] = False
+    response = attach_audit_to_payload(response, require_timestamps=False, include_market_check=True)
+    response = attach_v4_legacy_to_payload(response)
+    response["status"] = "ok"
+    return response
+
+
+@app.get("/v4-legacy/daily")
+def v4_legacy_daily(day: str = Query("today"), provider: str = Query("api_tennis")) -> Dict[str, Any]:
+    response = daily(day=day, auto_history=False, provider=provider)
+    response.setdefault("daily", {})
+    response["daily"]["v4LegacyEndpoint"] = True
+    response["daily"]["historyWrite"] = False
+    response["status"] = "ok"
+    return response
+
 @app.get("/v4/status")
 def v4_status() -> Dict[str, Any]:
     return v4_status_payload()
@@ -1463,7 +1525,7 @@ async def v4_calculate(request: Request) -> Dict[str, Any]:
     response["daily"]["source"] = "manual_payload_v4_lab"
     response["daily"]["historyWrite"] = False
     response = attach_audit_to_payload(response, require_timestamps=False, include_market_check=True)
-    response = attach_v4_lab_to_payload(response)
+    response = attach_dual_v4_to_payload(response)
     response["status"] = "ok"
     return response
 
@@ -1497,7 +1559,7 @@ async def step56_audit_calculate(request: Request) -> Dict[str, Any]:
     auditor = get_step56_auditor()
     auditor.enrich_response(response)
     response = attach_audit_to_payload(response, require_timestamps=False, include_market_check=True)
-    response = attach_v4_lab_to_payload(response)
+    response = attach_dual_v4_to_payload(response)
     response["status"] = "ok"
     return response
 
@@ -1517,7 +1579,7 @@ def step56_audit_daily(day: str = Query("today"), provider: str = Query("api_ten
     auditor = get_step56_auditor()
     auditor.enrich_response(response)
     response = attach_audit_to_payload(response, require_timestamps=False, include_market_check=True)
-    response = attach_v4_lab_to_payload(response)
+    response = attach_dual_v4_to_payload(response)
     response["status"] = "ok"
     return response
 
