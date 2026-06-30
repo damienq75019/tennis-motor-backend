@@ -29,6 +29,7 @@ from v3_learning_engine import (
 from tennis_motor_audit_v3 import AUDIT_VERSION as STEP63_AUDIT_VERSION, attach_audit_to_payload
 from tennis_motor_v4_lab import V4_VERSION as V4_FULL_VERSION, attach_v4_lab_to_payload, status_payload as v4_status_payload
 from tennis_motor_v4_legacy import V4_LEGACY_VERSION, attach_v4_legacy_to_payload, status_payload as v4_legacy_status_payload
+from tennis_motor_v5_export import router as v5_export_router
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -40,6 +41,8 @@ PAYLOAD_DIR = OUTPUT_DIR / "payloads"
 EXCLUDED_ANALYSIS_PLAYERS = ["Jannik Sinner"]
 
 app = FastAPI(title="Tennis Motor Backend Clean", version="step66-dual-v4-lab")
+app.include_router(v5_export_router)
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
