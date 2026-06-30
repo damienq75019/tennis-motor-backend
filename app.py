@@ -30,6 +30,7 @@ from tennis_motor_audit_v3 import AUDIT_VERSION as STEP63_AUDIT_VERSION, attach_
 from tennis_motor_v4_lab import V4_VERSION as V4_FULL_VERSION, attach_v4_lab_to_payload, status_payload as v4_status_payload
 from tennis_motor_v4_legacy import V4_LEGACY_VERSION, attach_v4_legacy_to_payload, status_payload as v4_legacy_status_payload
 from tennis_motor_v5_export import router as v5_export_router
+from tennis_motor_v5_cote250 import router as v5_cote250_router
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -40,8 +41,9 @@ PAYLOAD_DIR = OUTPUT_DIR / "payloads"
 # Règle utilisateur verrouillée : Jannik Sinner reste exclu de l'analyse.
 EXCLUDED_ANALYSIS_PLAYERS = ["Jannik Sinner"]
 
-app = FastAPI(title="Tennis Motor Backend Clean", version="step66-dual-v4-lab")
+app = FastAPI(title="Tennis Motor Backend Clean", version="step68-v5-cote250-parallel")
 app.include_router(v5_export_router)
+app.include_router(v5_cote250_router)
 
 app.add_middleware(
     CORSMiddleware,
@@ -1217,13 +1219,15 @@ def root() -> Dict[str, Any]:
     return {
         "status": "ok",
         "service": "Tennis Motor Backend Clean",
-        "version": "step66-dual-v4-lab",
+        "version": "step68-v5-cote250-parallel",
+        "v5Cote250": "enabled_parallel_no_official_mutation",
+        "v5Cote250Endpoint": "/v5/daily",
         "coreEngineVersion": "step56-global-direct-prediction-official-with-persistent-refuse-value",
         "auditV3Version": STEP63_AUDIT_VERSION,
         "v4LegacyVersion": V4_LEGACY_VERSION,
         "v4LabVersion": V4_FULL_VERSION,
-        "message": "Backend STEP66 : STEP56 officiel + Audit v3 passif + V4 Legacy STEP64 + V4 Full Candidate STEP65 en parallèle, aucun appel Sportradar.",
-        "endpoints": ["/health", "/calculate", "/predictions", "/state", "/history", "/daily", "/api-tennis/status", "/odds/status", "/sync/results2026/status", "/sync/results2026/run", "/sync/results2026/postgres/status", "/sync/results2026/postgres/export", "/sync/premium/status", "/sync/premium/list", "/sync/premium/reset", "/sync/premium/run", "/sync/premium/settle", "/sync/premium/settle-pending", "/sync/history/form-value", "/sync/history/list", "/sync/history/reset", "/sync/history/repair-dellien-royer", "/sync/history/repair-shelton-merida", "/sync/history/repair-wawrinka-fils-dejong", "/sync/history/repair-van-assche-kypson-gaubas", "/sync/history/settle", "/sync/history/settle-pending", "/sync/daily-maintenance/run", "/sync/refuse-value/history", "/sync/refuse-value/backfill", "/audit/step56/status", "/audit/step56/daily", "/audit/step56/calculate", "/audit/v3/status", "/audit/v3/daily", "/audit/v3/calculate", "/v4/status", "/v4/daily", "/v4/calculate", "/v4-legacy/status", "/v4-legacy/daily", "/v4-legacy/calculate"],
+        "message": "Backend STEP68 : STEP56 officiel + Audit v3 passif + V4 Legacy/Full Candidate en parallèle + V5 cote>2.50 hors Grand Chelem en lecture parallèle, aucun appel Sportradar.",
+        "endpoints": ["/health", "/calculate", "/predictions", "/state", "/history", "/daily", "/api-tennis/status", "/odds/status", "/sync/results2026/status", "/sync/results2026/run", "/sync/results2026/postgres/status", "/sync/results2026/postgres/export", "/sync/premium/status", "/sync/premium/list", "/sync/premium/reset", "/sync/premium/run", "/sync/premium/settle", "/sync/premium/settle-pending", "/sync/history/form-value", "/sync/history/list", "/sync/history/reset", "/sync/history/repair-dellien-royer", "/sync/history/repair-shelton-merida", "/sync/history/repair-wawrinka-fils-dejong", "/sync/history/repair-van-assche-kypson-gaubas", "/sync/history/settle", "/sync/history/settle-pending", "/sync/daily-maintenance/run", "/sync/refuse-value/history", "/sync/refuse-value/backfill", "/audit/step56/status", "/audit/step56/daily", "/audit/step56/calculate", "/audit/v3/status", "/audit/v3/daily", "/audit/v3/calculate", "/v4/status", "/v4/daily", "/v4/calculate", "/v4-legacy/status", "/v4-legacy/daily", "/v4-legacy/calculate", "/v5/status", "/v5/daily", "/v5/cote250", "/v5/backtest/cote250"],
         "excludedAnalysisPlayers": _excluded_analysis_names(),
     }
 
@@ -1234,7 +1238,9 @@ def health() -> Dict[str, Any]:
     return {
         "status": "ok",
         "service": "Tennis Motor Backend Clean",
-        "version": "step66-dual-v4-lab",
+        "version": "step68-v5-cote250-parallel",
+        "v5Cote250": "enabled_parallel_no_official_mutation",
+        "v5Cote250Endpoint": "/v5/daily",
         "coreEngineVersion": "step56-global-direct-prediction-official-with-persistent-refuse-value",
         "auditV3Version": STEP63_AUDIT_VERSION,
         "v4LegacyVersion": V4_LEGACY_VERSION,
@@ -1273,6 +1279,9 @@ def health() -> Dict[str, Any]:
         "v4LegacyVersion": V4_LEGACY_VERSION,
         "v4LabVersion": V4_FULL_VERSION,
         "v4Policy": "full candidate all categories: validates/downgrades Premium, upgrades/watches Proche, searches Refuse Value, blocks non-analyzed; does not mutate STEP56/v3",
+        "v5Cote250": "enabled_parallel_no_official_mutation",
+        "v5Cote250Endpoint": "/v5/daily",
+        "v5Cote250Policy": "filtre pré-match uniquement: hors Grand Chelem + oddPredicted > 2.50; ne remplace pas V2/V3/V4",
         "refuseValueEngine": "enabled_for_refuse_only_persistent_history",
         "refuseValueHistory": "postgres_columns_plus_history_endpoint",
         "refuseValueRules": "cote<=1.80; large=60-72+cote<=1.80; strict=68-72+cote<=1.80",
