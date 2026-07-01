@@ -30,7 +30,7 @@ from tennis_motor_audit_v3 import AUDIT_VERSION as STEP63_AUDIT_VERSION, attach_
 from tennis_motor_v4_lab import V4_VERSION as V4_FULL_VERSION, attach_v4_lab_to_payload, status_payload as v4_status_payload
 from tennis_motor_v4_legacy import V4_LEGACY_VERSION, attach_v4_legacy_to_payload, status_payload as v4_legacy_status_payload
 from tennis_motor_v5_export import router as v5_export_router
-from tennis_motor_v5_cote250 import router as v5_cote250_router
+from tennis_motor_v5_cote250 import router as v5_cote250_router, _v5_daily_payload
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -3562,6 +3562,374 @@ def v3_daily_run(
             "steps": steps,
             "errors": errors,
         }
+
+
+# =============================================================================
+# STEP69 — All Versions Runner (V2 + V3 + V4 + V5)
+# =============================================================================
+
+def _tm_count_add(bucket: Dict[str, Any], key: Any) -> None:
+    label = str(key or "UNKNOWN").strip() or "UNKNOWN"
+    bucket[label] = int(bucket.get(label, 0)) + 1
+
+
+def _tm_category_for_match(match: Dict[str, Any]) -> str:
+    try:
+        cat = tracked_category(match)
+        if cat:
+            return str(cat).upper()
+    except Exception:
+        pass
+    for field in ("category", "status", "step56OfficialCategory"):
+        value = match.get(field)
+        if value:
+            return str(value).upper()
+    decision = str(match.get("decision") or "").lower()
+    if "jouable" in decision:
+        pct = _safe_float(match.get("premiumPct"), 0.0)
+        if pct > 80.0:
+            return "PREMIUM"
+        if pct >= 75.0:
+            return "PROCHE"
+    return "REFUSE_OR_NON_ANALYSED"
+
+
+def _tm_daily_compact(payload: Dict[str, Any], include_matches: bool = False) -> Dict[str, Any]:
+    if not isinstance(payload, dict):
+        return {"status": "error", "error": "payload_invalide"}
+    matches = payload.get("matches") or []
+    by_category: Dict[str, Any] = {}
+    by_decision: Dict[str, Any] = {}
+    for match in matches:
+        if not isinstance(match, dict):
+            continue
+        _tm_count_add(by_category, _tm_category_for_match(match))
+        _tm_count_add(by_decision, match.get("decision"))
+    out = {
+        "status": payload.get("status"),
+        "targetDay": (payload.get("daily") or {}).get("targetDay"),
+        "provider": (payload.get("daily") or {}).get("provider"),
+        "payloadCount": (payload.get("daily") or {}).get("payloadCount"),
+        "matches": len(matches),
+        "byCategory": by_category,
+        "byDecision": by_decision,
+        "premiumHistorySync": (payload.get("daily") or {}).get("premiumHistorySync"),
+        "policy": "V2/STEP56 reste officiel; V4 est attachée en passif dans le payload quotidien.",
+    }
+    if include_matches:
+        out["matchesRaw"] = matches
+    return out
+
+
+def _tm_v4_compact(daily_payload: Dict[str, Any], include_matches: bool = False) -> Dict[str, Any]:
+    matches = daily_payload.get("matches") or [] if isinstance(daily_payload, dict) else []
+    legacy_decisions: Dict[str, Any] = {}
+    lab_decisions: Dict[str, Any] = {}
+    lab_actions: Dict[str, Any] = {}
+    legacy_grades: Dict[str, Any] = {}
+    lab_grades: Dict[str, Any] = {}
+    for match in matches:
+        if not isinstance(match, dict):
+            continue
+        legacy = match.get("v4Legacy") if isinstance(match.get("v4Legacy"), dict) else {}
+        lab = match.get("v4Lab") if isinstance(match.get("v4Lab"), dict) else {}
+        _tm_count_add(legacy_decisions, legacy.get("decision"))
+        _tm_count_add(lab_decisions, lab.get("v4Decision") or lab.get("decision"))
+        _tm_count_add(lab_actions, lab.get("v4Action") or lab.get("decision"))
+        _tm_count_add(legacy_grades, legacy.get("grade"))
+        _tm_count_add(lab_grades, lab.get("grade"))
+    out = {
+        "status": "ok",
+        "version": "STEP66_DUAL_V4_LAB_2026-06-26",
+        "endpoint": "/v4/daily",
+        "officialMutation": False,
+        "matchesRead": len(matches),
+        "legacy": {
+            "version": V4_LEGACY_VERSION,
+            "decisions": legacy_decisions,
+            "grades": legacy_grades,
+        },
+        "fullCandidate": {
+            "version": V4_FULL_VERSION,
+            "decisions": lab_decisions,
+            "actions": lab_actions,
+            "grades": lab_grades,
+        },
+        "summary": daily_payload.get("v4DualSummary") if isinstance(daily_payload, dict) else None,
+        "policy": "V4 Legacy + V4 Lab tournent en parallèle; aucune mutation de V2/V3.",
+    }
+    if include_matches:
+        out["matchesRaw"] = matches
+    return out
+
+
+def _tm_v5_compact(v5_payload: Dict[str, Any], include_matches: bool = False) -> Dict[str, Any]:
+    if not isinstance(v5_payload, dict):
+        return {"status": "error", "error": "payload_v5_invalide"}
+    out = {
+        "status": v5_payload.get("status"),
+        "version": v5_payload.get("version"),
+        "endpoint": "/v5/cote250",
+        "targetDay": v5_payload.get("targetDay"),
+        "officialMutation": v5_payload.get("officialMutation"),
+        "replacesV2V3V4": v5_payload.get("replacesV2V3V4"),
+        "ruleId": v5_payload.get("ruleId"),
+        "decision": v5_payload.get("decision"),
+        "counts": v5_payload.get("counts"),
+        "summary": v5_payload.get("summary"),
+        "policy": v5_payload.get("policy"),
+    }
+    if include_matches:
+        out["matches"] = v5_payload.get("matches") or []
+    return out
+
+
+def _tm_v3_promotes_compact(promotes_payload: Dict[str, Any], include_matches: bool = False) -> Dict[str, Any]:
+    if not isinstance(promotes_payload, dict):
+        return {"status": "error", "error": "payload_v3_promotes_invalide"}
+    items = promotes_payload.get("items") or promotes_payload.get("promotes") or promotes_payload.get("matches") or []
+    out = {
+        "status": promotes_payload.get("status"),
+        "version": promotes_payload.get("version"),
+        "endpoint": "/v3/promotes",
+        "day": promotes_payload.get("day") or promotes_payload.get("targetDay"),
+        "source": promotes_payload.get("source") or promotes_payload.get("mode"),
+        "total": promotes_payload.get("total") if promotes_payload.get("total") is not None else len(items),
+        "counts": promotes_payload.get("counts"),
+        "policy": promotes_payload.get("policy"),
+    }
+    if include_matches:
+        out["items"] = items
+    return out
+
+
+def _tm_v3_performance_compact(perf_payload: Dict[str, Any]) -> Dict[str, Any]:
+    if not isinstance(perf_payload, dict):
+        return {"status": "error", "error": "payload_v3_performance_invalide"}
+    return {
+        "status": perf_payload.get("status"),
+        "version": perf_payload.get("version"),
+        "endpoint": perf_payload.get("endpoint") or "/v3/shadow/performance",
+        "day": perf_payload.get("day"),
+        "scope": perf_payload.get("scope"),
+        "v2BaselineSameScope": perf_payload.get("v2BaselineSameScope"),
+        "v3ShadowConservative": perf_payload.get("v3ShadowConservative"),
+        "byDecision": perf_payload.get("byDecision"),
+        "policy": perf_payload.get("policy"),
+    }
+
+
+def _tm_run_v3_pre_from_daily(
+    target_day: str,
+    daily_payload: Dict[str, Any],
+    persist_shadow: bool,
+    purge_existing: bool,
+    odds_cutoff: float,
+) -> Dict[str, Any]:
+    v3_store = V3LearningMemoryStore()
+    matches = daily_payload.get("matches", []) or []
+    rules = v3_store.list_shadow_rules(status="shadow", limit=500)
+    shadow = evaluate_shadow_matches(matches, rules, day=target_day, odds_cutoff=odds_cutoff)
+    write_info = None
+    if persist_shadow:
+        write_info = v3_store.persist_shadow_decisions(
+            target_day,
+            shadow.get("decisions", []) or [],
+            purge_existing=purge_existing,
+        )
+    cleanup = v3_store.cleanup_shadow_decisions(
+        day=target_day,
+        keep_latest=True,
+        purge_non_shadow_rules=False,
+        dry_run=False,
+    )
+    return {
+        "shadowDaily": _v3_shadow_summary(shadow, write_info=write_info, rules_loaded=len(rules)),
+        "shadowCleanupLatest": {
+            "status": cleanup.get("status"),
+            "dryRun": cleanup.get("dryRun"),
+            "beforeTotal": cleanup.get("beforeTotal"),
+            "afterTotal": cleanup.get("afterTotal"),
+            "duplicatesDeleted": cleanup.get("duplicatesDeleted"),
+            "nonShadowDeleted": cleanup.get("nonShadowDeleted"),
+        },
+    }
+
+
+@app.get("/all-versions/run")
+def all_versions_run(
+    day: str = Query("today", description="today, yesterday, tomorrow ou YYYY-MM-DD"),
+    phase: str = Query("morning", description="morning/pre_match/matin, evening/post_match/soir ou full"),
+    provider: str = Query("api_tennis"),
+    settle_days_back: int = Query(7, ge=1, le=60),
+    apply_rule_updates: bool = Query(True),
+    persist_shadow: bool = Query(True),
+    purge_existing: bool = Query(True),
+    odds_cutoff: float = Query(1.90, ge=1.01, le=100.0),
+    category: str = Query("all"),
+    limit: int = Query(50000, ge=1, le=100000),
+    include_matches: bool = Query(False, description="true = inclut les listes complètes; false = résumé compact"),
+) -> Dict[str, Any]:
+    """STEP69 — URL unique V2 + V3 + V4 + V5.
+
+    morning/pre_match:
+    - V2 /daily officiel avec écriture historique;
+    - V3 shadow pre-match avec persistance des décisions;
+    - V3 promotes persisted;
+    - V4 Legacy + V4 Lab via le payload daily;
+    - V5 cote > 2.50 hors Grand Chelem via Postgres.
+
+    evening/post_match:
+    - settle pending + sync mémoire + tracking + validation V3;
+    - lecture V2/V4 du jour sans nouvelle écriture historique;
+    - V3 performance;
+    - V5 cote > 2.50 après règlement.
+    """
+    target_day = normalize_day(day)
+    phase_key = (phase or "morning").strip().lower().replace("-", "_")
+    if phase_key in {"pre", "am", "matin", "morning", "prematch", "pre_match"}:
+        phase_key = "morning"
+    elif phase_key in {"post", "pm", "soir", "night", "evening", "postmatch", "post_match"}:
+        phase_key = "evening"
+    elif phase_key in {"all", "complete", "full", "daily"}:
+        phase_key = "full"
+    else:
+        raise HTTPException(status_code=400, detail="phase invalide. Utilise morning, evening ou full.")
+
+    started_at = datetime.utcnow().isoformat() + "Z"
+    errors: List[str] = []
+    steps: Dict[str, Any] = {}
+    daily_payload = None
+
+    if phase_key in {"morning", "full"}:
+        try:
+            daily_payload = daily(day=target_day, auto_history=True, provider=provider)
+            steps["v2OfficialDaily"] = _tm_daily_compact(daily_payload, include_matches=include_matches)
+            steps["v4DualDaily"] = _tm_v4_compact(daily_payload, include_matches=include_matches)
+            steps["v3PreMatch"] = _tm_run_v3_pre_from_daily(
+                target_day=target_day,
+                daily_payload=daily_payload,
+                persist_shadow=persist_shadow,
+                purge_existing=purge_existing,
+                odds_cutoff=odds_cutoff,
+            )
+            try:
+                steps["v3Promotes"] = _tm_v3_promotes_compact(
+                    v3_promotes(day=target_day, source="persisted", provider=provider, odds_cutoff=odds_cutoff, limit=5000),
+                    include_matches=include_matches,
+                )
+            except Exception as exc:
+                errors.append(f"v3Promotes failed: {type(exc).__name__}: {exc}")
+                steps["v3Promotes"] = {"status": "error", "error": f"{type(exc).__name__}: {exc}"}
+        except Exception as exc:
+            errors.append(f"morning failed: {type(exc).__name__}: {exc}")
+            steps["morningError"] = {"status": "error", "error": f"{type(exc).__name__}: {exc}"}
+
+    if phase_key in {"evening", "full"}:
+        try:
+            post_payload = v3_daily_run(
+                day=target_day,
+                phase="post_match",
+                provider=provider,
+                auto_history=True,
+                persist_shadow=persist_shadow,
+                purge_existing=purge_existing,
+                settle_days_back=settle_days_back,
+                category=category,
+                limit=limit,
+                odds_cutoff=odds_cutoff,
+                min_shadow_settled=10,
+                oos_last_days=14,
+                oos_min_test_days=2,
+                oos_min_test_settled=10,
+                apply_rule_updates=apply_rule_updates,
+                refresh_rules=False,
+            )
+            steps["v3PostMatch"] = post_payload
+            steps["v3Performance"] = _tm_v3_performance_compact(
+                v3_shadow_performance(day=target_day, limit=limit, odds_cutoff=odds_cutoff)
+            )
+            if daily_payload is None:
+                # Lecture de contrôle V2/V4 sans nouvelle écriture historique.
+                daily_payload = daily(day=target_day, auto_history=False, provider=provider)
+                steps["v2OfficialDaily"] = _tm_daily_compact(daily_payload, include_matches=include_matches)
+                steps["v4DualDaily"] = _tm_v4_compact(daily_payload, include_matches=include_matches)
+        except Exception as exc:
+            errors.append(f"evening failed: {type(exc).__name__}: {exc}")
+            steps["eveningError"] = {"status": "error", "error": f"{type(exc).__name__}: {exc}"}
+
+    try:
+        v5_payload = _v5_daily_payload(target_day)
+        v5_payload["endpoint"] = "/v5/cote250"
+        steps["v5Cote250"] = _tm_v5_compact(v5_payload, include_matches=include_matches)
+    except Exception as exc:
+        errors.append(f"v5Cote250 failed: {type(exc).__name__}: {exc}")
+        steps["v5Cote250"] = {"status": "error", "error": f"{type(exc).__name__}: {exc}"}
+
+    finished_at = datetime.utcnow().isoformat() + "Z"
+    return {
+        "status": "ok" if not errors else "partial",
+        "version": "STEP69_ALL_VERSIONS_RUNNER_2026-07-01",
+        "endpoint": "/all-versions/run",
+        "day": target_day,
+        "phase": phase_key,
+        "startedAt": started_at,
+        "finishedAt": finished_at,
+        "steps": steps,
+        "errors": errors,
+        "quickUrls": {
+            "morning": "/all-versions/run?phase=morning&day=today",
+            "evening": "/all-versions/run?phase=evening&day=today&settle_days_back=7&apply_rule_updates=true",
+            "full": "/all-versions/run?phase=full&day=today&settle_days_back=7&apply_rule_updates=true",
+            "morningAlias": "/all-versions/morning?day=today",
+            "eveningAlias": "/all-versions/evening?day=today",
+        },
+        "policy": "URL unique de contrôle/exécution : V2 reste officiel, V3 reste shadow, V4 reste lab/passive, V5 reste filtre parallèle hors Grand Chelem + cote > 2.50.",
+    }
+
+
+@app.get("/all-versions/morning")
+def all_versions_morning(
+    day: str = Query("today"),
+    provider: str = Query("api_tennis"),
+    include_matches: bool = Query(False),
+) -> Dict[str, Any]:
+    return all_versions_run(
+        day=day,
+        phase="morning",
+        provider=provider,
+        settle_days_back=7,
+        apply_rule_updates=True,
+        persist_shadow=True,
+        purge_existing=True,
+        odds_cutoff=1.90,
+        category="all",
+        limit=50000,
+        include_matches=include_matches,
+    )
+
+
+@app.get("/all-versions/evening")
+def all_versions_evening(
+    day: str = Query("today"),
+    provider: str = Query("api_tennis"),
+    settle_days_back: int = Query(7, ge=1, le=60),
+    apply_rule_updates: bool = Query(True),
+    include_matches: bool = Query(False),
+) -> Dict[str, Any]:
+    return all_versions_run(
+        day=day,
+        phase="evening",
+        provider=provider,
+        settle_days_back=settle_days_back,
+        apply_rule_updates=apply_rule_updates,
+        persist_shadow=True,
+        purge_existing=True,
+        odds_cutoff=1.90,
+        category="all",
+        limit=50000,
+        include_matches=include_matches,
+    )
 
 
 if __name__ == "__main__":
